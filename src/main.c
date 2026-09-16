@@ -1,28 +1,19 @@
 /*
  * doom-ps/src/main.c
  *
- * PS4/PS5 platform layer for doomgeneric, built on top of the EmuC0re /
- * Luac0re pattern from EmuC0re-main.
+ * PS4/PS5 platform layer for doomgeneric, built on the EmuC0re pattern.
  *
- * Compile flags (from real Makefile):
- *   -Os -ffreestanding -fno-stack-protector -fno-builtin
- *   -fpie -mno-red-zone -fomit-frame-pointer -fcf-protection=none
- *   -fno-exceptions -fno-unwind-tables -fno-asynchronous-unwind-tables
- *
- * Link flags:
- *   -T linker.ld -nostdlib -nostartfiles -static
- *   -Wl,--build-id=none -Wl,--no-dynamic-linker -Wl,-z,norelro -no-pie
- *
- * No SDK headers needed — every libSce* symbol is resolved at run time via
- * SYM() / NC(), exactly as EmuC0re does.
+ * DIAGNOSTIC BUILD: logs a UDP message after every step so we can see
+ * exactly where the shellcode dies. Once the crash is localized, remove
+ * the udp_log() calls between the SYMs — they add ~1 KB to the binary.
  */
 
 #include "core.h"
 #include "doomgeneric_ps.h"
 
-/* =========================================================================
+/* ========================================================================
  * Minimal helpers (no libc in ffreestanding+nostdlib)
- * ========================================================================= */
+ * ======================================================================== */
 static void ps_memset(void *dst, u8 val, u64 len) {
     u8 *d = (u8 *)dst;
     while (len--) *d++ = val;
@@ -36,10 +27,9 @@ static u64 ps_strlen(const char *s) {
     u64 n = 0; while (s[n]) n++; return n;
 }
 
-/* =========================================================================
- * DualShock / DualSense button bitmask → Doom key translation
- * Bit positions from EmuC0re's ds_to_nes() — confirmed correct.
- * ========================================================================= */
+/* ========================================================================
+ * DualShock button bits
+ * ======================================================================== */
 #define DS_UP       0x00000010
 #define DS_RIGHT    0x00000020
 #define DS_DOWN     0x00000040
@@ -57,13 +47,12 @@ static u64 ps_strlen(const char *s) {
 #define DS_L3       0x00000002
 #define DS_R3       0x00000004
 
-/* Doom key codes (doomkeys.h values, copied here to avoid header dep) */
 #define DG_KEY_RIGHTARROW  0xae
 #define DG_KEY_LEFTARROW   0xac
 #define DG_KEY_UPARROW     0xad
 #define DG_KEY_DOWNARROW   0xaf
-#define DG_KEY_FIRE        0xa0   /* ctrl  */
-#define DG_KEY_USE         0x20   /* space */
+#define DG_KEY_FIRE        0xa0
+#define DG_KEY_USE         0x20
 #define DG_KEY_ESCAPE      27
 #define DG_KEY_ENTER       13
 #define DG_KEY_TAB         9
@@ -79,16 +68,14 @@ static u64 ps_strlen(const char *s) {
 #define DG_KEY_6           '6'
 #define DG_KEY_7           '7'
 
-/* =========================================================================
- * Global context (flat struct — PIC-friendly, lives in .bss)
- * ========================================================================= */
+/* ========================================================================
+ * Global context
+ * ======================================================================== */
 #define KEY_QUEUE_SIZE 32
 
 static struct ps_ctx {
-    /* gadget / dlsym */
     void *G, *D;
 
-    /* libkernel */
     void *usleep_fn;
     void *load_mod;
     void *alloc_dm;
@@ -108,7 +95,6 @@ static struct ps_ctx {
     void *sendto_fn;
     void *cancel;
 
-    /* video */
     void *vid_open, *vid_close, *vid_reg, *vid_flip, *vid_rate, *vid_evt;
     s32   video_h;
     void *vmem;
@@ -117,35 +103,29 @@ static struct ps_ctx {
     u64   eq;
     u32   total_frames;
 
-    /* audio */
     void *aud_open, *aud_out, *aud_close;
     s32   audio_h;
     u8   *ring;
     int   ring_write, ring_read, ring_count;
 
-    /* pad */
     void *pad_init_fn, *pad_geth, *pad_read;
     s32   pad_h;
     u32   pad_prev;
 
-    /* key event queue */
     struct { u8 key; u8 pressed; } key_queue[KEY_QUEUE_SIZE];
     int   key_wp, key_rp;
 
-    /* WAD path */
     char  wad_path[128];
 
-    /* logging */
     s32   log_fd;
     u8    log_sa[16];
 
-    /* ext pointer */
     struct ext_args *ext;
 } g_ctx;
 
-/* =========================================================================
- * UDP log (mirrors EmuC0re's udp_log)
- * ========================================================================= */
+/* ========================================================================
+ * UDP log — safe to call once sendto_fn and log_fd are set
+ * ======================================================================== */
 static void udp_log(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->log_fd < 0 || !c->sendto_fn) return;
@@ -154,43 +134,32 @@ static void udp_log(const char *msg) {
        0, (u64)c->log_sa, 16);
 }
 
-/* =========================================================================
- * Blit 320×200 RGBA (DG_ScreenBuffer) → 1920×1080 BGRA framebuffer
- *
- * PS4 VideoOut format 0x80000000 = PIXEL_FORMAT_A8R8G8B8
- * doomgeneric DG_ScreenBuffer = RGBA (R at lowest address byte)
- * We must swap R↔B.
- * ========================================================================= */
+/* ========================================================================
+ * Blit 320×200 RGBA → 1920×1080 BGRA
+ * ======================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
-    /* Black letterbox */
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
-
     for (int dy = 0; dy < DOOM_H; dy++) {
         const u32 *row = doom + dy * DOOM_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
             u32 rgba = row[dx];
-            /* doomgeneric stores as 0xRRGGBBAA on most ports;
-             * but the standard is R at byte 0 = 0xAABBGGRR in little-endian.
-             * Either way we want it in PS A8R8G8B8 = 0xFFRRGGBB. */
             u8 r = rgba & 0xFF;
             u8 g = (rgba >> 8) & 0xFF;
             u8 b = (rgba >> 16) & 0xFF;
             u32 bgra = 0xFF000000 | ((u32)r << 16) | ((u32)g << 8) | b;
-
             int fy = OFF_Y + dy * SCALE_Y;
             int fx = OFF_X + dx * SCALE_X;
             for (int sy = 0; sy < SCALE_Y; sy++) {
                 u32 *dst = fb + (fy + sy) * SCR_W + fx;
-                for (int sx = 0; sx < SCALE_X; sx++)
-                    dst[sx] = bgra;
+                for (int sx = 0; sx < SCALE_X; sx++) dst[sx] = bgra;
             }
         }
     }
 }
 
-/* =========================================================================
- * Key queue helpers
- * ========================================================================= */
+/* ========================================================================
+ * Key queue
+ * ======================================================================== */
 static void push_key(u8 key, u8 pressed) {
     struct ps_ctx *c = &g_ctx;
     int next = (c->key_wp + 1) & (KEY_QUEUE_SIZE - 1);
@@ -200,9 +169,6 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
-/* =========================================================================
- * Translate DualSense raw button word → Doom key events (diff against prev)
- * ========================================================================= */
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 changed = raw ^ c->pad_prev;
@@ -219,12 +185,11 @@ static void translate_pad(u32 raw) {
     MAP(DS_SQUARE,   DG_KEY_USE);
     MAP(DS_CIRCLE,   DG_KEY_ENTER);
     MAP(DS_OPTIONS,  DG_KEY_ESCAPE);
-    MAP(DS_TRIANGLE, DG_KEY_TAB);   /* automap */
-    MAP(DS_L1,       DG_KEY_SHIFT); /* run */
-    MAP(DS_R1,       DG_KEY_ALT);   /* strafe */
+    MAP(DS_TRIANGLE, DG_KEY_TAB);
+    MAP(DS_L1,       DG_KEY_SHIFT);
+    MAP(DS_R1,       DG_KEY_ALT);
     MAP(DS_L2,       DG_KEY_F1);
     MAP(DS_R2,       DG_KEY_F2);
-    /* Weapon select: SHARE + face */
     if ((raw & DS_SHARE) && (changed & DS_CROSS))    push_key(DG_KEY_1, (raw & DS_CROSS)    ? 1 : 0);
     if ((raw & DS_SHARE) && (changed & DS_SQUARE))   push_key(DG_KEY_2, (raw & DS_SQUARE)   ? 1 : 0);
     if ((raw & DS_SHARE) && (changed & DS_CIRCLE))   push_key(DG_KEY_3, (raw & DS_CIRCLE)   ? 1 : 0);
@@ -235,9 +200,9 @@ static void translate_pad(u32 raw) {
 #undef MAP
 }
 
-/* =========================================================================
- * Audio ring-buffer drain (called from DG_DrawFrame each vsync)
- * ========================================================================= */
+/* ========================================================================
+ * Audio drain
+ * ======================================================================== */
 static void audio_drain(void) {
     struct ps_ctx *c = &g_ctx;
     if (c->audio_h < 0 || !c->aud_out || !c->ring) return;
@@ -249,13 +214,9 @@ static void audio_drain(void) {
     }
 }
 
-/* =========================================================================
- * WAD receive  — blocks until Python sender connects.
- *
- * Wire protocol (matches wad_sender.py):
- *   8-byte LE size  +  raw WAD bytes
- * Output: /savedata0/doom.wad
- * ========================================================================= */
+/* ========================================================================
+ * WAD receive
+ * ======================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -268,7 +229,6 @@ static int recv_wad(s32 listen_fd) {
                          (u64)listen_fd, (u64)peer, (u64)&plen, 0, 0, 0);
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* 8-byte LE size header */
     u8 hdr[8]; s32 got = 0;
     while (got < 8) {
         s32 n = (s32)NC(c->G, c->recv_fn,
@@ -282,7 +242,6 @@ static int recv_wad(s32 listen_fd) {
     udp_log("DoomPS: receiving WAD...\n");
 
     const char *out = "/savedata0/doom.wad";
-    /* O_WRONLY|O_CREAT|O_TRUNC = 0x601 */
     s32 fd = (s32)NC(c->G, c->kopen, (u64)out, 0x601, 0x1FF, 0, 0, 0);
     if (fd < 0) {
         udp_log("DoomPS: cannot open output WAD\n");
@@ -304,7 +263,6 @@ static int recv_wad(s32 listen_fd) {
     NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
     NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
 
-    /* Store path */
     int i = 0;
     while (out[i] && i < 127) { g_ctx.wad_path[i] = out[i]; i++; }
     g_ctx.wad_path[i] = 0;
@@ -313,13 +271,12 @@ static int recv_wad(s32 listen_fd) {
     return 0;
 }
 
-/* =========================================================================
+/* ========================================================================
  * doomgeneric callbacks
- * ========================================================================= */
+ * ======================================================================== */
+extern u32 *DG_ScreenBuffer;
 
-extern u32 *DG_ScreenBuffer;  /* filled by doomgeneric before DG_DrawFrame */
-
-void DG_Init(void) { /* video/audio already up in _start */ }
+void DG_Init(void) { }
 
 void DG_DrawFrame(void) {
     struct ps_ctx *c = &g_ctx;
@@ -340,7 +297,6 @@ void DG_DrawFrame(void) {
 
     audio_drain();
 
-    /* Poll pad */
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128];
         ps_memset(pad_buf, 0, 128);
@@ -363,9 +319,8 @@ void DG_SleepMs(unsigned int ms) {
 unsigned int DG_GetTicksMs(void) {
     struct ps_ctx *c = &g_ctx;
     if (!c->clock_gettime) return c->total_frames * 16;
-    /* struct timespec (FreeBSD): tv_sec u64 + tv_nsec u64 */
     u64 ts[2] = {0, 0};
-    NC(c->G, c->clock_gettime, 4 /* CLOCK_MONOTONIC */, (u64)ts, 0, 0, 0, 0);
+    NC(c->G, c->clock_gettime, 4, (u64)ts, 0, 0, 0, 0);
     return (unsigned int)(ts[0] * 1000ULL + ts[1] / 1000000ULL);
 }
 
@@ -380,9 +335,6 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
 
 void DG_SetWindowTitle(const char *title) { (void)title; }
 
-/* =========================================================================
- * Audio callback — wire this from i_sound_ps.c
- * ========================================================================= */
 void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
     if (!c->ring) return;
@@ -400,19 +352,25 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     }
 }
 
-/* =========================================================================
- * doomgeneric API (provided by doomgeneric.c after our clone)
- * ========================================================================= */
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
-/* =========================================================================
- * _start — Luac0re calls this as the shellcode entry point.
- *
- * Signature and section name match EmuC0re exactly.
- * ========================================================================= */
+/* ========================================================================
+ * _start — Luac0re entry point
+ * ======================================================================== */
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
+
+    /* ----- IMMEDIATE: mark step 1 before doing anything ----- */
+    ext->step = 1;
+
+    void *G = (void *)(eboot_base + GADGET_OFFSET);
+    void *D = (void *)dlsym_addr;
+
+    /* ----- Provide libc shims to doomgeneric FIRST ----- */
+    extern void ps_libc_init(void *G, void *D);
+    ps_libc_init(G, D);
+    ext->step = 2;
 
     struct ps_ctx *c = &g_ctx;
     ps_memset(c, 0, sizeof(*c));
@@ -421,50 +379,72 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->pad_h   = -1;
     c->log_fd  = -1;
     c->ext     = ext;
-    ext->step  = 1;
 
-    c->G = (void *)(eboot_base + GADGET_OFFSET);
-    c->D = (void *)dlsym_addr;
+    c->G = G;
+    c->D = D;
 
-    /* Copy log socket from ext */
+    /* Copy log socket details from ext IMMEDIATELY */
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
-    /* Args from Lua (see doom_launcher.lua) */
+    /* Resolve sendto FIRST so we can log everything after */
+    c->sendto_fn = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sendto");
+    ext->step = 3;
+    udp_log("DoomPS: [3] sendto resolved\n");
+
+    /* Args from Lua */
     s32 tcp_listen_fd = (s32)ext->dbg[0];
     s32 userId        = (s32)ext->dbg[2];
+    (void)userId;
 
-    /* ---- Resolve libkernel symbols (mirrors EmuC0re's _start) ---- */
+    /* ----- Resolve remaining libkernel symbols ----- */
     c->usleep_fn     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelUsleep");
+    ext->step = 4; udp_log("DoomPS: [4] usleep resolved\n");
+
     c->cancel        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "scePthreadCancel");
     c->load_mod      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
+    ext->step = 5; udp_log("DoomPS: [5] cancel + load_mod resolved\n");
+
     c->alloc_dm      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
     c->map_dm        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
     c->dm_size       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
+    ext->step = 6; udp_log("DoomPS: [6] dmem trio resolved\n");
+
     c->create_eq     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelCreateEqueue");
     c->wait_eq       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelWaitEqueue");
     c->delete_eq     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelDeleteEqueue");
+    ext->step = 7; udp_log("DoomPS: [7] equeue trio resolved\n");
+
     c->mmap_fn       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "mmap");
     c->kopen         = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelOpen");
     c->kwrite        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelWrite");
     c->kclose        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelClose");
     c->clock_gettime = SYM(c->G, c->D, LIBKERNEL_HANDLE, "clock_gettime");
+    ext->step = 8; udp_log("DoomPS: [8] file/clock resolved\n");
+
     c->accept_fn     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "accept");
     c->recv_fn       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "recv");
     c->close_fn      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "close");
-    c->sendto_fn     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sendto");
+    ext->step = 9; udp_log("DoomPS: [9] socket fns resolved\n");
 
     if (!c->usleep_fn || !c->load_mod) {
-        ext->status = -1; ext->step = 2; return;
+        ext->status = -1; ext->step = 10; return;
     }
-    ext->step = 3;
+    ext->step = 11;
     udp_log("DoomPS: symbols OK\n");
 
-    /* ---- Load sprx modules ---- */
+    /* ----- Load sprx modules ----- */
     s32 vid_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceVideoOut.sprx",  0,0,0,0,0);
+    ext->step = 12; udp_log("DoomPS: [12] VideoOut.sprx loaded\n");
+
     s32 aud_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceAudioOut.sprx",  0,0,0,0,0);
+    ext->step = 13; udp_log("DoomPS: [13] AudioOut.sprx loaded\n");
+
     s32 pad_mod = (s32)NC(c->G, c->load_mod, (u64)"libScePad.sprx",       0,0,0,0,0);
+    ext->step = 14; udp_log("DoomPS: [14] Pad.sprx loaded\n");
+
     NC(c->G, c->load_mod, (u64)"libSceUserService.sprx", 0,0,0,0,0);
+    ext->step = 15; udp_log("DoomPS: [15] UserService.sprx loaded\n");
 
     c->vid_open  = SYM(c->G, c->D, vid_mod, "sceVideoOutOpen");
     c->vid_close = SYM(c->G, c->D, vid_mod, "sceVideoOutClose");
@@ -472,115 +452,133 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->vid_flip  = SYM(c->G, c->D, vid_mod, "sceVideoOutSubmitFlip");
     c->vid_rate  = SYM(c->G, c->D, vid_mod, "sceVideoOutSetFlipRate");
     c->vid_evt   = SYM(c->G, c->D, vid_mod, "sceVideoOutAddFlipEvent");
+    ext->step = 16; udp_log("DoomPS: [16] VideoOut fns resolved\n");
 
     c->aud_open  = SYM(c->G, c->D, aud_mod, "sceAudioOutOpen");
     c->aud_out   = SYM(c->G, c->D, aud_mod, "sceAudioOutOutput");
     c->aud_close = SYM(c->G, c->D, aud_mod, "sceAudioOutClose");
+    ext->step = 17; udp_log("DoomPS: [17] AudioOut fns resolved\n");
 
     c->pad_init_fn = SYM(c->G, c->D, pad_mod, "scePadInit");
     c->pad_geth    = SYM(c->G, c->D, pad_mod, "scePadGetHandle");
     c->pad_read    = SYM(c->G, c->D, pad_mod, "scePadRead");
+    ext->step = 18; udp_log("DoomPS: [18] Pad fns resolved\n");
 
-    ext->step = 5;
-
-    /* ---- Kill existing game renderer (identical to EmuC0re) ---- */
+    /* ----- Kill existing game renderer ----- */
+    ext->step = 19; udp_log("DoomPS: [19] killing GS thread\n");
     if (c->cancel) {
         u64 gs = *(u64 *)(eboot_base + EBOOT_GS_THREAD);
         if (gs) NC(c->G, c->cancel, gs, 0,0,0,0,0);
     }
     NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
+    ext->step = 20; udp_log("DoomPS: [20] GS thread cancelled\n");
 
     s32 emu_vid = *(s32 *)(eboot_base + EBOOT_VIDOUT);
     if (c->vid_close && emu_vid >= 0)
         NC(c->G, c->vid_close, (u64)emu_vid, 0,0,0,0,0);
     NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+    ext->step = 21; udp_log("DoomPS: [21] old VideoOut closed\n");
 
-    /* ---- Open VideoOut ---- */
+    /* ----- Open VideoOut ----- */
     c->video_h = (s32)NC(c->G, c->vid_open, 0xFF, 0, 0, 0, 0, 0);
-    if (c->video_h < 0) { ext->status = -10; ext->step = 10; return; }
+    if (c->video_h < 0) {
+        ext->status = -10; ext->step = 22;
+        udp_log("DoomPS: [22] VideoOut open FAILED\n");
+        return;
+    }
+    ext->step = 23; udp_log("DoomPS: [23] VideoOut open OK\n");
 
-    /* ---- Equeue ---- */
+    /* ----- Equeue ----- */
     if (c->create_eq)
         NC(c->G, c->create_eq, (u64)&c->eq, (u64)"doomq", 0,0,0,0);
     if (c->vid_evt && c->eq)
         NC(c->G, c->vid_evt, c->eq, (u64)c->video_h, 0,0,0,0);
+    ext->step = 24; udp_log("DoomPS: [24] equeue created\n");
 
-    /* ---- Allocate direct memory for 2× framebuffers ---- */
+    /* ----- Direct memory for framebuffers ----- */
     u64 mem_total = c->dm_size
         ? NC(c->G, c->dm_size, 0,0,0,0,0,0)
         : 0x300000000ULL;
     u64 phys = 0;
     NC(c->G, c->alloc_dm, 0, mem_total, FB_TOTAL, 0x200000, 3, (u64)&phys);
+    ext->step = 25; udp_log("DoomPS: [25] dmem allocated\n");
+
     c->vmem = 0;
     NC(c->G, c->map_dm, (u64)&c->vmem, FB_TOTAL, 0x33, 0, phys, 0x200000);
-    if (!c->vmem) { ext->status = -21; ext->step = 21; return; }
+    if (!c->vmem) {
+        ext->status = -21; ext->step = 26;
+        udp_log("DoomPS: [26] dmem map FAILED\n");
+        return;
+    }
+    ext->step = 27; udp_log("DoomPS: [27] dmem mapped\n");
 
     c->fbs[0] = c->vmem;
     c->fbs[1] = (u8 *)c->vmem + FB_ALIGNED;
 
-    /* Clear both FBs to black */
     for (int i = 0; i < SCR_W * SCR_H; i++) {
         ((u32 *)c->fbs[0])[i] = 0xFF000000;
         ((u32 *)c->fbs[1])[i] = 0xFF000000;
     }
+    ext->step = 28; udp_log("DoomPS: [28] FBs cleared\n");
 
-    /* ---- Register framebuffers (identical attr block to EmuC0re) ---- */
+    /* ----- Register framebuffers ----- */
     u8 attr[64];
     ps_memset(attr, 0, 64);
-    *(u32 *)(attr +  0) = 0x80000000; /* PIXEL_FORMAT_A8R8G8B8 */
-    *(u32 *)(attr +  4) = 1;          /* tiling linear */
+    *(u32 *)(attr +  0) = 0x80000000;
+    *(u32 *)(attr +  4) = 1;
     *(u32 *)(attr + 12) = SCR_W;
     *(u32 *)(attr + 16) = SCR_H;
-    *(u32 *)(attr + 20) = SCR_W;      /* pitch */
+    *(u32 *)(attr + 20) = SCR_W;
 
     if (NC(c->G, c->vid_reg,
            (u64)c->video_h, 0, (u64)c->fbs, 2, (u64)attr, 0) != 0) {
-        ext->status = -30; ext->step = 30; return;
+        ext->status = -30; ext->step = 30;
+        udp_log("DoomPS: [30] RegisterBuffers FAILED\n");
+        return;
     }
+    ext->step = 31; udp_log("DoomPS: [31] FBs registered\n");
+
     if (c->vid_rate) NC(c->G, c->vid_rate, (u64)c->video_h, 0, 0,0,0,0);
 
-    ext->step = 7;
-    udp_log("DoomPS: video up\n");
-
-    /* ---- Audio ---- */
+    /* ----- Audio ----- */
     if (c->aud_close)
         for (int h = 0; h < 8; h++) NC(c->G, c->aud_close, (u64)h, 0,0,0,0,0);
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open,
                               0xFF, 0, 0, SAMPLES_PER_BUF, SAMPLE_RATE,
                               AUDIO_S16_STEREO);
+    ext->step = 32; udp_log("DoomPS: [32] audio opened\n");
 
-    /* Audio ring buffer via mmap (MAP_ANONYMOUS|MAP_PRIVATE = 0x1002) */
     if (c->mmap_fn) {
         c->ring = (u8 *)NC(c->G, c->mmap_fn,
                            0, (u64)(RING_SLOTS * RING_BYTES), 3, 0x1002,
                            (u64)-1, 0);
         if ((s64)c->ring == -1) c->ring = 0;
     }
-    udp_log(c->audio_h >= 0 ? "DoomPS: audio up\n" : "DoomPS: audio N/A\n");
+    ext->step = 33;
+    udp_log(c->audio_h >= 0 ? "DoomPS: [33] audio up\n"
+                            : "DoomPS: [33] audio N/A\n");
 
-    /* ---- Pad ---- */
+    /* ----- Pad ----- */
     if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
     if (c->pad_geth)
-        c->pad_h = (s32)NC(c->G, c->pad_geth, (u64)userId, 0, 0, 0, 0, 0);
-    udp_log(c->pad_h >= 0 ? "DoomPS: pad up\n" : "DoomPS: pad N/A\n");
+        c->pad_h = (s32)NC(c->G, c->pad_geth, 0, 0, 0, 0, 0, 0);
+    ext->step = 34;
+    udp_log(c->pad_h >= 0 ? "DoomPS: [34] pad up\n"
+                          : "DoomPS: [34] pad N/A\n");
 
-    ext->step = 9;
-
-    /* ---- Receive WAD file over TCP ---- */
+    /* ----- Receive WAD ----- */
+    ext->step = 35; udp_log("DoomPS: [35] calling recv_wad\n");
     if (recv_wad(tcp_listen_fd) != 0) {
-        /* Fallback: try pre-uploaded file */
         const char *fb = "/savedata0/doom.wad";
         int i = 0;
         while (fb[i] && i < 127) { c->wad_path[i] = fb[i]; i++; }
         c->wad_path[i] = 0;
         udp_log("DoomPS: WAD recv failed, trying /savedata0/doom.wad\n");
     }
+    ext->step = 36; udp_log("DoomPS: [36] WAD phase complete\n");
 
-    ext->step = 11;
-    udp_log("DoomPS: launching doom\n");
-
-    /* ---- Build argv ---- */
+    /* ----- Build argv ----- */
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
     const char *argv[4];
@@ -589,15 +587,15 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     argv[2] = c->wad_path;
     argv[3] = (char *)0;
 
+    ext->step = 37; udp_log("DoomPS: [37] calling doomgeneric_Create\n");
     doomgeneric_Create(3, (char **)argv);
 
-    /* ---- Main game loop ---- */
+    ext->step = 38; udp_log("DoomPS: [38] entering main loop\n");
     while (1) {
         doomgeneric_Tick();
         c->ext->frame_count = c->total_frames;
     }
 
-    /* Cleanup (unreachable in normal operation) */
     udp_log("DoomPS: exit\n");
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
