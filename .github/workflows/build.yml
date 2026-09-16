@@ -1,0 +1,78 @@
+name: Build doom-ps
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+  workflow_dispatch:      # allows manual "Run workflow" from the Actions tab
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            git \
+            binutils \
+            file \
+            python3
+
+      - name: Verify toolchain
+        run: |
+          gcc      --version | head -n1
+          objcopy  --version | head -n1
+          make     --version | head -n1
+          python3  --version
+
+      # Cache the doomgeneric clone between runs — saves ~30 s per build
+      # and pins the same upstream commit as long as the URL is unchanged.
+      - name: Cache doomgeneric
+        id: cache-dg
+        uses: actions/cache@v4
+        with:
+          path: doomgeneric
+          key: doomgeneric-${{ runner.os }}-${{ hashFiles('.github/workflows/build.yml') }}
+
+      - name: Clone doomgeneric
+        if: steps.cache-dg.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth=1 https://github.com/ozkl/doomgeneric doomgeneric
+
+      - name: Show doomgeneric commit
+        run: |
+          git -C doomgeneric rev-parse HEAD
+          git -C doomgeneric log -1 --oneline
+
+      - name: Build (elf + bin)
+        run: make -j"$(nproc)"
+
+      - name: Generate hex payload
+        run: make hex
+
+      - name: Inspect artifacts
+        run: |
+          ls -lh doom_ps.elf doom_ps.bin doom_ps.hex
+          echo "---- ELF header ----"
+          readelf -h doom_ps.elf
+          echo "---- Program headers ----"
+          readelf -l doom_ps.elf
+          echo "---- Hex size ----"
+          wc -c doom_ps.hex
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: doom-ps-${{ github.sha }}
+          path: |
+            doom_ps.elf
+            doom_ps.bin
+            doom_ps.hex
+          if-no-files-found: error
+          retention-days: 30
