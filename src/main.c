@@ -1,13 +1,14 @@
 /*
- * doom-ps/src/main.c — full file
+ * doom-ps/src/main.c — v12
  *
- * v11: fixed vsync-less flips in show_loading / show_wad_progress,
- *      flip arg = monotonically increasing frame counter,
- *      udp_log before ext->step writes,
- *      SO_RCVTIMEO return checked.
- *
- * On-screen LOADING animation + WAD progress bar, per-step UDP logging.
- * Font data and drawing helpers live in font.h.
+ * Fixes over v11:
+ *   - WAD output path changed to /av_contents/content_tmp/ (writable)
+ *   - WAD path fallback chain (av_contents -> temp0 -> savedata0)
+ *   - DG_ScreenBuffer allocated in DG_Init (doom has nowhere to draw before)
+ *   - userId queried from libSceUserService, not hardcoded
+ *   - Guard: if WAD cannot be opened, show error screen and never
+ *     call doomgeneric_Create (which crashes on missing WAD)
+ *   - SO_RCVTIMEO return value logged
  */
 
 #include "core.h"
@@ -69,6 +70,16 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DG_KEY_7 '7'
 
 /* ========================================================================
+ * WAD output paths — tried in order until one is writable
+ * ======================================================================== */
+static const char *WAD_PATH_CANDIDATES[] = {
+    "/av_contents/content_tmp/doom.wad",   /* FTP-upload scratch, writable */
+    "/temp0/doom.wad",
+    "/savedata0/doom.wad",
+    (const char *)0
+};
+
+/* ========================================================================
  * Global context
  * ======================================================================== */
 #define KEY_QUEUE_SIZE 32
@@ -96,6 +107,7 @@ static struct ps_ctx {
     void *pad_init_fn, *pad_geth, *pad_read;
     s32   pad_h;
     u32   pad_prev;
+    s32   user_id;                 /* real ID from UserService */
 
     struct { u8 key; u8 pressed; } key_queue[KEY_QUEUE_SIZE];
     int   key_wp, key_rp;
@@ -118,7 +130,7 @@ static void udp_log(const char *msg) {
 }
 
 /* ========================================================================
- * Shared present helper — flips with vsync wait and advances frame count
+ * Shared present helper
  * ======================================================================== */
 static void present(struct ps_ctx *c) {
     if (c->video_h < 0 || !c->vid_flip) return;
@@ -133,7 +145,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ========================================================================
- * On-screen LOADING / WAD progress
+ * On-screen LOADING / WAD progress / error
  * ======================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -184,11 +196,35 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     present(c);
 }
 
+/* Error screen — called when WAD loading failed for any reason.
+ * Never returns. */
+static void show_error_and_hang(struct ps_ctx *c, const char *line1,
+                                const char *line2) {
+    for (;;) {
+        if (c->video_h < 0 || !c->fbs[c->active_fb]) {
+            /* Can't draw — just spin */
+            continue;
+        }
+        u32 *fb = (u32 *)c->fbs[c->active_fb];
+        for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
+
+        ps_draw_str_center(fb, 300, "DOOM-PS ERROR", 0xFFFF4040, 6);
+        if (line1) ps_draw_str_center(fb, 500, line1, 0xFFFFFFFF, 4);
+        if (line2) ps_draw_str_center(fb, 600, line2, 0xFFA0A0A0, 3);
+        ps_draw_str_center(fb, 900, "Reboot console to recover",
+                           0xFF808080, 3);
+
+        present(c);
+        if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+    }
+}
+
 /* ========================================================================
  * Blit / key / audio
  * ======================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
+    if (!doom) return;
     for (int dy = 0; dy < DOOM_H; dy++) {
         const u32 *row = doom + dy * DOOM_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
@@ -247,19 +283,32 @@ static void audio_drain(void) {
 }
 
 /* ========================================================================
- * WAD receive — animated LOADING + progress bar
+ * Try to open a path for writing.  Returns fd >= 0 on success.
+ * ======================================================================== */
+static s32 try_create_wad(const char *path) {
+    struct ps_ctx *c = &g_ctx;
+    if (!c->kopen) return -1;
+    s32 fd = (s32)NC(c->G, c->kopen, (u64)path, 0x601, 0x1FF, 0,0,0);
+    return fd;
+}
+
+/* ========================================================================
+ * WAD receive
  * ======================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
-    if (listen_fd < 0) return -1;
+    if (listen_fd < 0) {
+        udp_log("DoomPS: listen_fd < 0\n");
+        return -1;
+    }
 
     udp_log("DoomPS: waiting for WAD on TCP...\n");
 
     /* 500 ms timeout on accept so we can animate the dots. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 8) = 500000;    /* tv_usec = 500 ms */
+        *(u64 *)(tv + 8) = 500000;
         s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
                              (u64)listen_fd, 0xFFFF, 0x1006,
                              (u64)tv, 16, 0);
@@ -279,7 +328,6 @@ static int recv_wad(s32 listen_fd) {
         dots = (dots + 1) & 3;
     }
     if (client < 0) {
-        show_loading(c, 3, "accept() timed out");
         udp_log("DoomPS: accept failed\n");
         return -1;
     }
@@ -287,6 +335,7 @@ static int recv_wad(s32 listen_fd) {
     show_loading(c, 0, "WAD connected, receiving...");
     udp_log("DoomPS: receiving WAD...\n");
 
+    /* Read 8-byte big-endian size header */
     u8 hdr[8]; s32 got = 0;
     while (got < 8) {
         s32 n = (s32)NC(c->G, c->recv_fn,
@@ -294,6 +343,7 @@ static int recv_wad(s32 listen_fd) {
                         (u64)(8 - got), 0,0,0);
         if (n <= 0) {
             NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
+            udp_log("DoomPS: hdr read failed\n");
             return -1;
         }
         got += n;
@@ -301,14 +351,32 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
-    const char *out = "/savedata0/doom.wad";
-    s32 fd = (s32)NC(c->G, c->kopen, (u64)out, 0x601, 0x1FF, 0,0,0);
+    /* Try each candidate path until one opens */
+    s32 fd = -1;
+    const char *chosen = 0;
+    for (int i = 0; WAD_PATH_CANDIDATES[i]; i++) {
+        fd = try_create_wad(WAD_PATH_CANDIDATES[i]);
+        if (fd >= 0) {
+            chosen = WAD_PATH_CANDIDATES[i];
+            break;
+        }
+    }
+
     if (fd < 0) {
-        udp_log("DoomPS: cannot open output WAD\n");
+        udp_log("DoomPS: ALL WAD paths failed (tried av_contents, temp0, savedata0)\n");
         NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
         return -1;
     }
 
+    /* Save chosen path into ctx */
+    {
+        int i = 0;
+        while (chosen[i] && i < 127) { c->wad_path[i] = chosen[i]; i++; }
+        c->wad_path[i] = 0;
+    }
+    udp_log(c->wad_path);
+
+    /* Stream data */
     u8 chunk[WAD_CHUNK];
     u64 remaining = wad_size;
     u64 total = wad_size;
@@ -330,11 +398,12 @@ static int recv_wad(s32 listen_fd) {
     NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
     NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
 
-    int i = 0;
-    while (out[i] && i < 127) { g_ctx.wad_path[i] = out[i]; i++; }
-    g_ctx.wad_path[i] = 0;
+    if (remaining > 0) {
+        udp_log("DoomPS: WAD truncated\n");
+        return -1;
+    }
 
-    udp_log("DoomPS: WAD written\n");
+    udp_log("DoomPS: WAD written OK\n");
     show_loading(c, 3, "WAD ready, launching Doom...");
     return 0;
 }
@@ -343,7 +412,19 @@ static int recv_wad(s32 listen_fd) {
  * doomgeneric callbacks
  * ======================================================================== */
 extern u32 *DG_ScreenBuffer;
-void DG_Init(void) {}
+extern void doomgeneric_Create(int argc, char **argv);
+extern void doomgeneric_Tick(void);
+
+void DG_Init(void) {
+    /* doomgeneric expects the platform backend to allocate DG_ScreenBuffer.
+     * Without this, doom writes to NULL on the first rendered frame. */
+    if (!DG_ScreenBuffer) {
+        DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
+        if (!DG_ScreenBuffer) {
+            udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
+        }
+    }
+}
 
 void DG_DrawFrame(void) {
     struct ps_ctx *c = &g_ctx;
@@ -399,9 +480,6 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     }
 }
 
-extern void doomgeneric_Create(int argc, char **argv);
-extern void doomgeneric_Tick(void);
-
 /* ========================================================================
  * _start
  * ======================================================================== */
@@ -418,8 +496,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
-    /* NOTE: log first, then set step.  If the log crashes we want the
-     * previous step number, which correctly localizes the fault. */
     ext->step = 2;
 
     c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
@@ -488,9 +564,25 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                           (u64)"libScePad.sprx",0,0,0,0,0);
     udp_log("DoomPS: [15] Pad.sprx\n");
     ext->step = 15;
-    NC(c->G, c->load_mod, (u64)"libSceUserService.sprx",0,0,0,0,0);
+    s32 usr_mod = (s32)NC(c->G, c->load_mod,
+                          (u64)"libSceUserService.sprx",0,0,0,0,0);
     udp_log("DoomPS: [16] UserService.sprx\n");
     ext->step = 16;
+
+    /* Query real user ID for pad handle */
+    c->user_id = 0;
+    if (usr_mod > 0) {
+        void *get_user = SYM(c->G, c->D, usr_mod,
+                             "sceUserServiceGetInitialUser");
+        if (get_user) {
+            u32 uid = 0;
+            s32 rc = (s32)NC(c->G, get_user, (u64)&uid, 0,0,0,0,0);
+            if (rc == 0 && uid != 0) c->user_id = (s32)uid;
+        }
+    }
+    /* If UserService failed, try a small range of IDs.  Most consoles
+     * use 1; some devkits use 0.  This makes pad more likely to work. */
+    if (c->user_id == 0) c->user_id = 1;
 
     c->vid_open  = SYM(c->G, c->D, vid_mod, "sceVideoOutOpen");
     c->vid_close = SYM(c->G, c->D, vid_mod, "sceVideoOutClose");
@@ -592,7 +684,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->vid_rate)
         NC(c->G, c->vid_rate, (u64)c->video_h, 0,0,0,0,0);
 
-    /* First visible frame — the LOADING screen. */
     show_loading(c, 0, "Doom-PS starting up");
     udp_log("DoomPS: [32] first frame shown\n");
     ext->step = 32;
@@ -616,21 +707,44 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
     if (c->pad_geth)
-        c->pad_h = (s32)NC(c->G, c->pad_geth, 0, 0, 0, 0, 0, 0);
-    udp_log(c->pad_h >= 0 ? "DoomPS: [34] pad up\n"
-                          : "DoomPS: [34] pad N/A\n");
+        c->pad_h = (s32)NC(c->G, c->pad_geth, (u64)c->user_id, 0, 0, 0, 0, 0);
+    {
+        char b[64]; int p = 0;
+        const char *m = "DoomPS: [34] pad_h=";
+        while (m[p]) { b[p] = m[p]; p++; }
+        if (c->pad_h < 0) { b[p++]='-'; b[p++]='1'; }
+        else { b[p++]='0'+(c->pad_h/10)%10; b[p++]='0'+c->pad_h%10; }
+        b[p++]=' '; b[p++]='u'; b[p++]='i'; b[p++]='d'; b[p++]='=';
+        b[p++]='0'+(c->user_id/10)%10; b[p++]='0'+c->user_id%10;
+        b[p++]='\n'; b[p]=0;
+        udp_log(b);
+    }
     ext->step = 34;
 
     s32 tcp_listen_fd = (s32)ext->dbg[0];
     udp_log("DoomPS: [35] entering recv_wad\n");
     ext->step = 35;
-    if (recv_wad(tcp_listen_fd) != 0) {
-        const char *fb = "/savedata0/doom.wad";
-        int i = 0;
-        while (fb[i] && i < 127) { c->wad_path[i] = fb[i]; i++; }
-        c->wad_path[i] = 0;
-        udp_log("DoomPS: WAD recv failed, using /savedata0/doom.wad\n");
+
+    int wad_ok = (recv_wad(tcp_listen_fd) == 0);
+
+    if (!wad_ok) {
+        udp_log("DoomPS: WAD recv failed\n");
+        /* Do NOT proceed to doomgeneric_Create — it crashes on missing WAD */
+        show_error_and_hang(c, "WAD transfer failed",
+                            "Check PC->console TCP connectivity");
     }
+
+    /* Double-check the WAD file actually exists and is non-empty */
+    {
+        s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path, 0, 0, 0,0,0);
+        if (check < 0) {
+            udp_log("DoomPS: WAD verify failed\n");
+            show_error_and_hang(c, "WAD missing after transfer",
+                                c->wad_path);
+        }
+        NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
+    }
+
     udp_log("DoomPS: [36] WAD phase complete\n");
     ext->step = 36;
 
