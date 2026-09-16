@@ -1,0 +1,80 @@
+name: Extract ZIP to Root
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "*.zip"
+
+permissions:
+  contents: write
+
+jobs:
+  extract-zip:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find and extract ZIP files
+        shell: bash
+        run: |
+          set -e
+
+          shopt -s nullglob
+          zips=(./*.zip)
+
+          if [ ${#zips[@]} -eq 0 ]; then
+            echo "No ZIP files found in repository root."
+            exit 0
+          fi
+
+          for zip in "${zips[@]}"; do
+            echo "Processing: $zip"
+
+            # Temporary directory used only during extraction
+            temp_dir="$(mktemp -d)"
+
+            # Extract ZIP into temporary directory
+            unzip -q "$zip" -d "$temp_dir"
+
+            # Move EVERYTHING from the extracted archive into repo root.
+            # This also handles ZIPs containing a single top-level folder.
+            cp -a "$temp_dir"/. ./ 
+
+            # Delete temporary directory
+            rm -rf "$temp_dir"
+
+            # Delete the original ZIP
+            rm -f "$zip"
+
+            echo "Finished: $zip"
+          done
+
+      - name: Show resulting files
+        run: |
+          echo "Repository root after extraction:"
+          find . -maxdepth 2 -type f \
+            ! -path "./.git/*" \
+            -print | sort
+
+      - name: Commit and push changes
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+
+          git commit -m "Extract ZIP contents to repository root"
+          git push
