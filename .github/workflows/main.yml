@@ -16,10 +16,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Find and extract ZIP files
+      - name: Extract ZIP contents directly into root
         shell: bash
         run: |
           set -e
@@ -35,37 +33,43 @@ jobs:
           for zip in "${zips[@]}"; do
             echo "Processing: $zip"
 
-            # Temporary directory used only during extraction
-            temp_dir="$(mktemp -d)"
+            TEMP_DIR="$(mktemp -d)"
 
             # Extract ZIP into temporary directory
-            unzip -q "$zip" -d "$temp_dir"
+            unzip -q "$zip" -d "$TEMP_DIR"
 
-            # Move EVERYTHING from the extracted archive into repo root.
-            # This also handles ZIPs containing a single top-level folder.
-            cp -a "$temp_dir"/. ./ 
+            # If the ZIP contains exactly one top-level directory,
+            # extract the CONTENTS of that directory into the repo root.
+            entries=("$TEMP_DIR"/*)
 
-            # Delete temporary directory
-            rm -rf "$temp_dir"
+            if [ ${#entries[@]} -eq 1 ] && [ -d "${entries[0]}" ]; then
+              TOP_DIR="${entries[0]}"
+
+              echo "Top-level folder detected: $(basename "$TOP_DIR")"
+              echo "Moving its contents into repository root..."
+
+              # The /* is intentional:
+              # copy the CONTENTS, not the folder itself.
+              cp -a "$TOP_DIR"/. ./
+            else
+              echo "No single top-level folder detected."
+              echo "Copying archive contents directly into repository root..."
+
+              cp -a "$TEMP_DIR"/. ./
+            fi
+
+            # Remove temporary extraction directory
+            rm -rf "$TEMP_DIR"
 
             # Delete the original ZIP
             rm -f "$zip"
 
-            echo "Finished: $zip"
+            echo "Done: $zip"
           done
 
-      - name: Show resulting files
-        run: |
-          echo "Repository root after extraction:"
-          find . -maxdepth 2 -type f \
-            ! -path "./.git/*" \
-            -print | sort
-
-      - name: Commit and push changes
+      - name: Commit changes
         shell: bash
         run: |
-          set -e
-
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
@@ -76,5 +80,5 @@ jobs:
             exit 0
           fi
 
-          git commit -m "Extract ZIP contents to repository root"
+          git commit -m "Extract ZIP contents to root"
           git push
