@@ -1,13 +1,5 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
- *
- * doomgeneric calls a huge amount of libc.  Because we link with
- * -nostdlib -nostartfiles (required for Luac0re shellcode), we have
- * to provide every one of those symbols ourselves.
- *
- * Nothing here is fast or complete.  It exists to make doom link and
- * run on PS4/PS5.  File I/O is routed through libkernel's
- * sceKernelOpen/Read/Write/Close/Lseek, memory through mmap.
  */
 
 #include "core.h"
@@ -48,6 +40,7 @@ void *malloc(size_t size) {
     __pool_used += size;
     return p;
 }
+
 void *calloc(size_t n, size_t size) {
     size_t total = n * size;
     void *p = malloc(total);
@@ -56,6 +49,7 @@ void *calloc(size_t n, size_t size) {
     for (size_t i = 0; i < total; i++) b[i] = 0;
     return p;
 }
+
 void *realloc(void *p, size_t size) {
     if (!p) return malloc(size);
     if (!size) return p;
@@ -66,6 +60,7 @@ void *realloc(void *p, size_t size) {
     for (size_t i = 0; i < size; i++) d[i] = s[i];
     return np;
 }
+
 void free(void *p) { (void)p; }
 
 /* ===== mem* ===== */
@@ -75,6 +70,7 @@ void *memcpy(void *d, const void *s, size_t n) {
     while (n--) *dd++ = *ss++;
     return d;
 }
+
 void *memmove(void *d, const void *s, size_t n) {
     unsigned char *dd = (unsigned char *)d;
     const unsigned char *ss = (const unsigned char *)s;
@@ -82,11 +78,13 @@ void *memmove(void *d, const void *s, size_t n) {
     else { dd += n; ss += n; while (n--) *--dd = *--ss; }
     return d;
 }
+
 void *memset(void *d, int c, size_t n) {
     unsigned char *p = (unsigned char *)d;
     while (n--) *p++ = (unsigned char)c;
     return d;
 }
+
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = (const unsigned char *)a;
     const unsigned char *y = (const unsigned char *)b;
@@ -96,40 +94,50 @@ int memcmp(const void *a, const void *b, size_t n) {
 
 /* ===== string ===== */
 size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
+
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
+
 int strncmp(const char *a, const char *b, size_t n) {
     while (n && *a && *a == *b) { a++; b++; n--; }
     return n ? (unsigned char)*a - (unsigned char)*b : 0;
 }
+
 static int __lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
+
 int strcasecmp(const char *a, const char *b) {
     while (*a && __lc((unsigned char)*a) == __lc((unsigned char)*b)) { a++; b++; }
     return __lc((unsigned char)*a) - __lc((unsigned char)*b);
 }
+
 int strncasecmp(const char *a, const char *b, size_t n) {
     while (n && *a && __lc((unsigned char)*a) == __lc((unsigned char)*b)) { a++; b++; n--; }
     return n ? __lc((unsigned char)*a) - __lc((unsigned char)*b) : 0;
 }
+
 char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)); return r; }
+
 char *strncpy(char *d, const char *s, size_t n) {
     char *r = d;
     while (n && (*d = *s)) { d++; s++; n--; }
     while (n--) *d++ = 0;
     return r;
 }
+
 char *strchr(const char *s, int c) {
     while (*s) { if (*s == (char)c) return (char *)s; s++; }
     return (char)c == 0 ? (char *)s : 0;
 }
+
 char *strrchr(const char *s, int c) {
     const char *last = 0;
     while (*s) { if (*s == (char)c) last = s; s++; }
     if ((char)c == 0) return (char *)s;
     return (char *)last;
 }
+
 char *strstr(const char *hay, const char *needle) {
     if (!*needle) return (char *)hay;
     for (; *hay; hay++) {
@@ -139,6 +147,7 @@ char *strstr(const char *hay, const char *needle) {
     }
     return 0;
 }
+
 char *strdup(const char *s) {
     size_t len = strlen(s) + 1;
     char *p = (char *)malloc(len);
@@ -169,6 +178,7 @@ static const int __toupper_tbl[384]            = {0};
 static const int *__toupper_tbl_p              = __toupper_tbl + 128;
 static const int __tolower_tbl[384]            = {0};
 static const int *__tolower_tbl_p              = __tolower_tbl + 128;
+
 const unsigned short **__ctype_b_loc(void)       { return &__ctype_tbl_p; }
 const int **__ctype_toupper_loc(void)            { return &__toupper_tbl_p; }
 const int **__ctype_tolower_loc(void)            { return &__tolower_tbl_p; }
@@ -176,6 +186,7 @@ const int **__ctype_tolower_loc(void)            { return &__tolower_tbl_p; }
 /* ===== numeric ===== */
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
+
 int atoi(const char *s) {
     int v = 0, neg = 0;
     while (*s == ' ' || *s == '\t') s++;
@@ -183,6 +194,7 @@ int atoi(const char *s) {
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
     return neg ? -v : v;
 }
+
 double atof(const char *s) { return (double)atoi(s); }
 double fabs(double x) { return x < 0 ? -x : x; }
 
@@ -193,11 +205,11 @@ int *__errno_location(void) { return &__errno_val; }
 /* ===== stdio ===== */
 typedef struct _ps_file FILE;
 struct _ps_file {
-    int fd;             /* >=0 for write mode; -1 for read mode (buffered) */
+    int fd;
     int writable;
     long pos;
     long size;
-    unsigned char *buf; /* read mode only */
+    unsigned char *buf;
 };
 
 static FILE __null_file = { -1, 0, 0, 0, 0 };
@@ -219,7 +231,6 @@ static FILE *alloc_slot(void) {
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
     int writable = (mode[0] == 'w' || mode[0] == 'a');
-    /* O_RDONLY=0 ; O_WRONLY|O_CREAT|O_TRUNC = 0x601 (FreeBSD) */
     int flags = writable ? 0x601 : 0x0000;
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
@@ -300,18 +311,20 @@ int fseek(FILE *f, long off, int whence) {
     else if (whence == 2) f->pos = f->size + off;
     return 0;
 }
+
 long ftell(FILE *f)  { return f ? f->pos : -1; }
 int  fflush(FILE *f) { (void)f; return 0; }
 int  feof(FILE *f)   { return f ? (f->pos >= f->size) : 1; }
 
 int remove(const char *path) { (void)path; return 0; }
 int rename(const char *a, const char *b) { (void)a; (void)b; return 0; }
+
 int mkdir(const char *path, unsigned int mode) {
     if (!fn_kmkdir) return -1;
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
-/* printf family — silent.  Doom uses them only for debug. */
+/* printf family — silent. */
 int printf(const char *fmt, ...)                           { (void)fmt; return 0; }
 int fprintf(FILE *f, const char *fmt, ...)                 { (void)f; (void)fmt; return 0; }
 int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) { (void)f; (void)fmt; (void)a; return 0; }
@@ -319,7 +332,29 @@ int sprintf(char *b, const char *fmt, ...)                 { if (b) b[0]=0; (voi
 int snprintf(char *b, size_t n, const char *fmt, ...)      { if (b && n) b[0]=0; (void)fmt; return 0; }
 int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a)
                                                            { if (b && n) b[0]=0; (void)fmt; (void)a; return 0; }
-int sscanf(const char *s, const char *fmt, ...)            { (void)s; (void)fmt; return 0; }
+
+/* ============================================================
+ * glibc redirects sscanf to __isoc99_sscanf at the header level.
+ * Attaching the mangled name via __asm__ guarantees the compiler
+ * emits the exact symbol the linker is looking for, regardless of
+ * what any header has already done to the identifier.
+ * ============================================================ */
+
+int sscanf(const char *s, const char *fmt, ...) { (void)s; (void)fmt; return 0; }
+
+int __isoc99_sscanf(const char *s, const char *fmt, ...)
+    __asm__("__isoc99_sscanf");
+int __isoc99_sscanf(const char *s, const char *fmt, ...) {
+    (void)s; (void)fmt;
+    return 0;
+}
+
+int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a)
+    __asm__("__isoc99_vsscanf");
+int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a) {
+    (void)s; (void)fmt; (void)a;
+    return 0;
+}
 
 int puts(const char *s)          { (void)s; return 0; }
 int putchar(int c)               { return c; }
