@@ -22,20 +22,29 @@ OUR_C := src/main.c src/i_sound_ps.c
 OUR_O := $(patsubst src/%.c,$(BUILD_DIR)/%.o,$(OUR_C))
 
 # ---- doomgeneric sources ----
-# Grab every .c, then drop all platform backends.
-# The pattern `doomgeneric_*.c` matches doomgeneric_allegro.c,
-# doomgeneric_emscripten.c, doomgeneric_sdl.c, doomgeneric_sdl2.c,
-# doomgeneric_soso.c, doomgeneric_sosox.c, doomgeneric_win.c,
-# doomgeneric_xlib.c, etc.  It does NOT match doomgeneric.c itself
-# (dot, not underscore), so the core stays in.
 DG_ALL_C := $(wildcard $(DOOM_DIR)/*.c)
-DG_BAD_C := $(wildcard $(DOOM_DIR)/doomgeneric_*.c)
-DG_C     := $(filter-out $(DG_BAD_C),$(DG_ALL_C))
 
-# If your i_sound_ps.c fully replaces doomgeneric's own i_sound.c,
-# uncomment the next line to avoid duplicate I_Sound*/I_Music* symbols:
-# DG_C := $(filter-out $(DOOM_DIR)/i_sound.c,$(DG_C))
+# Platform glue: doomgeneric_allegro.c, doomgeneric_emscripten.c,
+# doomgeneric_sdl.c, doomgeneric_sdl2.c, doomgeneric_soso.c,
+# doomgeneric_sosox.c, doomgeneric_win.c, doomgeneric_xlib.c ...
+# (note: does NOT match doomgeneric.c — the core — because of the dot)
+DG_PLATFORM_C := $(wildcard $(DOOM_DIR)/doomgeneric_*.c)
 
+# Host audio backends (require allegro/sdl/soso/xlib/openal headers)
+DG_HOSTAUD_C := \
+    $(wildcard $(DOOM_DIR)/i_allegro*.c) \
+    $(wildcard $(DOOM_DIR)/i_sdl*.c) \
+    $(wildcard $(DOOM_DIR)/i_soso*.c) \
+    $(wildcard $(DOOM_DIR)/i_xlib*.c) \
+    $(wildcard $(DOOM_DIR)/i_oal*.c)
+
+# Other host-specific files
+DG_OTHER_C := \
+    $(wildcard $(DOOM_DIR)/i_psp*.c) \
+    $(wildcard $(DOOM_DIR)/i_videohr*.c) \
+    $(DOOM_DIR)/i_main.c
+
+DG_C := $(filter-out $(DG_PLATFORM_C) $(DG_HOSTAUD_C) $(DG_OTHER_C),$(DG_ALL_C))
 DG_O := $(patsubst $(DOOM_DIR)/%.c,$(BUILD_DIR)/dg/%.o,$(DG_C))
 
 OBJS := $(OUR_O) $(DG_O)
