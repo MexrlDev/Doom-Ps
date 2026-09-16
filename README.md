@@ -120,3 +120,8 @@ different game, update these three constants in `src/core.h`:
 | WAD transfer stalls | Firewall blocking port 5000, or Lua not yet at accept() |
 | No audio | Normal — audio_h < 0 means libSceAudioOut unavailable, game still runs |
 | Linker errors in CI | doomgeneric API changed — check i_sound.h for `mixsound` symbol name |
+
+---
+
+## Credits
+
