@@ -3,8 +3,8 @@
 Doom (via [doomgeneric](https://github.com/ozkl/doomgeneric)) running as
 homebrew on PS4 / PS5 through the **Luac0re** shellcode loader.
 
-Verified: both source files compile and link to a valid x86-64 ELF with
-base address 0x0, single RWX LOAD segment — the exact format Luac0re expects.
+Doom-Ps is based of [EmuC0re](https://github.com/egycnq/EmuC0re) by [egycnq](https://github.com/egycnq) and also based on [Exp-C0re](https://github.com/MexrlDev/Exp-C0re) 
+and based of [LuaC0re](https://github.com/Gezine/Luac0re) by [Gezine](https://github.com/Gezine) and also based on [doomgeneric](https://github.com/ozkl/doomgeneric)) 
 
 ---
 
@@ -124,4 +124,14 @@ different game, update these three constants in `src/core.h`:
 ---
 
 ## Credits
+* MexrlDev - Project Development
 
+**Special Thanks To**
+ - [egycnq](https://github.com/egycnq) for [EmuC0re](https://github.com/egycnq/EmuC0re)
+ - [Gezine](https://github.com/Gezine) for [Luac0re](https://github.com/Gezine/Luac0re)
+ - Claude & Deepseek models for codes development bug researching
+
+---
+
+
+# Epeical
