@@ -4,8 +4,8 @@
  * PS4/PS5 platform layer for doomgeneric, built on the EmuC0re pattern.
  *
  * DIAGNOSTIC BUILD: logs a UDP message after every step so we can see
- * exactly where the shellcode dies. Once the crash is localized, remove
- * the udp_log() calls between the SYMs — they add ~1 KB to the binary.
+ * exactly where the shellcode dies. Once the crash is localized, you
+ * can remove the intermediate udp_log() calls between the SYMs.
  */
 
 #include "core.h"
@@ -47,6 +47,7 @@ static u64 ps_strlen(const char *s) {
 #define DS_L3       0x00000002
 #define DS_R3       0x00000004
 
+/* Doom key codes (doomkeys.h values) */
 #define DG_KEY_RIGHTARROW  0xae
 #define DG_KEY_LEFTARROW   0xac
 #define DG_KEY_UPARROW     0xad
@@ -135,7 +136,7 @@ static void udp_log(const char *msg) {
 }
 
 /* ========================================================================
- * Blit 320×200 RGBA → 1920×1080 BGRA
+ * Blit 320x200 RGBA -> 1920x1080 BGRA
  * ======================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
@@ -361,90 +362,88 @@ extern void doomgeneric_Tick(void);
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
-    /* ----- IMMEDIATE: mark step 1 before doing anything ----- */
+    /* ---- Step 1: absolute first thing, mark arrival ---- */
     ext->step = 1;
 
     void *G = (void *)(eboot_base + GADGET_OFFSET);
     void *D = (void *)dlsym_addr;
 
-    /* ----- Provide libc shims to doomgeneric FIRST ----- */
-    extern void ps_libc_init(void *G, void *D);
-    ps_libc_init(G, D);
-    ext->step = 2;
-
     struct ps_ctx *c = &g_ctx;
+
+    /* ---- Step 2: clear ctx, wire up log socket ---- */
     ps_memset(c, 0, sizeof(*c));
     c->video_h = -1;
     c->audio_h = -1;
     c->pad_h   = -1;
     c->log_fd  = -1;
     c->ext     = ext;
-
-    c->G = G;
-    c->D = D;
-
-    /* Copy log socket details from ext IMMEDIATELY */
-    c->log_fd = ext->log_fd;
+    c->G       = G;
+    c->D       = D;
+    c->log_fd  = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
+    ext->step = 2;
 
-    /* Resolve sendto FIRST so we can log everything after */
-    c->sendto_fn = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sendto");
+    /* ---- Step 3: resolve sendto FIRST so we can log from here on ---- */
+    c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     ext->step = 3;
     udp_log("DoomPS: [3] sendto resolved\n");
 
-    /* Args from Lua */
-    s32 tcp_listen_fd = (s32)ext->dbg[0];
-    s32 userId        = (s32)ext->dbg[2];
-    (void)userId;
+    /* ---- Step 4: bring up libc shims for doomgeneric ---- */
+    extern void ps_libc_init(void *G, void *D);
+    ps_libc_init(G, D);
+    ext->step = 4;
+    udp_log("DoomPS: [4] ps_libc_init OK\n");
 
-    /* ----- Resolve remaining libkernel symbols ----- */
-    c->usleep_fn     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelUsleep");
-    ext->step = 4; udp_log("DoomPS: [4] usleep resolved\n");
+    /* ---- Step 5+: remaining libkernel symbols ---- */
+    c->usleep_fn     = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelUsleep");
+    ext->step = 5; udp_log("DoomPS: [5] usleep resolved\n");
 
-    c->cancel        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "scePthreadCancel");
-    c->load_mod      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
-    ext->step = 5; udp_log("DoomPS: [5] cancel + load_mod resolved\n");
+    c->cancel        = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCancel");
+    c->load_mod      = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLoadStartModule");
+    ext->step = 6; udp_log("DoomPS: [6] cancel + load_mod resolved\n");
 
-    c->alloc_dm      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
-    c->map_dm        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
-    c->dm_size       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
-    ext->step = 6; udp_log("DoomPS: [6] dmem trio resolved\n");
+    c->alloc_dm      = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
+    c->map_dm        = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
+    c->dm_size       = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
+    ext->step = 7; udp_log("DoomPS: [7] dmem trio resolved\n");
 
-    c->create_eq     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelCreateEqueue");
-    c->wait_eq       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelWaitEqueue");
-    c->delete_eq     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelDeleteEqueue");
-    ext->step = 7; udp_log("DoomPS: [7] equeue trio resolved\n");
+    c->create_eq     = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelCreateEqueue");
+    c->wait_eq       = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWaitEqueue");
+    c->delete_eq     = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelDeleteEqueue");
+    ext->step = 8; udp_log("DoomPS: [8] equeue trio resolved\n");
 
-    c->mmap_fn       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "mmap");
-    c->kopen         = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelOpen");
-    c->kwrite        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelWrite");
-    c->kclose        = SYM(c->G, c->D, LIBKERNEL_HANDLE, "sceKernelClose");
-    c->clock_gettime = SYM(c->G, c->D, LIBKERNEL_HANDLE, "clock_gettime");
-    ext->step = 8; udp_log("DoomPS: [8] file/clock resolved\n");
+    c->mmap_fn       = SYM(G, D, LIBKERNEL_HANDLE, "mmap");
+    c->kopen         = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelOpen");
+    c->kwrite        = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWrite");
+    c->kclose        = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose");
+    c->clock_gettime = SYM(G, D, LIBKERNEL_HANDLE, "clock_gettime");
+    ext->step = 9; udp_log("DoomPS: [9] file/clock resolved\n");
 
-    c->accept_fn     = SYM(c->G, c->D, LIBKERNEL_HANDLE, "accept");
-    c->recv_fn       = SYM(c->G, c->D, LIBKERNEL_HANDLE, "recv");
-    c->close_fn      = SYM(c->G, c->D, LIBKERNEL_HANDLE, "close");
-    ext->step = 9; udp_log("DoomPS: [9] socket fns resolved\n");
+    c->accept_fn     = SYM(G, D, LIBKERNEL_HANDLE, "accept");
+    c->recv_fn       = SYM(G, D, LIBKERNEL_HANDLE, "recv");
+    c->close_fn      = SYM(G, D, LIBKERNEL_HANDLE, "close");
+    ext->step = 10; udp_log("DoomPS: [10] socket fns resolved\n");
 
     if (!c->usleep_fn || !c->load_mod) {
-        ext->status = -1; ext->step = 10; return;
+        ext->status = -1; ext->step = 11;
+        udp_log("DoomPS: [11] symbol check FAILED\n");
+        return;
     }
-    ext->step = 11;
+    ext->step = 12;
     udp_log("DoomPS: symbols OK\n");
 
-    /* ----- Load sprx modules ----- */
-    s32 vid_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceVideoOut.sprx",  0,0,0,0,0);
-    ext->step = 12; udp_log("DoomPS: [12] VideoOut.sprx loaded\n");
+    /* ---- Load sprx modules ---- */
+    s32 vid_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceVideoOut.sprx", 0,0,0,0,0);
+    ext->step = 13; udp_log("DoomPS: [13] VideoOut.sprx loaded\n");
 
-    s32 aud_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceAudioOut.sprx",  0,0,0,0,0);
-    ext->step = 13; udp_log("DoomPS: [13] AudioOut.sprx loaded\n");
+    s32 aud_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceAudioOut.sprx", 0,0,0,0,0);
+    ext->step = 14; udp_log("DoomPS: [14] AudioOut.sprx loaded\n");
 
-    s32 pad_mod = (s32)NC(c->G, c->load_mod, (u64)"libScePad.sprx",       0,0,0,0,0);
-    ext->step = 14; udp_log("DoomPS: [14] Pad.sprx loaded\n");
+    s32 pad_mod = (s32)NC(c->G, c->load_mod, (u64)"libScePad.sprx", 0,0,0,0,0);
+    ext->step = 15; udp_log("DoomPS: [15] Pad.sprx loaded\n");
 
     NC(c->G, c->load_mod, (u64)"libSceUserService.sprx", 0,0,0,0,0);
-    ext->step = 15; udp_log("DoomPS: [15] UserService.sprx loaded\n");
+    ext->step = 16; udp_log("DoomPS: [16] UserService.sprx loaded\n");
 
     c->vid_open  = SYM(c->G, c->D, vid_mod, "sceVideoOutOpen");
     c->vid_close = SYM(c->G, c->D, vid_mod, "sceVideoOutClose");
@@ -452,20 +451,19 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->vid_flip  = SYM(c->G, c->D, vid_mod, "sceVideoOutSubmitFlip");
     c->vid_rate  = SYM(c->G, c->D, vid_mod, "sceVideoOutSetFlipRate");
     c->vid_evt   = SYM(c->G, c->D, vid_mod, "sceVideoOutAddFlipEvent");
-    ext->step = 16; udp_log("DoomPS: [16] VideoOut fns resolved\n");
+    ext->step = 17; udp_log("DoomPS: [17] VideoOut fns resolved\n");
 
     c->aud_open  = SYM(c->G, c->D, aud_mod, "sceAudioOutOpen");
     c->aud_out   = SYM(c->G, c->D, aud_mod, "sceAudioOutOutput");
     c->aud_close = SYM(c->G, c->D, aud_mod, "sceAudioOutClose");
-    ext->step = 17; udp_log("DoomPS: [17] AudioOut fns resolved\n");
+    ext->step = 18; udp_log("DoomPS: [18] AudioOut fns resolved\n");
 
     c->pad_init_fn = SYM(c->G, c->D, pad_mod, "scePadInit");
     c->pad_geth    = SYM(c->G, c->D, pad_mod, "scePadGetHandle");
     c->pad_read    = SYM(c->G, c->D, pad_mod, "scePadRead");
-    ext->step = 18; udp_log("DoomPS: [18] Pad fns resolved\n");
+    ext->step = 19; udp_log("DoomPS: [19] Pad fns resolved\n");
 
-    /* ----- Kill existing game renderer ----- */
-    ext->step = 19; udp_log("DoomPS: [19] killing GS thread\n");
+    /* ---- Kill existing game renderer ---- */
     if (c->cancel) {
         u64 gs = *(u64 *)(eboot_base + EBOOT_GS_THREAD);
         if (gs) NC(c->G, c->cancel, gs, 0,0,0,0,0);
@@ -479,7 +477,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
     ext->step = 21; udp_log("DoomPS: [21] old VideoOut closed\n");
 
-    /* ----- Open VideoOut ----- */
+    /* ---- Open VideoOut ---- */
     c->video_h = (s32)NC(c->G, c->vid_open, 0xFF, 0, 0, 0, 0, 0);
     if (c->video_h < 0) {
         ext->status = -10; ext->step = 22;
@@ -488,14 +486,14 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
     ext->step = 23; udp_log("DoomPS: [23] VideoOut open OK\n");
 
-    /* ----- Equeue ----- */
+    /* ---- Equeue ---- */
     if (c->create_eq)
         NC(c->G, c->create_eq, (u64)&c->eq, (u64)"doomq", 0,0,0,0);
     if (c->vid_evt && c->eq)
         NC(c->G, c->vid_evt, c->eq, (u64)c->video_h, 0,0,0,0);
     ext->step = 24; udp_log("DoomPS: [24] equeue created\n");
 
-    /* ----- Direct memory for framebuffers ----- */
+    /* ---- Direct memory for framebuffers ---- */
     u64 mem_total = c->dm_size
         ? NC(c->G, c->dm_size, 0,0,0,0,0,0)
         : 0x300000000ULL;
@@ -521,7 +519,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
     ext->step = 28; udp_log("DoomPS: [28] FBs cleared\n");
 
-    /* ----- Register framebuffers ----- */
+    /* ---- Register framebuffers ---- */
     u8 attr[64];
     ps_memset(attr, 0, 64);
     *(u32 *)(attr +  0) = 0x80000000;
@@ -540,7 +538,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     if (c->vid_rate) NC(c->G, c->vid_rate, (u64)c->video_h, 0, 0,0,0,0);
 
-    /* ----- Audio ----- */
+    /* ---- Audio ---- */
     if (c->aud_close)
         for (int h = 0; h < 8; h++) NC(c->G, c->aud_close, (u64)h, 0,0,0,0,0);
     if (c->aud_open)
@@ -559,7 +557,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     udp_log(c->audio_h >= 0 ? "DoomPS: [33] audio up\n"
                             : "DoomPS: [33] audio N/A\n");
 
-    /* ----- Pad ----- */
+    /* ---- Pad ---- */
     if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth, 0, 0, 0, 0, 0, 0);
@@ -567,18 +565,19 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     udp_log(c->pad_h >= 0 ? "DoomPS: [34] pad up\n"
                           : "DoomPS: [34] pad N/A\n");
 
-    /* ----- Receive WAD ----- */
+    /* ---- Receive WAD ---- */
+    s32 tcp_listen_fd = (s32)ext->dbg[0];
     ext->step = 35; udp_log("DoomPS: [35] calling recv_wad\n");
     if (recv_wad(tcp_listen_fd) != 0) {
         const char *fb = "/savedata0/doom.wad";
         int i = 0;
         while (fb[i] && i < 127) { c->wad_path[i] = fb[i]; i++; }
         c->wad_path[i] = 0;
-        udp_log("DoomPS: WAD recv failed, trying /savedata0/doom.wad\n");
+        udp_log("DoomPS: WAD recv failed, using /savedata0/doom.wad\n");
     }
     ext->step = 36; udp_log("DoomPS: [36] WAD phase complete\n");
 
-    /* ----- Build argv ----- */
+    /* ---- Build argv ---- */
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
     const char *argv[4];
