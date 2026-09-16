@@ -1,0 +1,60 @@
+name: Move doom-ps to Root
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  move-to-root:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Move everything from doom-ps into root
+        shell: bash
+        run: |
+          set -e
+
+          if [ ! -d "doom-ps" ]; then
+            echo "ERROR: doom-ps directory does not exist."
+            exit 1
+          fi
+
+          echo "Contents of doom-ps:"
+          ls -la doom-ps
+
+          echo "Moving contents into repository root..."
+
+          # The "/." is IMPORTANT.
+          # It means: copy everything INSIDE doom-ps,
+          # NOT the doom-ps directory itself.
+          cp -a doom-ps/. ./
+
+          echo "Removing empty doom-ps directory..."
+
+          rm -rf doom-ps
+
+          echo "Final repository structure:"
+          find . -maxdepth 2 -not -path "./.git*" -print
+
+      - name: Commit and push
+        shell: bash
+        run: |
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add -A
+
+          if git diff --cached --quiet; then
+            echo "Nothing changed."
+            exit 0
+          fi
+
+          git commit -m "Move doom-ps contents to repository root"
+          git push
