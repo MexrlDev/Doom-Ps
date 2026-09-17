@@ -1,12 +1,8 @@
 /*
- * doom-ps/src/main.c — v14
+ * doom-ps/src/main.c — v15
  *
- * Fixes over v13:
- *   - O_CREAT/O_TRUNC use PS4/PS5 values (0x100 / 0x1000)
- *   - WAD open attempts unrolled, no nested-function stack frames
- *   - Single static diag buffer (no stack recursion in native_call)
- *   - "By MexrlDev" credit line under "doomgeneric on Luac0re"
- *   - Error screen says "Reboot game to recover"
+ * Fix over v14: WAD open flags corrected from 0x1101 to 0x0601.
+ * FreeBSD/PS4/PS5 O_CREAT = 0x200, O_TRUNC = 0x400, not 0x100/0x1000.
  */
 
 #include "core.h"
@@ -68,13 +64,15 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DG_KEY_7 '7'
 
 /* ========================================================================
- * PS4/PS5 file open flags — CORRECTED for libkernel
+ * FreeBSD / PS4 / PS5 file open flags — THE REAL VALUES
  * ======================================================================== */
-#define O_RDONLY_  0x0000
 #define O_WRONLY_  0x0001
 #define O_RDWR_    0x0002
-#define O_CREAT_   0x0100   /* PS4/PS5 value (not FreeBSD desktop) */
-#define O_TRUNC_   0x1000   /* PS4/PS5 value */
+#define O_CREAT_   0x0200   /* correct: FreeBSD standard */
+#define O_TRUNC_   0x0400   /* correct: FreeBSD standard */
+#define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)   /* 0x0601 */
+#define O_RW_CREAT_TRUNC  (O_RDWR_   | O_CREAT_ | O_TRUNC_)   /* 0x0602 */
+#define O_WR_CREAT        (O_WRONLY_ | O_CREAT_)              /* 0x0201 */
 
 /* ========================================================================
  * Global context
@@ -115,7 +113,6 @@ static struct ps_ctx {
     struct ext_args *ext;
 } g_ctx;
 
-/* Single static diag buffer — no per-call stack allocation */
 static char g_diag[256];
 
 /* ========================================================================
@@ -129,7 +126,6 @@ static void udp_log(const char *msg) {
        0, (u64)c->log_sa, 16);
 }
 
-/* Log "DoomPS: <prefix><path> fd=0xNNNNNNNN\n" */
 static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     int p = 0;
     const char *m = prefix;
@@ -164,7 +160,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ========================================================================
- * On-screen LOADING / progress / error
+ * LOADING / progress / error
  * ======================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -174,7 +170,6 @@ static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    /* By MexrlDev — 3px below the previous line */
     ps_draw_str_center(fb, 427, "By MexrlDev",
                        0xFF606060, 2);
 
@@ -302,7 +297,7 @@ static void audio_drain(void) {
 }
 
 /* ========================================================================
- * WAD receive — unrolled open attempts, checkpoints at each step
+ * WAD receive — CORRECTED FLAGS 0x0601
  * ======================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
@@ -357,7 +352,6 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
-    /* Print WAD size */
     {
         int p = 0;
         const char *m = "DoomPS: WAD size = ";
@@ -372,61 +366,61 @@ static int recv_wad(s32 listen_fd) {
     }
 
     /* ================================================================
-     * Unrolled open attempts — no nested functions, single static buffer,
-     * correct PS4/PS5 O_CREAT/O_TRUNC values.
+     * Correct flags: 0x0601 = O_WRONLY | O_CREAT | O_TRUNC
+     * This is exactly what EmuC0re's FTP uses.
      * ================================================================ */
     const char *wad_out = (const char *)0;
     s32 fd = -1;
 
-    udp_log("DoomPS: [W1] kopen /av_contents/content_tmp/doom.wad 0x1101\n");
+    udp_log("DoomPS: [W1] kopen /av_contents/content_tmp/doom.wad 0x0601\n");
     fd = (s32)NC(c->G, c->kopen,
                  (u64)"/av_contents/content_tmp/doom.wad",
-                 (u64)0x1101, 0x1FF, 0,0,0);
+                 (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
     diag_kopen("DoomPS: [W1r] ", "/av_contents/content_tmp/doom.wad", fd);
     if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
 
     if (fd < 0) {
-        udp_log("DoomPS: [W2] kopen /tmp/doom.wad 0x1101\n");
+        udp_log("DoomPS: [W2] kopen /data/doom.wad 0x0601\n");
         fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/tmp/doom.wad",
-                     (u64)0x1101, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W2r] ", "/tmp/doom.wad", fd);
-        if (fd >= 0) wad_out = "/tmp/doom.wad";
+                     (u64)"/data/doom.wad",
+                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W2r] ", "/data/doom.wad", fd);
+        if (fd >= 0) wad_out = "/data/doom.wad";
     }
 
     if (fd < 0) {
-        udp_log("DoomPS: [W3] kopen /savedata0/doom.wad 0x1101\n");
+        udp_log("DoomPS: [W3] kopen /savedata0/doom.wad 0x0601\n");
         fd = (s32)NC(c->G, c->kopen,
                      (u64)"/savedata0/doom.wad",
-                     (u64)0x1101, 0x1FF, 0,0,0);
+                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
         diag_kopen("DoomPS: [W3r] ", "/savedata0/doom.wad", fd);
         if (fd >= 0) wad_out = "/savedata0/doom.wad";
     }
 
     if (fd < 0) {
-        udp_log("DoomPS: [W4] kopen /temp0/doom.wad 0x1101\n");
+        udp_log("DoomPS: [W4] kopen /temp0/doom.wad 0x0601\n");
         fd = (s32)NC(c->G, c->kopen,
                      (u64)"/temp0/doom.wad",
-                     (u64)0x1101, 0x1FF, 0,0,0);
+                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
         diag_kopen("DoomPS: [W4r] ", "/temp0/doom.wad", fd);
         if (fd >= 0) wad_out = "/temp0/doom.wad";
     }
 
     if (fd < 0) {
-        udp_log("DoomPS: [W5] kopen doom.wad 0x1101\n");
+        udp_log("DoomPS: [W5] kopen /tmp/doom.wad 0x0601\n");
         fd = (s32)NC(c->G, c->kopen,
-                     (u64)"doom.wad",
-                     (u64)0x1101, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W5r] ", "doom.wad", fd);
-        if (fd >= 0) wad_out = "doom.wad";
+                     (u64)"/tmp/doom.wad",
+                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W5r] ", "/tmp/doom.wad", fd);
+        if (fd >= 0) wad_out = "/tmp/doom.wad";
     }
 
-    /* Fallback: try RDWR instead of WRONLY */
+    /* Fallback: /av_contents with RDWR */
     if (fd < 0) {
-        udp_log("DoomPS: [W6] kopen /av_contents/content_tmp/doom.wad 0x1102\n");
+        udp_log("DoomPS: [W6] kopen /av_contents/content_tmp/doom.wad 0x0602\n");
         fd = (s32)NC(c->G, c->kopen,
                      (u64)"/av_contents/content_tmp/doom.wad",
-                     (u64)0x1102, 0x1FF, 0,0,0);
+                     (u64)O_RW_CREAT_TRUNC, 0x1FF, 0,0,0);
         diag_kopen("DoomPS: [W6r] ", "/av_contents/content_tmp/doom.wad", fd);
         if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
     }
@@ -437,7 +431,6 @@ static int recv_wad(s32 listen_fd) {
         return -1;
     }
 
-    /* Save chosen path */
     {
         int i = 0;
         while (wad_out[i] && i < 127) { c->wad_path[i] = wad_out[i]; i++; }
@@ -453,7 +446,6 @@ static int recv_wad(s32 listen_fd) {
         udp_log(g_diag);
     }
 
-    /* Stream the WAD data */
     u8 chunk[WAD_CHUNK];
     u64 remaining = wad_size;
     u64 total = wad_size;
