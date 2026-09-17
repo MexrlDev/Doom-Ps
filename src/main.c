@@ -1,11 +1,11 @@
 /*
- * doom-ps/src/main.c — v23
+ * doom-ps/src/main.c — v24
  *
- * v23: clear inherited SO_RCVTIMEO on the accepted client socket.
- *      FreeBSD (PS4/PS5) inherits socket options from a listening
- *      socket to accepted sockets.  Our 500ms accept-timeout was
- *      inherited by the WAD client and made recv() fail whenever the
- *      stream paused >500ms.  Reset to 30s on the client.
+ * v24: added I_SubmitSound() calls in DG_DrawFrame so the sound mixer
+ *      runs.  doomgeneric has no audio thread — it expects the
+ *      platform's sound driver to call I_SubmitSound on its own.
+ *      Each call mixes 512 stereo frames (~10.7 ms @ 48 kHz); we call
+ *      it 8 times per render (~85 ms of audio per frame at ~8 fps).
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -21,6 +21,9 @@ extern char __bss_end[];
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
+
+/* i_sound_ps.c provides this — mixes channels into dg_audio_callback. */
+extern void I_SubmitSound(void);
 
 /* Doomgeneric's real framebuffer dimensions (2x upscaled from 320x200). */
 #define DOOMFB_W  640
@@ -259,6 +262,7 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
     }
 }
 
+/* Called by ps_libc.c's exit() when Doom hits I_Error. */
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
@@ -267,11 +271,13 @@ static void ps_error_display(const char *msg) {
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
 
-        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR", 0xFFFF4040, 6);
+        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR",
+                           0xFFFF4040, 6);
         if (msg && msg[0]) {
             ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
         } else {
-            ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
+            ps_draw_str_center(fb, 400, "(no message)",
+                               0xFFA0A0A0, 3);
         }
         ps_draw_str_center(fb, 900, "Reboot game to recover",
                            0xFF808080, 3);
@@ -344,7 +350,7 @@ static void audio_drain(void) {
 }
 
 /* ====================================================================
- * recv_wad — v23: clears inherited SO_RCVTIMEO on the accepted client.
+ * recv_wad — clears inherited SO_RCVTIMEO on the accepted client.
  * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
@@ -355,7 +361,6 @@ static int recv_wad(s32 listen_fd) {
     show_loading(c, 0, "Waiting for WAD upload...");
     udp_log("DoomPS: WAD screen drawn\n");
 
-    /* 500 ms timeout on the LISTENING socket (for animated waiting). */
     if (c->setsockopt_fn) {
         udp_log("DoomPS: setting SO_RCVTIMEO on listener\n");
         u8 tv[16] = {0};
@@ -377,14 +382,14 @@ static int recv_wad(s32 listen_fd) {
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* ---- Clear inherited SO_RCVTIMEO on the CLIENT socket ---- *
+    /* Clear inherited SO_RCVTIMEO on the CLIENT socket.
      * FreeBSD (PS4/PS5) inherits socket options from the listening
      * socket to accepted sockets.  Our 500ms accept-timeout was
      * inherited by the WAD client and made recv() fail whenever the
      * stream paused >500ms.  Reset to 30 seconds. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 8) = 30000000;   /* 30 s */
+        *(u64 *)(tv + 8) = 30000000;
         (void)NC(c->G, c->setsockopt_fn,
                  (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
         udp_log("DoomPS: client timeout cleared\n");
@@ -471,8 +476,7 @@ extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
 /* ====================================================================
- * DG_Init — do NOT allocate DG_ScreenBuffer.  doomgeneric_Create
- * already allocated it at 640*400*4 = 1 MB.
+ * DG_Init — do NOT allocate DG_ScreenBuffer (doomgeneric already did).
  * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
@@ -483,6 +487,9 @@ void DG_Init(void) {
     }
 }
 
+/* ====================================================================
+ * DG_DrawFrame — blits frame, presents, and pumps the sound mixer.
+ * ==================================================================== */
 void DG_DrawFrame(void) {
     static int draw_count = 0;
     draw_count++;
@@ -510,7 +517,16 @@ void DG_DrawFrame(void) {
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
-    audio_drain();
+
+    /* === Sound: push ~85 ms of audio per frame ===
+     * doomgeneric has no audio thread — it expects the platform sound
+     * driver to call I_SubmitSound on its own.  We call it 8 times per
+     * render: each call mixes 512 stereo frames (~10.7 ms @ 48 kHz),
+     * so 8 × 10.7 ≈ 85 ms of audio — roughly matching our render rate. */
+    for (int i = 0; i < 8; i++) {
+        I_SubmitSound();
+        audio_drain();
+    }
 
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
@@ -562,9 +578,11 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
+    /* 1) Apply ELF relocations */
     u64 load_base = (u64)&_start;
     int n_reloc = do_relocations(load_base);
 
+    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file) */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
