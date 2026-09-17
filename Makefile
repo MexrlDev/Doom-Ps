@@ -1,23 +1,18 @@
 # ============================================================
 # doom-ps/Makefile
 #
-# Builds doomgeneric (cloned by build.sh) + our shellcode into a
-# freestanding x86-64 blob for Luac0re.
+# Builds doomgeneric + our shellcode into a freestanding x86-64
+# blob for Luac0re.
 #
-# KEY CHANGE (v19):
-#   LDFLAGS now uses  -pie  instead of  -no-pie.
-#   This makes the linker emit .rela.dyn relocation records into the
-#   output.  Our _start walks those records and applies load_base to
-#   every R_X86_64_RELATIVE entry, fixing absolute pointers stored in
-#   .data (e.g. defaults[].location = &screenblocks).  Without this,
-#   Doom crashes silently inside M_LoadDefaults.
+# Uses GNU make's wildcard + filter-out (not $(shell ls | grep))
+# so the doomgeneric source list is discovered reliably on all
+# platforms, including GitHub Actions runners.
 # ============================================================
 
 DOOM_DIR := doomgeneric
 
 CC      := gcc
 OBJCOPY := objcopy
-PYTHON  := python3
 
 # ------------------------------------------------------------------
 # C flags
@@ -41,7 +36,7 @@ CFLAGS := \
     -I$(DOOM_DIR)
 
 # ------------------------------------------------------------------
-# Linker flags — CRITICAL: -pie, NOT -no-pie
+# Linker flags — -pie is REQUIRED so the linker emits .rela.dyn
 # ------------------------------------------------------------------
 LDFLAGS := \
     -T linker.ld \
@@ -52,29 +47,43 @@ LDFLAGS := \
     -pie
 
 # ------------------------------------------------------------------
-# Source files
+# Our source files
 # ------------------------------------------------------------------
 OUR_SRCS := \
     src/main.c \
     src/ps_libc.c
 
-# doomgeneric source files — everything except platform backends
-DOOM_SRCS := $(shell \
-    ls $(DOOM_DIR)/*.c 2>/dev/null | \
-    grep -v -E '(doomgeneric_|i_allegro|i_sdl|i_soso|i_xlib|i_oal|i_main|i_psp|i_videohr)' \
-)
+# ------------------------------------------------------------------
+# doomgeneric sources — everything except platform backends.
+#
+# The `%` in filter-out is a make wildcard, not a shell glob.
+# doomgeneric/doomgeneric.c   → KEPT   (has Create/Tick/ScreenBuffer)
+# doomgeneric/doomgeneric_*.c → DROPPED (platform backends)
+# doomgeneric/i_main.c        → DROPPED (its own main())
+# doomgeneric/i_sdl.c etc.    → DROPPED
+# doomgeneric/i_sound.c etc.  → KEPT
+# ------------------------------------------------------------------
+ALL_DOOM_C := $(wildcard $(DOOM_DIR)/*.c)
+
+DOOM_SRCS := $(filter-out \
+    $(DOOM_DIR)/doomgeneric_%.c \
+    $(DOOM_DIR)/i_allegro%.c \
+    $(DOOM_DIR)/i_sdl%.c \
+    $(DOOM_DIR)/i_soso%.c \
+    $(DOOM_DIR)/i_xlib%.c \
+    $(DOOM_DIR)/i_oal%.c \
+    $(DOOM_DIR)/i_main.c \
+    $(DOOM_DIR)/i_psp%.c \
+    $(DOOM_DIR)/i_videohr%.c, \
+    $(ALL_DOOM_C))
 
 SRCS := $(OUR_SRCS) $(DOOM_SRCS)
-
-# ------------------------------------------------------------------
-# Objects
-# ------------------------------------------------------------------
 OBJS := $(SRCS:.c=.o)
 
 # ------------------------------------------------------------------
 # Targets
 # ------------------------------------------------------------------
-.PHONY: all clean hex size check-doom
+.PHONY: all clean hex size check-doom list-src relocs sections
 
 all: doom_ps.bin doom_ps.elf
 
@@ -82,9 +91,16 @@ check-doom:
 	@if [ ! -d "$(DOOM_DIR)" ]; then \
 	    echo "[!] $(DOOM_DIR)/ not found."; \
 	    echo "    Run:  bash build.sh"; \
-	    echo "    Or:   git clone --depth=1 https://github.com/ozkl/doomgeneric $(DOOM_DIR)"; \
 	    exit 1; \
 	fi
+
+list-src: check-doom
+	@echo "Our sources:"
+	@for f in $(OUR_SRCS); do echo "  $$f"; done
+	@echo "Doomgeneric sources:"
+	@for f in $(DOOM_SRCS); do echo "  $$f"; done
+	@echo ""
+	@echo "Total C files: $(words $(SRCS))"
 
 %.o: %.c check-doom
 	$(CC) $(CFLAGS) -c $< -o $@
@@ -93,10 +109,10 @@ doom_ps.elf: $(OBJS) linker.ld
 	$(CC) $(CFLAGS) $(LDFLAGS) $(OBJS) -o $@
 	@echo ""
 	@echo "===== ELF header ====="
-	readelf -h doom_ps.elf | grep -E 'Type|Machine|Entry'
+	@readelf -h doom_ps.elf | grep -E 'Type|Machine|Entry'
 	@echo ""
 	@echo "===== Program headers ====="
-	readelf -l doom_ps.elf | grep -E 'LOAD|Flags'
+	@readelf -l doom_ps.elf | grep -E 'LOAD|Flags'
 
 doom_ps.bin: doom_ps.elf
 	$(OBJCOPY) -O binary -j .text doom_ps.bin
@@ -109,7 +125,6 @@ doom_ps.bin: doom_ps.elf
 	    echo "    Console launcher expects >= ~623 KB."; \
 	fi
 
-# Generate hex string for pasting into doom_launcher.lua
 hex: doom_ps.bin
 	@xxd -p doom_ps.bin | tr -d '\n' | sed 's/../& /g' > doom_ps.hex
 	@echo "Wrote doom_ps.hex ($$(stat -c %s doom_ps.hex) bytes)"
@@ -119,20 +134,17 @@ size: doom_ps.bin
 	@stat -c '%s bytes' doom_ps.bin
 	@size doom_ps.elf
 
+relocs: doom_ps.elf
+	@echo "--- .rela.dyn entries (first 40) ---"
+	@readelf -r doom_ps.elf 2>/dev/null | head -40 || echo "(none)"
+	@echo ""
+	@echo "--- total reloc count ---"
+	@readelf -r doom_ps.elf 2>/dev/null | grep -c R_X86_64 || true
+
+sections: doom_ps.elf
+	@readelf -S doom_ps.elf
+
 clean:
 	rm -f $(OBJS) doom_ps.elf doom_ps.bin doom_ps.hex
 	@find $(DOOM_DIR) -name '*.o' -delete 2>/dev/null || true
 	@echo "clean done"
-
-# ------------------------------------------------------------------
-# Debug helpers
-# ------------------------------------------------------------------
-relocs: doom_ps.elf
-	@echo "--- .rela.dyn entries ---"
-	@readelf -r doom_ps.elf 2>/dev/null | head -40 || echo "(none)"
-
-sections: doom_ps.elf
-	@echo "--- Section headers ---"
-	@readelf -S doom_ps.elf
-
-.PHONY: relocs sections
