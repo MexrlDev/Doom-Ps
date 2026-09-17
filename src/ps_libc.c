@@ -1,29 +1,17 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v10: fast memcpy/memset using `rep movsb` / `rep stosb`.
- *      Was byte-at-a-time loop, now uses CPU string ops (5-10x faster).
- *      This is a major FPS win for Doom's rendering pipeline.
- *
- *   - vsnprintf handles %s %d %i %u %x %X %o %c %p %f %%
- *     and precision (.N) for integers
- *   - printf/fprintf/vfprintf format into a buffer, then UDP log result
- *   - vfprintf captures last stderr for exit() display
- *   - sscanf handles %d %i %u %x %s %c %%
- *   - putchar/fputc/fputs silent (spam avoidance)
+ * v11: added putc (silent, same as fputc) and strtod (parse double).
  */
 
 #include "core.h"
 #include <stddef.h>
 #include <stdarg.h>
 
-/* FILE is used by the printf family below; the full struct is defined
- * later in the stdio section.  Forward-declare the typedef here. */
 typedef struct _ps_file FILE;
 
 /* ============================================================
- * Error capture — the last message written to stderr is saved so
- * exit() can hand it to main.c's display callback.
+ * Error capture
  * ============================================================ */
 static void (*__error_cb)(const char *msg) = 0;
 static char __last_err[256];
@@ -159,7 +147,6 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
 
         if (*fmt == '%') { _putc(&o, '%'); fmt++; continue; }
 
-        /* ---- flags ---- */
         int zero_pad = 0, left = 0;
         for (;;) {
             if (*fmt == '0') { zero_pad = 1; fmt++; }
@@ -169,17 +156,12 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         }
         (void)left;
 
-        /* ---- width ---- */
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
 
-        /* ---- precision ----
-         * For integer specifiers, precision = minimum digits with
-         * zero-fill.  Doom builds font lump names with
-         * sprintf(buf, "STCFN%.3d", i), so this matters. */
         if (*fmt == '.') {
             fmt++;
             int precision = 0;
@@ -193,7 +175,6 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             }
         }
 
-        /* ---- length modifier ---- */
         int is_long = 0, is_ll = 0, is_short = 0;
         for (;;) {
             if (*fmt == 'l') {
@@ -488,7 +469,7 @@ void *realloc(void *p, size_t size) {
 void free(void *p) { (void)p; }
 
 /* ============================================================
- * mem* — v10: rep movsb / rep stosb for speed
+ * mem* — fast rep movsb / rep stosb
  * ============================================================ */
 void *memcpy(void *d, const void *s, size_t n) {
     void *ret = d;
@@ -667,6 +648,39 @@ int atoi(const char *s) {
 }
 double atof(const char *s) { return (double)atoi(s); }
 double fabs(double x) { return x < 0 ? -x : x; }
+
+/* --- v11 addition: strtod parses a double from a string --- */
+double strtod(const char *s, char **endptr) {
+    while (*s == ' ' || *s == '\t') s++;
+    int neg = 0;
+    if (*s == '-') { neg = 1; s++; }
+    else if (*s == '+') s++;
+    double v = 0.0;
+    while (*s >= '0' && *s <= '9') { v = v * 10.0 + (*s - '0'); s++; }
+    if (*s == '.') {
+        s++;
+        double frac = 0.1;
+        while (*s >= '0' && *s <= '9') {
+            v += (*s - '0') * frac;
+            frac *= 0.1;
+            s++;
+        }
+    }
+    if (*s == 'e' || *s == 'E') {
+        s++;
+        int eneg = 0;
+        if (*s == '-') { eneg = 1; s++; }
+        else if (*s == '+') s++;
+        int exp = 0;
+        while (*s >= '0' && *s <= '9') { exp = exp * 10 + (*s - '0'); s++; }
+        while (exp-- > 0) {
+            if (eneg) v /= 10.0;
+            else      v *= 10.0;
+        }
+    }
+    if (endptr) *endptr = (char *)s;
+    return neg ? -v : v;
+}
 
 long strtol(const char *s, char **endptr, int base) {
     long v = 0; int neg = 0;
@@ -992,6 +1006,7 @@ int puts(const char *s) {
     return 0;
 }
 int putchar(int c)               { return c; }
+int putc(int c, FILE *f)         { (void)f; return c; }   /* v11 addition */
 int fputc(int c, FILE *f)        { (void)f; return c; }
 int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
 
@@ -1016,7 +1031,6 @@ void exit(int code) {
     b[p++] = '\n'; b[p] = 0;
     ps_libc_log(b);
 
-    /* If main.c installed a callback, display the error on screen. */
     if (__error_cb && __last_err_len > 0) {
         __error_cb(__last_err);
     }
