@@ -1,13 +1,17 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v16:
- *   - FIXED: dump_score_bytes wrote 203 bytes into a 160-byte buffer,
- *     clobbering 43 bytes of the caller's stack frame.  That's what
- *     crashed the console right after "Music: playing once".  Buffer
- *     is now 320 bytes.
- *   - Everything else identical to v15 (32× music, 4× SFX headroom,
- *     LPF on music path, T=6 spurious skip).
+ * v17:
+ *   - CRITICAL: SFX playback rate.  Doom's DMX lumps are 11025 Hz,
+ *     but ch->step was 1<<16 = "1 input sample per output sample".
+ *     At 48000 Hz output, that's a 4.35x speedup (chipmunk + fast).
+ *     Now step = (11025 << 16) / SAMPLE_RATE  →  15052.
+ *   - Music volume conversion: Doom sends 0-120 to I_SetMusicVolume
+ *     (its menu value 0-15 is pre-multiplied by 8).  Was dividing by
+ *     64; now /120 so default 8 stays 8/15 and slider max 120 → 15.
+ *   - MUSIC_AMPL 32 → 48 (50% louder).
+ *   - Event logging 40 → 100, note logging 30 → 200.
+ *   - One-pole LPF, soft clip, T=6 spurious skip retained.
  */
 
 #include <stdio.h>
@@ -39,11 +43,14 @@ int snd_sfxvolume   = 8;
 #define MUS_TICKS_PER_SEC   140
 #define MUS_DEFAULT_TICK_US (1000000 / MUS_TICKS_PER_SEC)
 
+/* SFX headroom: 4 → 4 concurrent full-volume sounds fit under ±32767. */
 #define SFX_HEADROOM   4
-#define MUSIC_AMPL     32
 
-#define OUT_BOOST_NUM  1
-#define OUT_BOOST_DEN  1
+/* Music: typical 4-voice chord at vel 64 → mix=256.  × 48 × vol/15. */
+#define MUSIC_AMPL     48
+
+/* DMX sample rate for Doom SFX lumps (dsXXX).  Output is 48000. */
+#define DMX_SAMPLE_RATE 11025
 
 #define FADE_MAX       1024
 #define FADE_STEP_IN   6
@@ -79,7 +86,6 @@ static channel_t channels[NCHANNELS];
 static s32   mix_accum[MIXBUF * 2];
 static short mix_final[MIXBUF * 2];
 
-/* One-pole LPF for the music path (removes aliasing harmonics). */
 static s32 g_mus_lpf = 0;
 
 typedef struct {
@@ -135,7 +141,7 @@ static void music_note_on(int note, int vel, int chan) {
     if (vel <= 0) { music_note_off_chan(chan, note); return; }
     if (vel > 127)  vel = 127;
 
-    if (dbg_note < 30) {
+    if (dbg_note < 200) {
         dbg_note++;
         log_num("M: note N=", note, "");
         log_num("M: note V=", vel, "");
@@ -187,9 +193,7 @@ static int mus_read_varlen(void) {
     return v;
 }
 
-/* 64-byte hex dump of the score.  Buffer must be at least
- * 9 (prefix) + 64*3 (bytes) + 2 (newline+null) = 203 bytes.
- * Was 160 in v14/v15 — overflowed by 43 bytes, crashed the console. */
+/* 64-byte hex dump.  Buffer must be >= 9 + 64*3 + 2 = 203 bytes. */
 static void dump_score_bytes(void) {
     char b[320]; int p = 0;
     const char *pre = "M: hdr64:";
@@ -242,7 +246,7 @@ static void mus_process_tick(void) {
         int chan = ev & 0x0F;
 
         dbg_event++;
-        if (dbg_event <= 40) {
+        if (dbg_event <= 100) {
             log_num("M: ev #", dbg_event, "");
             log_num("M: ev T=", type, "");
             log_num("M: ev C=", chan, "");
@@ -347,9 +351,11 @@ static void music_render_accum(s32 *accum, int frames) {
     if (us_per_sample < 1) us_per_sample = 1;
 
     int vol = snd_musicvolume;
-    if (vol < 0)  vol = 0;
-    if (vol > 15) vol = (vol * 15) / 64;
-    if (vol > 15) vol = 15;
+    if (vol < 0)   vol = 0;
+    /* Doom menu value 0-15 is pre-multiplied by 8 before reaching
+     * I_SetMusicVolume.  Normalize 0-120 → 0-15. */
+    if (vol > 15)  vol = (vol * 15) / 120;
+    if (vol > 15)  vol = 15;
 
     for (int i = 0; i < frames; i++) {
         if (mus_playing) {
@@ -383,9 +389,6 @@ static void music_render_accum(s32 *accum, int frames) {
         }
 
         mix = mix * MUSIC_AMPL * vol / 15;
-
-        /* One-pole LPF, alpha = 0.5 → ~3.8 kHz cutoff.
-         * Removes the harmonics above Nyquist that aliased down as buzz. */
         g_mus_lpf += (mix - g_mus_lpf) / 2;
 
         accum[i * 2]     += g_mus_lpf;
@@ -480,8 +483,7 @@ void I_SubmitSound(void) {
     music_render_accum(mix_accum, MIXBUF);
 
     for (int i = 0; i < MIXBUF * 2; i++) {
-        s32 v = mix_accum[i] * OUT_BOOST_NUM / OUT_BOOST_DEN;
-        mix_final[i] = soft_clip(v);
+        mix_final[i] = soft_clip(mix_accum[i]);
     }
 
     dg_audio_callback(mix_final, MIXBUF);
@@ -505,8 +507,12 @@ int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
 
     channel_t *ch = &channels[channel];
     ch->active = 1; ch->releasing = 0; ch->fade = 0;
-    ch->volume = vol; ch->pan = sep; ch->step = 1 << 16; ch->pos = 0;
-    ch->data = samples; ch->length = length;
+    ch->volume = vol; ch->pan = sep;
+    /* DMX lumps are 11025 Hz; output is SAMPLE_RATE Hz.  step is 16.16. */
+    ch->step   = (DMX_SAMPLE_RATE << 16) / SAMPLE_RATE;
+    ch->pos    = 0;
+    ch->data   = samples;
+    ch->length = length;
     return channel;
 }
 
