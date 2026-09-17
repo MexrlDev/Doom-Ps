@@ -1,9 +1,12 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v2: added globals (snd_musicdevice etc.) and missing functions
- *     (I_BindSoundVariables, I_MusicIsPlaying) that were originally
- *     defined in doomgeneric's i_sound.c.
+ * v3: removed `snd_channels` — it's defined in doomgeneric/s_sound.c,
+ *     redefining it caused a link error ("multiple definition").
+ *
+ * Implements the modern doomgeneric I_* sound API.  Sound effects
+ * play through dg_audio_callback() (defined in main.c), which pushes
+ * samples via sceAudioOutOutput on the console.  Music is stubbed.
  */
 
 #include <stdio.h>
@@ -21,16 +24,17 @@
 #include "core.h"
 #include "doomgeneric_ps.h"
 
+/* Implemented in main.c — pushes stereo samples to sceAudioOut */
 extern void dg_audio_callback(const short *pcm, int sample_count);
 
 /* ============================================================
- * Global sound configuration — originally in i_sound.c.
+ * Global sound configuration.
+ * NOTE: snd_channels is defined in s_sound.c — DO NOT redefine.
  * ============================================================ */
 int snd_musicdevice = 0;
 int snd_sfxdevice   = 0;
 int snd_musicvolume = 8;
 int snd_sfxvolume   = 8;
-int snd_channels    = 8;
 
 #define NCHANNELS   16
 #define MIXBUF      512
