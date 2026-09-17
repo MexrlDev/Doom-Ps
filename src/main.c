@@ -1,10 +1,25 @@
 /*
- * doom-ps/src/main.c — v27
+ * doom-ps/src/main.c — v29
  *
- * v27: dedicated audio thread + improved pad diagnostics.
- *      Audio no longer blocks the render loop.
- *      Pad logging now shows the bit NAMES so we can see exactly what
- *      happens when Cross is pressed.
+ * v29: send BOTH convention key codes so Square opens doors on every
+ *      doomgeneric build.  Some builds use the original Doom 1.9 codes
+ *      (KEY_USE=0xa2), others use the Chocolate Doom names (KEY_SPACE=0x20).
+ *      We map each button to both, and only the value that actually
+ *      matches the running game's binding takes effect.
+ *
+ *      Cross    -> KEY_FIRE   (0xa3) + KEY_RCTRL  (0x9d)
+ *      Square   -> KEY_USE    (0xa2) + KEY_SPACE  (0x20)
+ *      Triangle -> KEY_RSHIFT (0xb6)
+ *      Circle   -> KEY_ENTER  (0x0d)
+ *      Options  -> KEY_ESCAPE (0x1b)
+ *      R1       -> KEY_F2     (0xbc)  Save menu
+ *      L1       -> KEY_F3     (0xbd)  Load menu
+ *      R2       -> ']'        (0x5d)  Next weapon
+ *      L2       -> '['        (0x5b)  Prev weapon
+ *      Share (DS_SHARE) intentionally unmapped.
+ *
+ * Logs kept as-is — no spam removal.
+ * UI LOCKED to v17 spec.
  */
 
 #include "core.h"
@@ -19,7 +34,7 @@ extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 
-/* Doomgeneric's native framebuffer dims — 320x200 after Makefile change */
+/* Doomgeneric native framebuffer dims */
 #define DOOMFB_W  320
 #define DOOMFB_H  200
 
@@ -90,7 +105,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_PAD_MASK 0x001FFFFF
 
 /* ============================================================
- * Doom 1.9 key codes
+ * Doom 1.9 key codes (doomdef.h from id Software)
  * ============================================================ */
 #define DOOM_KEY_ESCAPE     0x1b
 #define DOOM_KEY_ENTER      0x0d
@@ -101,14 +116,20 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RIGHT      0xae
 #define DOOM_KEY_DOWN       0xaf
 
-#define DOOM_KEY_LBRACKET   0x5b
-#define DOOM_KEY_RBRACKET   0x5d
+#define DOOM_KEY_LBRACKET   0x5b   /* Prev weapon */
+#define DOOM_KEY_RBRACKET   0x5d   /* Next weapon */
 
-#define DOOM_KEY_FIRE       0xa0
-#define DOOM_KEY_RSHIFT     0xa2   /* Doom's "run" is RSHIFT-like key 0xa2 */
-#define DOOM_KEY_F1         0xbb
-#define DOOM_KEY_F2         0xbc
-#define DOOM_KEY_F3         0xbd
+/* Original Doom (id Software) convention */
+#define DOOM_KEY_USE        0xa2
+#define DOOM_KEY_FIRE       0xa3
+
+/* Chocolate Doom / modern doomgeneric convention */
+#define DOOM_KEY_RCTRL      0x9d   /* alt fire */
+
+/* Both conventions use these */
+#define DOOM_KEY_RSHIFT     0xb6   /* KEY_RSHIFT */
+#define DOOM_KEY_F2         0xbc   /* Save menu */
+#define DOOM_KEY_F3         0xbd   /* Load menu */
 
 /* ============================================================
  * Context
@@ -341,15 +362,11 @@ static void translate_pad(u32 raw) {
     u32 ch = raw ^ c->pad_prev;
     c->pad_prev = raw;
 
-    /* Detailed logging for the first 200 pad changes */
     static int pad_log_count = 0;
     if (ch != 0 && pad_log_count < 200) {
         pad_log_count++;
-
-        /* Log each bit that changed with its name and press/release */
         for (u32 b = 1; b != 0; b <<= 1) {
             if (!(ch & b)) continue;
-
             char buf[64]; int p = 0;
             const char *nm = bit_name(b);
             const char *m = (raw & b) ? "PRESS " : "REL   ";
@@ -368,39 +385,52 @@ static void translate_pad(u32 raw) {
     MAP(DS_DOWN,     DOOM_KEY_DOWN);
     MAP(DS_LEFT,     DOOM_KEY_LEFT);
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
+
+    /* Cross: FIRE — original (0xa3) + Chocolate (0x9d) */
     MAP(DS_CROSS,    DOOM_KEY_FIRE);
+    MAP(DS_CROSS,    DOOM_KEY_RCTRL);
+
+    /* Square: USE — original (0xa2) + Chocolate (0x20) */
+    MAP(DS_SQUARE,   DOOM_KEY_USE);
     MAP(DS_SQUARE,   DOOM_KEY_SPACE);
+
+    /* Triangle: RUN */
     MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);
+
+    /* Circle: ENTER / confirm */
     MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
+
+    /* Options: ESC / menu */
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
+
+    /* Shoulder buttons */
     MAP(DS_R1,       DOOM_KEY_F2);
     MAP(DS_L1,       DOOM_KEY_F3);
     MAP(DS_R2,       DOOM_KEY_RBRACKET);
     MAP(DS_L2,       DOOM_KEY_LBRACKET);
-    /* Share (DS_SHARE) intentionally unmapped. */
+
+    /* Share (DS_SHARE) intentionally unmapped */
 #undef MAP
 }
 
 /* ====================================================================
- * Audio submission (called by i_sound_ps.c → dg_audio_callback)
+ * Audio submission (called from i_sound_ps.c → dg_audio_callback)
  * ==================================================================== */
 void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
     if (c->audio_h < 0 || !c->aud_out) return;
     (void)sample_count;
-    /* Submit directly.  sceAudioOutOutput blocks until the hardware
-     * has consumed the previous buffer, so the audio thread self-paces. */
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
 /* ====================================================================
- * Audio thread — runs continuously, mixes, submits
+ * Audio thread
  * ==================================================================== */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
     while (g_audio_thread_running) {
-        I_SubmitSound();     /* mixes → dg_audio_callback → sceAudioOutOutput */
+        I_SubmitSound();
     }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
@@ -434,7 +464,6 @@ static int recv_wad(s32 listen_fd) {
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* Clear inherited SO_RCVTIMEO on client */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 30000000;
@@ -544,8 +573,6 @@ void DG_DrawFrame(void) {
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
-
-    /* Audio is now handled by the dedicated thread — no submissions here. */
 
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
