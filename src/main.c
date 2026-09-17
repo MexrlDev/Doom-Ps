@@ -1,14 +1,18 @@
 /*
- * doom-ps/src/main.c — v34
+ * doom-ps/src/main.c — v35
  *
- * v34:
+ * v35:
+ *   - Fixed ps_setjmp / ps_longjmp: added ::: "memory" clobber so GCC
+ *     treats them as extended asm and unescapes %% correctly.
  *   - Clean exit via setjmp/longjmp. When Doom calls exit() (Quit Game,
  *     I_Error), we jump back to _start's cleanup block, tear down
  *     video/audio/equeue, set ext->status=0 / ext->step=99, and
- *     return to Lua. LuaC0re keeps running, user can send another
- *     payload without rebooting.
+ *     return to Lua. LuaC0re keeps running.
  *   - Touchpad mapped to 0x00100000 → TAB (automap).
  *   - Share unmapped per request.
+ *   - mkdir(".savegame") so Doom can save files.
+ *   - Triangle → automap (TAB). L3/R3 → strafe. R1/L1 → save/load.
+ *     R2/L2 → next/prev weapon.
  */
 
 #include "core.h"
@@ -139,34 +143,36 @@ static int   g_exit_requested = 0;
 
 __attribute__((naked)) static int ps_setjmp(void) {
     __asm__ volatile (
-        "leaq g_jmp_buf(%%rip), %%rax\n\t"
-        "movq %%rbx, 0(%%rax)\n\t"
-        "movq %%rbp, 8(%%rax)\n\t"
-        "movq %%rsp, 16(%%rax)\n\t"
-        "movq %%r12, 24(%%rax)\n\t"
-        "movq %%r13, 32(%%rax)\n\t"
-        "movq %%r14, 40(%%rax)\n\t"
-        "movq %%r15, 48(%%rax)\n\t"
-        "movq (%%rsp), %%rcx\n\t"
-        "movq %%rcx, 56(%%rax)\n\t"
-        "xorl %%eax, %%eax\n\t"
+        "leaq g_jmp_buf(%rip), %rax\n\t"
+        "movq %rbx, 0(%rax)\n\t"
+        "movq %rbp, 8(%rax)\n\t"
+        "movq %rsp, 16(%rax)\n\t"
+        "movq %r12, 24(%rax)\n\t"
+        "movq %r13, 32(%rax)\n\t"
+        "movq %r14, 40(%rax)\n\t"
+        "movq %r15, 48(%rax)\n\t"
+        "movq (%rsp), %rcx\n\t"
+        "movq %rcx, 56(%rax)\n\t"
+        "xorl %eax, %eax\n\t"
         "retq"
+        ::: "memory"
     );
 }
 
 __attribute__((naked)) static void ps_longjmp(void) {
     __asm__ volatile (
-        "leaq g_jmp_buf(%%rip), %%rax\n\t"
-        "movq 0(%%rax), %%rbx\n\t"
-        "movq 8(%%rax), %%rbp\n\t"
-        "movq 16(%%rax), %%rsp\n\t"
-        "movq 24(%%rax), %%r12\n\t"
-        "movq 32(%%rax), %%r13\n\t"
-        "movq 40(%%rax), %%r14\n\t"
-        "movq 48(%%rax), %%r15\n\t"
-        "movq 56(%%rax), %%rcx\n\t"
-        "movl $1, %%eax\n\t"
-        "jmpq *%%rcx\n\t"
+        "leaq g_jmp_buf(%rip), %rax\n\t"
+        "movq 0(%rax), %rbx\n\t"
+        "movq 8(%rax), %rbp\n\t"
+        "movq 16(%rax), %rsp\n\t"
+        "movq 24(%rax), %r12\n\t"
+        "movq 32(%rax), %r13\n\t"
+        "movq 40(%rax), %r14\n\t"
+        "movq 48(%rax), %r15\n\t"
+        "movq 56(%rax), %rcx\n\t"
+        "movl $1, %eax\n\t"
+        "jmpq *%rcx"
+        ::: "memory"
     );
 }
 
