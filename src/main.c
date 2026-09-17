@@ -1,9 +1,15 @@
 /*
- * doom-ps/src/main.c — v21
+ * doom-ps/src/main.c — v22
  *
- * v21: DG_DrawFrame logs call count (1, 2, 3, then every 60) and
- *      "present entering/returned" for the first 3 frames so we can
- *      pinpoint where Doom hangs after the title screen renders.
+ * v22 fixes:
+ *   - DG_Init no longer reallocates DG_ScreenBuffer.  doomgeneric already
+ *     allocates it at DOOMGENERIC_RESX*DOOMGENERIC_RESY*4 = 640*400*4 = 1 MB.
+ *     Our old code overwrote the pointer with a 256 KB block, then doom wrote
+ *     1 MB into it, corrupting the doom zone and hanging 2 seconds later.
+ *   - blit_doom_frame reads the 640x400 framebuffer with stride 640,
+ *     downsampling to 320x200 by sampling every other pixel.
+ *   - Color passthrough: doomgeneric writes A8R8G8B8, PS5 format=1 is
+ *     also A8R8G8B8, so R/B were being swapped (looked "inverted").
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -19,6 +25,10 @@ extern char __bss_end[];
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
+
+/* Doomgeneric's real framebuffer dimensions (2x upscaled from 320x200). */
+#define DOOMFB_W  640
+#define DOOMFB_H  400
 
 /* ============================================================
  * ELF64 relocation record + type constants
@@ -253,7 +263,6 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
     }
 }
 
-/* Called by ps_libc.c's exit() when Doom hits I_Error. */
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
@@ -262,13 +271,11 @@ static void ps_error_display(const char *msg) {
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
 
-        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR",
-                           0xFFFF4040, 6);
+        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR", 0xFFFF4040, 6);
         if (msg && msg[0]) {
             ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
         } else {
-            ps_draw_str_center(fb, 400, "(no message)",
-                               0xFFA0A0A0, 3);
+            ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
         }
         ps_draw_str_center(fb, 900, "Reboot game to recover",
                            0xFF808080, 3);
@@ -277,22 +284,36 @@ static void ps_error_display(const char *msg) {
     }
 }
 
+/* ====================================================================
+ * blit_doom_frame — v22
+ *
+ * DG_ScreenBuffer is 640x400 (doomgeneric upscales 320x200 -> 640x400
+ * with 2x nearest-neighbor).  We downsample back to 320x200 by taking
+ * every other pixel, then 6x/5x scale up to 1920x1000 on the display.
+ *
+ * Color: doomgeneric writes A8R8G8B8 (R at bit 16, G at bit 8, B at
+ * bit 0).  PS5's pixel format 1 is also A8R8G8B8.  So we pass through
+ * unmodified with forced opaque alpha.
+ * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
+
     for (int dy = 0; dy < DOOM_H; dy++) {
-        const u32 *row = doom + dy * DOOM_W;
+        /* Row stride is 640, take every other row */
+        const u32 *row = doom + (dy * 2) * DOOMFB_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
-            u32 rgba = row[dx];
-            u8 r = rgba & 0xFF;
-            u8 g = (rgba >> 8) & 0xFF;
-            u8 b = (rgba >> 16) & 0xFF;
-            u32 bgra = 0xFF000000 | ((u32)r << 16) | ((u32)g << 8) | b;
+            /* Take every other pixel of the 2x-upscaled framebuffer */
+            u32 rgba = row[dx * 2];
+
+            /* A8R8G8B8 -> A8R8G8B8, just force alpha to opaque */
+            u32 out = rgba | 0xFF000000;
+
             int fy = OFF_Y + dy * SCALE_Y;
             int fx = OFF_X + dx * SCALE_X;
             for (int sy = 0; sy < SCALE_Y; sy++) {
                 u32 *dst = fb + (fy + sy) * SCR_W + fx;
-                for (int sx = 0; sx < SCALE_X; sx++) dst[sx] = bgra;
+                for (int sx = 0; sx < SCALE_X; sx++) dst[sx] = out;
             }
         }
     }
@@ -447,24 +468,27 @@ extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
+/* ====================================================================
+ * DG_Init — v22
+ * Do NOT allocate DG_ScreenBuffer here.  doomgeneric_Create already
+ * allocated it at DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4 = 640*400*4
+ * = 1 MB.  Our OLD code reallocated to 320*200*4 = 256 KB, then doom
+ * wrote 1 MB into it → overflow → pool corruption → hang.
+ * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
-    DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
-    if (!DG_ScreenBuffer) udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
-    else udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
+    if (!DG_ScreenBuffer) {
+        udp_log("DoomPS: WARN DG_ScreenBuffer is NULL\n");
+    } else {
+        udp_log("DoomPS: DG_ScreenBuffer preserved\n");
+    }
 }
 
-/* ====================================================================
- * DG_DrawFrame — v21 diagnostic: logs 1st, 2nd, 3rd frame and then
- * every 60 frames.  Also logs "present entering/returned" for the
- * first 3 frames so we can pinpoint where the hang occurs.
- * ==================================================================== */
 void DG_DrawFrame(void) {
     static int draw_count = 0;
     draw_count++;
     struct ps_ctx *c = &g_ctx;
 
-    /* Log frame count */
     if (draw_count == 1 || draw_count == 2 || draw_count == 3) {
         char b[64]; int p = 0;
         const char *m = "DoomPS: DG_DrawFrame #";
@@ -485,11 +509,7 @@ void DG_DrawFrame(void) {
     }
 
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
-
-    if (draw_count <= 3) udp_log("DoomPS: present entering\n");
     present(c);
-    if (draw_count <= 3) udp_log("DoomPS: present returned\n");
-
     if (c->ext) c->ext->frame_count = c->total_frames;
     audio_drain();
 
@@ -543,11 +563,9 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
-    /* 1) Apply ELF relocations. */
     u64 load_base = (u64)&_start;
     int n_reloc = do_relocations(load_base);
 
-    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file). */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
@@ -563,8 +581,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->ext = ext; c->G = G; c->D = D;
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
-
-    *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     ext->step = 2;
 
@@ -787,8 +803,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
     }
     udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
-
-    *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
