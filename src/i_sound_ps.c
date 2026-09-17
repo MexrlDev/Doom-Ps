@@ -1,20 +1,18 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v13:
- *   - is_last handling: removed. Bit 7 in a MUS event means "last
- *     event for THIS channel", not "end of track". v11a ended the
- *     whole song on the first is_last event, which is why every
- *     track stopped after 4 events and no melody ever played.
- *   - Only a type-6 event ends a track, matching Doom's own
- *     mus2mid.c reference.
- *   - MUSIC_AMPL 56 -> 80  (music 1.4x louder)
- *   - SFX_HEADROOM 5 -> 4  (SFX 1.25x louder)
- *   - OUT_BOOST 3/2 -> 2/1 (final 1.33x louder)
- *   - Score dump: first 32 bytes of score once per song, so we can
- *     verify alignment if the fix doesn't take.
- *   - Diagnostics trimmed: notes logged for first 30, events for
- *     first 30, ticks at 1/1000/5000, submits at 1/100/1000/5000.
+ * v14:
+ *   - T=6 (score-end) skip: some WAD masters contain spurious score-end
+ *     bytes mid-track. Real Doom's sound card ignored them. We now
+ *     only honor T=6 when it's within 100 bytes of mus_track_end.
+ *     Otherwise we skip it and keep reading. This is why E1M1 ended
+ *     after 6 events; now it plays the full track.
+ *   - Volume boost: MUSIC_AMPL 80->120, SFX_HEADROOM 4->3,
+ *     OUT_BOOST 2/1->3/2.
+ *   - Soft-clip knees softened (linear up to 16000, 3:1 to 22000,
+ *     10:1 to 30000, hard limit).
+ *   - Diagnostics: event byte offset + full 64-byte score dump per
+ *     song (title + E1M1 + menu music all get dumps now).
  */
 
 #include <stdio.h>
@@ -46,15 +44,15 @@ int snd_sfxvolume   = 8;
 #define MUS_TICKS_PER_SEC   140
 #define MUS_DEFAULT_TICK_US (1000000 / MUS_TICKS_PER_SEC)
 
-#define SFX_HEADROOM   4
-#define MUSIC_AMPL     80
+#define SFX_HEADROOM   3
+#define MUSIC_AMPL     120
 
-#define OUT_BOOST_NUM  2
-#define OUT_BOOST_DEN  1
+#define OUT_BOOST_NUM  3
+#define OUT_BOOST_DEN  2
 
 #define FADE_MAX       1024
-#define FADE_STEP_IN   8
-#define FADE_STEP_OUT  4
+#define FADE_STEP_IN   6
+#define FADE_STEP_OUT  3
 
 static int dbg_submit = 0;
 static int dbg_tick   = 0;
@@ -191,21 +189,16 @@ static int mus_read_varlen(void) {
     return v;
 }
 
-static void dump_score_once(void) {
-    static int dumped = 0;
-    if (dumped) return;
-    dumped = 1;
-    char b[128]; int p = 0;
-    const char *pre = "M: score:";
+static void dump_score_bytes(void) {
+    char b[160]; int p = 0;
+    const char *pre = "M: hdr64:";
     while (*pre) b[p++] = *pre++;
     const char h[] = "0123456789ABCDEF";
-    int n = 0;
-    for (int i = 0; i < 32 && (mus_track_start + i) < mus_track_end; i++) {
+    for (int i = 0; i < 64 && (mus_track_start + i) < mus_track_end; i++) {
         b[p++] = ' ';
         unsigned char c = mus_data[mus_track_start + i];
         b[p++] = h[(c >> 4) & 0xF];
         b[p++] = h[c & 0xF];
-        n++;
     }
     b[p++] = '\n'; b[p] = 0;
     ps_sound_log(b);
@@ -242,15 +235,15 @@ static void mus_process_tick(void) {
             break;
         }
 
+        int pos_before = mus_pos;
         unsigned char ev = mus_data[mus_pos++];
-        /* Bit 7 is "last event for THIS channel" — NOT end of track.
-         * Only type 6 ends a track.  Ignore bit 7 entirely. */
         int type = (ev >> 4) & 0x07;
         int chan = ev & 0x0F;
 
         dbg_event++;
-        if (dbg_event <= 30) {
+        if (dbg_event <= 40) {
             log_num("M: ev #", dbg_event, "");
+            log_num("M: ev pos=", pos_before, "");
             log_num("M: ev T=", type, "");
             log_num("M: ev C=", chan, "");
         }
@@ -282,7 +275,14 @@ static void mus_process_tick(void) {
             mus_pos += 2;
             break;
         case 6:
-            mus_end_of_track = 1;
+            /* Only honor T=6 if it's near the end of the score. Some
+             * WAD masters embed spurious score-end bytes mid-track. */
+            if (mus_pos + 100 < mus_track_end) {
+                log_str("M: skip spurious T=6");
+                /* fall through to read delay */
+            } else {
+                mus_end_of_track = 1;
+            }
             break;
         default:
             mus_end_of_track = 1;
@@ -318,14 +318,12 @@ static void mus_parse_header(void) {
 
     int score_len   = mus_data[4]  | (mus_data[5]  << 8);
     int score_start = mus_data[6]  | (mus_data[7]  << 8);
-    int prim_ch     = mus_data[8]  | (mus_data[9]  << 8);
-    int sec_ch      = mus_data[10] | (mus_data[11] << 8);
-    int inst        = mus_data[12] | (mus_data[13] << 8);
+    log_num("M: lump_len=", mus_len, "");
     log_num("M: score_len=", score_len, "");
     log_num("M: score_start=", score_start, "");
-    log_num("M: prim_ch=", prim_ch, "");
-    log_num("M: sec_ch=", sec_ch, "");
-    log_num("M: inst=", inst, "");
+    log_num("M: prim_ch=", mus_data[8] | (mus_data[9] << 8), "");
+    log_num("M: sec_ch=", mus_data[10] | (mus_data[11] << 8), "");
+    log_num("M: inst=", mus_data[12] | (mus_data[13] << 8), "");
 
     if (score_start < 16 || score_start >= mus_len) {
         log_str("Music: bad MUS score offset");
@@ -339,13 +337,11 @@ static void mus_parse_header(void) {
     mus_next_event_tick = (unsigned)mus_read_varlen();
     log_num("M: first delay=", (int)mus_next_event_tick, "");
 
-    dump_score_once();
+    dump_score_bytes();
     log_str("Music: MUS loaded");
 }
 
-static void midi_process_tick(void) {
-    mus_end_of_track = 1;
-}
+static void midi_process_tick(void) { mus_end_of_track = 1; }
 
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
@@ -396,13 +392,13 @@ static void music_render_accum(s32 *accum, int frames) {
 }
 
 static inline s16 soft_clip(s32 v) {
-    if (v > 12000)  v = 12000 + (v - 12000) * 2 / 5;
-    if (v > 20000)  v = 20000 + (v - 20000) / 6;
-    if (v > 30000)  v = 30000 + (v - 30000) / 16;
+    if (v > 16000)  v = 16000 + (v - 16000) / 3;
+    if (v > 22000)  v = 22000 + (v - 22000) / 10;
+    if (v > 30000)  v = 30000 + (v - 30000) / 32;
     if (v > 32767)  v =  32767;
-    if (v < -12000) v = -12000 + (v + 12000) * 2 / 5;
-    if (v < -20000) v = -20000 + (v + 20000) / 6;
-    if (v < -30000) v = -30000 + (v + 30000) / 16;
+    if (v < -16000) v = -16000 + (v + 16000) / 3;
+    if (v < -22000) v = -22000 + (v + 22000) / 10;
+    if (v < -30000) v = -30000 + (v + 30000) / 32;
     if (v < -32768) v = -32768;
     return (s16)v;
 }
