@@ -1,18 +1,17 @@
 /*
- * doom-ps/src/main.c — v35
+ * doom-ps/src/main.c — v36
  *
- * v35:
- *   - Fixed ps_setjmp / ps_longjmp: added ::: "memory" clobber so GCC
- *     treats them as extended asm and unescapes %% correctly.
- *   - Clean exit via setjmp/longjmp. When Doom calls exit() (Quit Game,
- *     I_Error), we jump back to _start's cleanup block, tear down
- *     video/audio/equeue, set ext->status=0 / ext->step=99, and
- *     return to Lua. LuaC0re keeps running.
+ * v36:
+ *   - FIXED ps_setjmp / ps_longjmp: basic asm form (no colons, single
+ *     %).  GCC's naked attribute only supports basic asm reliably;
+ *     the previous two attempts each used the wrong escaping.
+ *   - Clean exit via setjmp/longjmp.  When Doom calls exit() (Quit
+ *     Game, I_Error), we jump back to _start's cleanup block, tear
+ *     down video/audio/equeue, set ext->status=0 / ext->step=99, and
+ *     return to Lua.  LuaC0re keeps running.
  *   - Touchpad mapped to 0x00100000 → TAB (automap).
  *   - Share unmapped per request.
  *   - mkdir(".savegame") so Doom can save files.
- *   - Triangle → automap (TAB). L3/R3 → strafe. R1/L1 → save/load.
- *     R2/L2 → next/prev weapon.
  */
 
 #include "core.h"
@@ -83,7 +82,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_CIRCLE    0x00002000
 #define DS_CROSS     0x00004000
 #define DS_SQUARE    0x00008000
-#define DS_TOUCHPAD  0x00100000    /* confirmed via log */
+#define DS_TOUCHPAD  0x00100000
 #define DS_PAD_MASK  0x001FFFFF
 
 #define DOOM_KEY_ESCAPE     0x1b
@@ -137,7 +136,15 @@ static struct ps_ctx {
 static char g_diag[256];
 static volatile int g_audio_thread_running = 0;
 
-/* ---- setjmp/longjmp for clean Doom exit ---- */
+/* ---- setjmp/longjmp for clean Doom exit ----
+ *
+ * Naked functions only support BASIC asm (no colon-separated clobber
+ * lists) reliably.  In basic asm, `%` is a literal and `%reg` is
+ * just how you write a register.  Adding `::: "memory"` switches
+ * GCC to extended-asm parsing, where `%r` is interpreted as an
+ * operand reference and `%%` becomes the literal escape — which is
+ * why the previous two attempts both failed.
+ */
 static void *g_jmp_buf[8];
 static int   g_exit_requested = 0;
 
@@ -155,7 +162,6 @@ __attribute__((naked)) static int ps_setjmp(void) {
         "movq %rcx, 56(%rax)\n\t"
         "xorl %eax, %eax\n\t"
         "retq"
-        ::: "memory"
     );
 }
 
@@ -172,7 +178,6 @@ __attribute__((naked)) static void ps_longjmp(void) {
         "movq 56(%rax), %rcx\n\t"
         "movl $1, %eax\n\t"
         "jmpq *%rcx"
-        ::: "memory"
     );
 }
 
