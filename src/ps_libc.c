@@ -1,12 +1,16 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v8: real vsnprintf + real sscanf + error capture for on-screen display.
+ * v9: fixed %.Nd precision on integer specifiers (was treated as
+ *     no-op, so "STCFN%.3d" produced "STCFN33" instead of "STCFN033"
+ *     and Doom couldn't find the font lump).
+ *
  *   - vsnprintf handles %s %d %i %u %x %X %o %c %p %f %%
- *   - printf/fprintf/vfprintf format into a buffer, then UDP log the result
- *   - vfprintf also captures the last stderr message so exit() can display it
+ *     and precision (.N) for integers
+ *   - printf/fprintf/vfprintf format into a buffer, then UDP log result
+ *   - vfprintf captures last stderr for exit() display
  *   - sscanf handles %d %i %u %x %s %c %%
- *   - putchar/fputc/fputs silent (spam avoidance)
+ *   - putchar/fputc/fputs silent
  */
 
 #include "core.h"
@@ -155,6 +159,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
 
         if (*fmt == '%') { _putc(&o, '%'); fmt++; continue; }
 
+        /* ---- flags ---- */
         int zero_pad = 0, left = 0;
         for (;;) {
             if (*fmt == '0') { zero_pad = 1; fmt++; }
@@ -164,17 +169,31 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         }
         (void)left;
 
+        /* ---- width ---- */
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
 
+        /* ---- precision ----
+         * For integer specifiers, treat precision as minimum
+         * digits with zero-fill.  Doom builds font lump names
+         * with sprintf(buf, "STCFN%.3d", i), so this matters. */
         if (*fmt == '.') {
             fmt++;
-            while (*fmt >= '0' && *fmt <= '9') fmt++;
+            int precision = 0;
+            while (*fmt >= '0' && *fmt <= '9') {
+                precision = precision * 10 + (*fmt - '0');
+                fmt++;
+            }
+            if (precision > width) {
+                width = precision;
+                zero_pad = 1;
+            }
         }
 
+        /* ---- length modifier ---- */
         int is_long = 0, is_ll = 0, is_short = 0;
         for (;;) {
             if (*fmt == 'l') {
@@ -332,7 +351,7 @@ int vfprintf(FILE *f, const char *fmt, va_list ap) {
     char buf[512];
     int r = vsnprintf(buf, sizeof(buf), fmt, ap);
     log_printf_output("[stderr]", buf, r);
-    __capture_err(buf, r);       /* capture for exit() display */
+    __capture_err(buf, r);
     return r;
 }
 
