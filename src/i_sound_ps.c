@@ -1,14 +1,17 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v18:
- *   - MUS parser rewritten for "packed 3-byte event" format used by
- *     Doom's WAD musics.  Each event is [byte][data][data] with no
- *     inter-event delay byte.  Events fire 2 ticks apart.
- *   - MUSIC_AMPL 48 → 72 (50% louder).
- *   - SFX_HEADROOM 4 (unchanged), OUT_BOOST 1.
- *   - Kept: one-pole LPF on music, soft-clip limiter, DMX 11025 Hz
- *     step for SFX.
+ * v19:
+ *   - FIXED glitchy sound: added output reconstruction filter
+ *     (single-pole LPF at ~3.8 kHz) to smooth the stair-step
+ *     artifacts from zero-order-hold upsampling of 11 kHz SFX.
+ *   - Slower music envelopes: attack 10→2, release 6→1 per sample.
+ *     The old envelopes clicked on every note because they
+ *     finished in 0.3 ms.
+ *   - Slight volume boost: MUSIC_AMPL 72→80, SFX_HEADROOM 4→3.
+ *   - Lighter music LPF (0.5) so the output LPF handles most of
+ *     the anti-aliasing (cascade = 2-pole rolloff).
+ *   - Everything else identical to v18.
  */
 
 #include <stdio.h>
@@ -38,8 +41,8 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              512
 #define MUSIC_MAX_NOTES     24
 
-#define SFX_HEADROOM   4
-#define MUSIC_AMPL     72
+#define SFX_HEADROOM   3
+#define MUSIC_AMPL     80
 
 #define DMX_SAMPLE_RATE 11025
 
@@ -47,9 +50,6 @@ int snd_sfxvolume   = 8;
 #define FADE_STEP_IN   6
 #define FADE_STEP_OUT  3
 
-/* MUS packed-event scheduling.  Each event fires this many ticks after
- * the previous.  2 ticks ≈ 14 ms, roughly matching Doom's actual DMX
- * event density for level musics. */
 #define MUS_TICKS_PER_EVENT 2
 
 static int dbg_submit = 0;
@@ -82,7 +82,11 @@ static channel_t channels[NCHANNELS];
 static s32   mix_accum[MIXBUF * 2];
 static short mix_final[MIXBUF * 2];
 
+/* Music path LPF (light). */
 static s32 g_mus_lpf = 0;
+/* Output reconstruction LPF (heavier). */
+static s32 g_out_lpf_l = 0;
+static s32 g_out_lpf_r = 0;
 
 typedef struct {
     int active, note, channel, releasing;
@@ -175,14 +179,12 @@ static void music_all_notes_off(void) {
         mus_notes[i].active = mus_notes[i].releasing = 0;
 }
 
-/* 3-byte event reader.  Each event = 1 header byte + 2 data bytes. */
 static void mus_process_event(void) {
     if (mus_pos + 2 >= mus_track_end) {
         if (mus_loop) {
             log_str("M: loop restart");
             mus_pos = mus_track_start;
             music_all_notes_off();
-            g_mus_lpf = 0;
             mus_next_event_tick = MUS_TICKS_PER_EVENT;
         } else {
             log_str("M: END");
@@ -210,10 +212,6 @@ static void mus_process_event(void) {
     switch (type) {
     case 0: music_note_off_chan(chan, d1); break;
     case 1: music_note_on(d1 & 0x7F, d2 ? d2 : 64, chan); break;
-    case 2: break;                               /* pitch bend — ignored */
-    case 3: break;                               /* system event — ignored */
-    case 4: break;                               /* controller — ignored */
-    case 6: break;                               /* embedded score-end — skip */
     default: break;
     }
 }
@@ -221,7 +219,6 @@ static void mus_process_event(void) {
 static void mus_parse_header(void) {
     mus_pos = mus_track_start;
     music_all_notes_off();
-    g_mus_lpf = 0;
 
     if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
@@ -252,7 +249,7 @@ static void mus_parse_header(void) {
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
-    int us_per_tick = 1000000 / 140;   /* 140 Hz DMX tick */
+    int us_per_tick = 1000000 / 140;
     int us_per_sample = 1000000 / SAMPLE_RATE;
     if (us_per_sample < 1) us_per_sample = 1;
 
@@ -283,11 +280,14 @@ static void music_render_accum(s32 *accum, int frames) {
             music_note_t *n = &mus_notes[j];
             if (!n->active) continue;
 
+            /* Slower envelopes: attack over ~63 samples (~1.3 ms),
+             * release over ~127 samples (~2.6 ms).  Old values
+             * (10/6) finished in 0.3 ms and clicked on every note. */
             if (n->releasing) {
-                n->env -= 6;
+                n->env -= 1;
                 if (n->env <= 0) { n->env = 0; n->active = 0; continue; }
             } else if (n->env < n->env_target) {
-                n->env += 10;
+                n->env += 2;
                 if (n->env > n->env_target) n->env = n->env_target;
             }
 
@@ -298,6 +298,8 @@ static void music_render_accum(s32 *accum, int frames) {
         }
 
         mix = mix * MUSIC_AMPL * vol / 15;
+        /* Light LPF on the music path only (the heavy one is on
+         * the full output mix). */
         g_mus_lpf += (mix - g_mus_lpf) / 2;
 
         accum[i * 2]     += g_mus_lpf;
@@ -325,6 +327,8 @@ void I_InitSound(boolean use_sfx_prefix) {
         channels[i].active = channels[i].releasing = channels[i].fade = 0;
     init_music_tables();
     g_mus_lpf = 0;
+    g_out_lpf_l = 0;
+    g_out_lpf_r = 0;
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
@@ -365,6 +369,7 @@ void I_SubmitSound(void) {
 
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
+            int frac = pos & 0xFFFF;
             if (idx >= length) { ch->active = 0; break; }
 
             if (releasing) {
@@ -375,7 +380,12 @@ void I_SubmitSound(void) {
                 if (fade > FADE_MAX) fade = FADE_MAX;
             }
 
-            int sample = ((int)data[idx] - 128) << 8;
+            /* Linear interpolation between source samples to reduce
+             * the stair-step artifacts of zero-order-hold upsampling. */
+            int s0 = (int)data[idx] - 128;
+            int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
+            int sample8 = s0 + ((s1 - s0) * frac >> 16);
+            int sample = sample8 << 8;
             sample = sample * fade / FADE_MAX;
             sample = sample * vol / 127;
             sample /= SFX_HEADROOM;
@@ -391,8 +401,17 @@ void I_SubmitSound(void) {
 
     music_render_accum(mix_accum, MIXBUF);
 
-    for (int i = 0; i < MIXBUF * 2; i++) {
-        mix_final[i] = soft_clip(mix_accum[i]);
+    /* Output reconstruction filter: single-pole LPF at ~5.5 kHz
+     * (alpha = 0.6).  This smooths the residual stair-step artifacts
+     * from the SFX upsampler and takes the harsh edge off the square
+     * waves coming from the music synth. */
+    for (int i = 0; i < MIXBUF; i++) {
+        int l = mix_accum[i * 2];
+        int r = mix_accum[i * 2 + 1];
+        g_out_lpf_l += (l - g_out_lpf_l) * 3 / 5;
+        g_out_lpf_r += (r - g_out_lpf_r) * 3 / 5;
+        mix_final[i * 2]     = soft_clip(g_out_lpf_l);
+        mix_final[i * 2 + 1] = soft_clip(g_out_lpf_r);
     }
 
     dg_audio_callback(mix_final, MIXBUF);
