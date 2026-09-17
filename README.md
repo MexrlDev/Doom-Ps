@@ -67,7 +67,7 @@ local shellcode_hex = "..."       -- paste from `make hex` or doom_ps.hex
 ### 2. Run the launcher from your PC
 
 ```sh
-python3 doom-luncher.py 192.168.1.50 /path/to/DOOM.WAD
+python3 doom_launcher.py 192.168.1.50 /path/to/DOOM.WAD
 ```
 ### 2. Run the launcher from your phone
 1. make a folder and add the python in it and also put the bin in the same folder as the python, and put the wad in /wad folder. don’t forget to change the Python to ur ip, and put the wad file name you want to send
