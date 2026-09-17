@@ -1,11 +1,18 @@
 /*
- * doom-ps/src/main.c — v24
+ * doom-ps/src/main.c — v25
  *
- * v24: added I_SubmitSound() calls in DG_DrawFrame so the sound mixer
- *      runs.  doomgeneric has no audio thread — it expects the
- *      platform's sound driver to call I_SubmitSound on its own.
- *      Each call mixes 512 stereo frames (~10.7 ms @ 48 kHz); we call
- *      it 8 times per render (~85 ms of audio per frame at ~8 fps).
+ * v25: correct Doom 1.9 key codes + clean controller layout.
+ *      - Cross    = Fire
+ *      - Square   = Use / Open door
+ *      - Triangle = Run (RSHIFT = 0xb6)
+ *      - Circle   = Enter / Confirm
+ *      - Options  = Escape / Menu
+ *      - D-Pad    = Movement (arrow keys)
+ *      - R1       = Save menu (F2 = 0xbc)
+ *      - L1       = Load menu (F3 = 0xbd)
+ *      - R2       = Next weapon (']' = 0x5d)
+ *      - L2       = Prev weapon ('[' = 0x5b)
+ *      Share button is NOT used.
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -17,7 +24,6 @@
 extern char __bss_start[];
 extern char __bss_end[];
 
-/* ps_libc.c provides these. */
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
@@ -25,12 +31,11 @@ extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 /* i_sound_ps.c provides this — mixes channels into dg_audio_callback. */
 extern void I_SubmitSound(void);
 
-/* Doomgeneric's real framebuffer dimensions (2x upscaled from 320x200). */
 #define DOOMFB_W  640
 #define DOOMFB_H  400
 
 /* ============================================================
- * ELF64 relocation record + type constants
+ * ELF64 relocation
  * ============================================================ */
 typedef struct {
     u64 r_offset;
@@ -73,49 +78,53 @@ static void ps_memcpy(void *dst, const void *src, u64 len) {
 }
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 
-#define DS_UP 0x10
-#define DS_RIGHT 0x20
-#define DS_DOWN 0x40
-#define DS_LEFT 0x80
-#define DS_L2 0x100
-#define DS_R2 0x200
-#define DS_L1 0x400
-#define DS_R1 0x800
+/* ============================================================
+ * DualShock button bits (matches PS4/PS5 ScePadData.buttons)
+ * ============================================================ */
+#define DS_SHARE    0x0001   /* NOT USED */
+#define DS_L3       0x0002
+#define DS_R3       0x0004
+#define DS_OPTIONS  0x0008
+#define DS_UP       0x0010
+#define DS_RIGHT    0x0020
+#define DS_DOWN     0x0040
+#define DS_LEFT     0x0080
+#define DS_L2       0x0100
+#define DS_R2       0x0200
+#define DS_L1       0x0400
+#define DS_R1       0x0800
 #define DS_TRIANGLE 0x1000
-#define DS_CIRCLE 0x2000
-#define DS_CROSS 0x4000
-#define DS_SQUARE 0x8000
-#define DS_OPTIONS 0x08
-#define DS_SHARE 0x01
-#define DS_L3 0x02
+#define DS_CIRCLE   0x2000
+#define DS_CROSS    0x4000
+#define DS_SQUARE   0x8000
+#define DS_PAD_MASK 0x0000FFFF
 
-#define DG_KEY_RIGHTARROW 0xae
-#define DG_KEY_LEFTARROW  0xac
-#define DG_KEY_UPARROW    0xad
-#define DG_KEY_DOWNARROW  0xaf
-#define DG_KEY_FIRE       0xa0
-#define DG_KEY_USE        0x20
-#define DG_KEY_ESCAPE     27
-#define DG_KEY_ENTER      13
-#define DG_KEY_TAB        9
-#define DG_KEY_SHIFT      0xa2
-#define DG_KEY_ALT        0xa4
-#define DG_KEY_F1         (0x80+0x3b)
-#define DG_KEY_F2         (0x80+0x3c)
-#define DG_KEY_1 '1'
-#define DG_KEY_2 '2'
-#define DG_KEY_3 '3'
-#define DG_KEY_4 '4'
-#define DG_KEY_5 '5'
-#define DG_KEY_6 '6'
-#define DG_KEY_7 '7'
+/* ============================================================
+ * Doom 1.9 key codes (from original i_video.h)
+ * ============================================================ */
+#define DOOM_KEY_ESCAPE     0x1b
+#define DOOM_KEY_ENTER      0x0d
+#define DOOM_KEY_TAB        0x09
+#define DOOM_KEY_SPACE      0x20
 
-#define O_WRONLY_  0x0001
-#define O_RDWR_    0x0002
-#define O_CREAT_   0x0200
-#define O_TRUNC_   0x0400
-#define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
+#define DOOM_KEY_LEFT       0xac
+#define DOOM_KEY_UP         0xad
+#define DOOM_KEY_RIGHT      0xae
+#define DOOM_KEY_DOWN       0xaf
 
+#define DOOM_KEY_COMMA      0x2c   /* Strafe left  */
+#define DOOM_KEY_PERIOD     0x2e   /* Strafe right */
+#define DOOM_KEY_LBRACKET   0x5b   /* Prev weapon  */
+#define DOOM_KEY_RBRACKET   0x5d   /* Next weapon  */
+
+#define DOOM_KEY_FIRE       0xa0
+#define DOOM_KEY_RSHIFT     0xb6   /* Run */
+#define DOOM_KEY_F2         0xbc   /* Save menu */
+#define DOOM_KEY_F3         0xbd   /* Load menu */
+
+/* ============================================================
+ * Context
+ * ============================================================ */
 #define KEY_QUEUE_SIZE 32
 
 static struct ps_ctx {
@@ -160,6 +169,11 @@ static void udp_log(const char *msg) {
     NC(c->G, c->sendto_fn,
        (u64)c->log_fd, (u64)msg, (u64)ps_strlen(msg),
        0, (u64)c->log_sa, 16);
+}
+
+/* Called by i_sound_ps.c to log via the same UDP channel. */
+void ps_sound_log(const char *msg) {
+    udp_log(msg);
 }
 
 static void diag_kopen(const char *prefix, const char *path, s32 fd) {
@@ -262,7 +276,6 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
     }
 }
 
-/* Called by ps_libc.c's exit() when Doom hits I_Error. */
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
@@ -286,10 +299,6 @@ static void ps_error_display(const char *msg) {
     }
 }
 
-/* ====================================================================
- * blit_doom_frame — reads 640x400 (stride 640), downsamples to 320x200,
- * then scales to 1920x1000 on the display.  Color passthrough (A8R8G8B8).
- * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
@@ -299,7 +308,6 @@ static void blit_doom_frame(u32 *fb, const u32 *doom) {
         for (int dx = 0; dx < DOOM_W; dx++) {
             u32 rgba = row[dx * 2];
             u32 out = rgba | 0xFF000000;
-
             int fy = OFF_Y + dy * SCALE_Y;
             int fx = OFF_X + dx * SCALE_X;
             for (int sy = 0; sy < SCALE_Y; sy++) {
@@ -318,26 +326,59 @@ static void push_key(u8 key, u8 pressed) {
     c->key_queue[c->key_wp].pressed = pressed;
     c->key_wp = next;
 }
+
+/* ====================================================================
+ * Controller mapping — v25 layout
+ * ==================================================================== */
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
-    u32 ch = raw ^ c->pad_prev; c->pad_prev = raw;
+    u32 ch = raw ^ c->pad_prev;
+    c->pad_prev = raw;
+
+    /* Debug: log first few button presses so user can see raw values */
+    static int pad_log_count = 0;
+    if (ch != 0 && pad_log_count < 12) {
+        pad_log_count++;
+        char b[48]; int p = 0;
+        const char *m = "Pad: change=0x";
+        while (*m) b[p++] = *m++;
+        const char h[] = "0123456789ABCDEF";
+        for (int k = 3; k >= 0; k--) b[p++] = h[(ch >> (k*4)) & 0xF];
+        b[p++] = ' '; b[p++] = 'r'; b[p++] = 'a'; b[p++] = 'w'; b[p++] = '=';
+        b[p++] = '0'; b[p++] = 'x';
+        for (int k = 3; k >= 0; k--) b[p++] = h[(raw >> (k*4)) & 0xF];
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    }
+
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
-    MAP(DS_UP,DG_KEY_UPARROW);   MAP(DS_DOWN,DG_KEY_DOWNARROW);
-    MAP(DS_LEFT,DG_KEY_LEFTARROW); MAP(DS_RIGHT,DG_KEY_RIGHTARROW);
-    MAP(DS_CROSS,DG_KEY_FIRE);   MAP(DS_SQUARE,DG_KEY_USE);
-    MAP(DS_CIRCLE,DG_KEY_ENTER); MAP(DS_OPTIONS,DG_KEY_ESCAPE);
-    MAP(DS_TRIANGLE,DG_KEY_TAB); MAP(DS_L1,DG_KEY_SHIFT);
-    MAP(DS_R1,DG_KEY_ALT);       MAP(DS_L2,DG_KEY_F1);
-    MAP(DS_R2,DG_KEY_F2);
-    if ((raw&DS_SHARE)&&(ch&DS_CROSS))    push_key(DG_KEY_1,(raw&DS_CROSS)?1:0);
-    if ((raw&DS_SHARE)&&(ch&DS_SQUARE))   push_key(DG_KEY_2,(raw&DS_SQUARE)?1:0);
-    if ((raw&DS_SHARE)&&(ch&DS_CIRCLE))   push_key(DG_KEY_3,(raw&DS_CIRCLE)?1:0);
-    if ((raw&DS_SHARE)&&(ch&DS_TRIANGLE)) push_key(DG_KEY_4,(raw&DS_TRIANGLE)?1:0);
-    if ((raw&DS_L3)&&(ch&DS_CROSS))       push_key(DG_KEY_5,(raw&DS_CROSS)?1:0);
-    if ((raw&DS_L3)&&(ch&DS_SQUARE))      push_key(DG_KEY_6,(raw&DS_SQUARE)?1:0);
-    if ((raw&DS_L3)&&(ch&DS_CIRCLE))      push_key(DG_KEY_7,(raw&DS_CIRCLE)?1:0);
+
+    /* D-Pad = movement */
+    MAP(DS_UP,       DOOM_KEY_UP);
+    MAP(DS_DOWN,     DOOM_KEY_DOWN);
+    MAP(DS_LEFT,     DOOM_KEY_LEFT);
+    MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
+
+    /* Face buttons */
+    MAP(DS_CROSS,    DOOM_KEY_FIRE);      /* ✕ = Shoot */
+    MAP(DS_SQUARE,   DOOM_KEY_SPACE);     /* □ = Use / Open door */
+    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);    /* △ = Run */
+    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);     /* ○ = Confirm */
+
+    /* Menu */
+    MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);    /* Options = Main menu */
+
+    /* Shoulder buttons */
+    MAP(DS_R1,       DOOM_KEY_F2);        /* R1 = Save menu */
+    MAP(DS_L1,       DOOM_KEY_F3);        /* L1 = Load menu */
+    MAP(DS_R2,       DOOM_KEY_RBRACKET);  /* R2 = Next weapon */
+    MAP(DS_L2,       DOOM_KEY_LBRACKET);  /* L2 = Prev weapon */
+
+    /* Share (0x0001) intentionally NOT mapped. */
+
 #undef MAP
 }
+
 static void audio_drain(void) {
     struct ps_ctx *c = &g_ctx;
     if (c->audio_h < 0 || !c->aud_out || !c->ring) return;
@@ -349,9 +390,6 @@ static void audio_drain(void) {
     }
 }
 
-/* ====================================================================
- * recv_wad — clears inherited SO_RCVTIMEO on the accepted client.
- * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -382,11 +420,6 @@ static int recv_wad(s32 listen_fd) {
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* Clear inherited SO_RCVTIMEO on the CLIENT socket.
-     * FreeBSD (PS4/PS5) inherits socket options from the listening
-     * socket to accepted sockets.  Our 500ms accept-timeout was
-     * inherited by the WAD client and made recv() fail whenever the
-     * stream paused >500ms.  Reset to 30 seconds. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 30000000;
@@ -475,9 +508,6 @@ extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
-/* ====================================================================
- * DG_Init — do NOT allocate DG_ScreenBuffer (doomgeneric already did).
- * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
     if (!DG_ScreenBuffer) {
@@ -488,7 +518,7 @@ void DG_Init(void) {
 }
 
 /* ====================================================================
- * DG_DrawFrame — blits frame, presents, and pumps the sound mixer.
+ * DG_DrawFrame — blit + present + pump audio
  * ==================================================================== */
 void DG_DrawFrame(void) {
     static int draw_count = 0;
@@ -518,11 +548,7 @@ void DG_DrawFrame(void) {
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
 
-    /* === Sound: push ~85 ms of audio per frame ===
-     * doomgeneric has no audio thread — it expects the platform sound
-     * driver to call I_SubmitSound on its own.  We call it 8 times per
-     * render: each call mixes 512 stereo frames (~10.7 ms @ 48 kHz),
-     * so 8 × 10.7 ≈ 85 ms of audio — roughly matching our render rate. */
+    /* Pump the audio mixer — 8 slots per frame ≈ 85 ms of audio. */
     for (int i = 0; i < 8; i++) {
         I_SubmitSound();
         audio_drain();
@@ -534,7 +560,7 @@ void DG_DrawFrame(void) {
                         (u64)c->pad_h, (u64)pad_buf, 1, 0, 0, 0);
         if (n > 0 && (u32)n < 0x80000000) {
             u32 raw = *(u32 *)pad_buf;
-            if (!(raw & 0x80000000)) translate_pad(raw & 0x001FFFFF);
+            if (!(raw & 0x80000000)) translate_pad(raw & DS_PAD_MASK);
         }
     }
 }
@@ -578,11 +604,9 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
-    /* 1) Apply ELF relocations */
     u64 load_base = (u64)&_start;
     int n_reloc = do_relocations(load_base);
 
-    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file) */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
@@ -784,68 +808,4 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
                              SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
-    if (c->mmap_fn) {
-        c->ring = (u8 *)NC(c->G, c->mmap_fn, 0,
-                           (u64)(RING_SLOTS * RING_BYTES), 3, 0x1002,
-                           (u64)-1, 0);
-        if ((s64)c->ring == -1) c->ring = 0;
-    }
-    udp_log(c->audio_h >= 0 ? "DoomPS: [34] audio up\n"
-                            : "DoomPS: [34] audio N/A\n");
-    ext->step = 34;
-
-    if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
-    if (c->pad_geth)
-        c->pad_h = (s32)NC(c->G, c->pad_geth,
-                           (u64)c->user_id, 0, 0, 0, 0, 0);
-    udp_log("DoomPS: [35] pad query done\n"); ext->step = 35;
-
-    s32 tcp_listen_fd = (s32)ext->dbg[0];
-    udp_log("DoomPS: [36] entering recv_wad\n"); ext->step = 36;
-
-    int wad_ok = (recv_wad(tcp_listen_fd) == 0);
-    if (!wad_ok) {
-        udp_log("DoomPS: WAD recv failed\n");
-        show_error_and_hang(c, "WAD transfer failed",
-                            "Check PC->console TCP connectivity");
-    }
-    {
-        s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path,
-                            (u64)0x0000, 0, 0, 0, 0);
-        if (check < 0) {
-            udp_log("DoomPS: WAD verify failed\n");
-            show_error_and_hang(c, "WAD missing after transfer",
-                                c->wad_path);
-        }
-        NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
-    }
-    udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
-
-    static const char arg0[] = "doom";
-    static const char arg1[] = "-iwad";
-    const char *argv[4];
-    argv[0] = arg0;
-    argv[1] = arg1;
-    argv[2] = c->wad_path;
-    argv[3] = (char *)0;
-
-    udp_log("DoomPS: [38] doomgeneric_Create\n"); ext->step = 38;
-    doomgeneric_Create(3, (char **)argv);
-
-    udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
-    udp_log("DoomPS: entering tick loop\n");
-    while (1) {
-        doomgeneric_Tick();
-        c->ext->frame_count = c->total_frames;
-    }
-
-    udp_log("DoomPS: exit\n");
-    if (c->aud_close && c->audio_h >= 0)
-        NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
-    if (c->vid_close && c->video_h >= 0)
-        NC(c->G, c->vid_close, (u64)c->video_h, 0,0,0,0,0);
-    if (c->delete_eq && c->eq)
-        NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
-    ext->status = 0;
-    ext->step   = 99;
-}
+    if (c->
