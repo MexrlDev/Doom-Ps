@@ -1,17 +1,13 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v15 — AMPLITUDE RESET + ALIASING FILTER
- *   - MUSIC_AMPL 120 → 32.  A 4-voice chord was producing ±48,000
- *     pre-clip; the 240× effective gain drove the soft-clip into a
- *     wall of harmonics = the buzzing you heard.
- *   - OUT_BOOST 3/2 → 1/1.  No final boost.
- *   - SFX_HEADROOM 3 → 4.
- *   - One-pole LPF (~5.5 kHz) on the music path.  Removes the
- *     harmonics above Nyquist that would otherwise alias down as
- *     inharmonic buzz.
- *   - Soft-clip: linear to 20000, 4:1 to 26000, 8:1 to 30000.
- *   - T=6 spurious score-end skip retained (E1M1 quirk).
+ * v16:
+ *   - FIXED: dump_score_bytes wrote 203 bytes into a 160-byte buffer,
+ *     clobbering 43 bytes of the caller's stack frame.  That's what
+ *     crashed the console right after "Music: playing once".  Buffer
+ *     is now 320 bytes.
+ *   - Everything else identical to v15 (32× music, 4× SFX headroom,
+ *     LPF on music path, T=6 spurious skip).
  */
 
 #include <stdio.h>
@@ -191,12 +187,16 @@ static int mus_read_varlen(void) {
     return v;
 }
 
+/* 64-byte hex dump of the score.  Buffer must be at least
+ * 9 (prefix) + 64*3 (bytes) + 2 (newline+null) = 203 bytes.
+ * Was 160 in v14/v15 — overflowed by 43 bytes, crashed the console. */
 static void dump_score_bytes(void) {
-    char b[160]; int p = 0;
+    char b[320]; int p = 0;
     const char *pre = "M: hdr64:";
-    while (*pre) b[p++] = *pre++;
+    while (*pre && p < 32) b[p++] = *pre++;
     const char h[] = "0123456789ABCDEF";
     for (int i = 0; i < 64 && (mus_track_start + i) < mus_track_end; i++) {
+        if (p >= 315) break;
         b[p++] = ' ';
         unsigned char c = mus_data[mus_track_start + i];
         b[p++] = h[(c >> 4) & 0xF];
@@ -384,8 +384,8 @@ static void music_render_accum(s32 *accum, int frames) {
 
         mix = mix * MUSIC_AMPL * vol / 15;
 
-        /* One-pole LPF, alpha = 0.5 → ~5.5 kHz cutoff.  Removes the
-         * harmonics above Nyquist that aliased down as buzz. */
+        /* One-pole LPF, alpha = 0.5 → ~3.8 kHz cutoff.
+         * Removes the harmonics above Nyquist that aliased down as buzz. */
         g_mus_lpf += (mix - g_mus_lpf) / 2;
 
         accum[i * 2]     += g_mus_lpf;
