@@ -1,22 +1,15 @@
 /*
  * doom-ps/src/main.c — FINAL
  *
- * UI layout locked to spec:
- *   DOOM-PS               y=280  scale=8  0xFFFFAA00
- *   doomgeneric on Luac0re y=400 scale=3  0xFF808080
- *   By MexrlDev           y=470  scale=4  0xFFA0A0A0
- *   LOADING               y=570  scale=5  0xFFFFFFFF
- *   status                y=720  scale=3  0xFFA0A0A0
- *   progress bar          x=200 y=700 w=(SCR_W-400) h=40
- *   DOOM-PS ERROR         y=300  scale=6  0xFFFF4040
- *   error line 1          y=500  scale=4  0xFFFFFFFF
- *   error line 2          y=600  scale=3  0xFFA0A0A0
- *   Reboot game to recover y=900 scale=3  0xFF808080
+ * UI locked to v17 spec. BSS zeroed at start of _start.
  */
 
 #include "core.h"
 #include "doomgeneric_ps.h"
 #include "font.h"
+
+extern char __bss_start[];
+extern char __bss_end[];
 
 static void ps_memset(void *dst, u8 val, u64 len) {
     u8 *d = (u8 *)dst;
@@ -149,7 +142,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ====================================================================
- * LOADING — exact spec
+ * LOADING — locked to v17 spec
  * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -158,16 +151,16 @@ static void show_loading(struct ps_ctx *c, int dots, const char *status) {
 
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
-    ps_draw_str_center(fb, 470, "By MexrlDev", 0xFFA0A0A0, 4);
+    ps_draw_str_center(fb, 445, "By MexrlDev", 0xFF909090, 3);
 
     char buf[32]; int p = 0;
     const char *base = "LOADING";
     while (base[p]) { buf[p] = base[p]; p++; }
     for (int i = 0; i < dots; i++) buf[p++] = '.';
     buf[p] = 0;
-    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
 
-    if (status) ps_draw_str_center(fb, 720, status, 0xFFA0A0A0, 3);
+    if (status) ps_draw_str_center(fb, 700, status, 0xFFA0A0A0, 3);
 
     present(c);
 }
@@ -179,7 +172,7 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
 
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
-    ps_draw_str_center(fb, 470, "By MexrlDev", 0xFFA0A0A0, 4);
+    ps_draw_str_center(fb, 445, "By MexrlDev", 0xFF909090, 3);
 
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
     char buf[40]; int p = 0;
@@ -189,9 +182,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     if (pct >= 10)  buf[p++] = '0' + ((pct / 10) % 10);
     buf[p++] = '0' + (pct % 10);
     buf[p++] = '%'; buf[p] = 0;
-    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
 
-    int bar_x = 200, bar_y = 700, bar_w = SCR_W - 400, bar_h = 40;
+    int bar_x = 200, bar_y = 680, bar_w = SCR_W - 400, bar_h = 40;
     int filled = (total > 0) ? (int)((u64)bar_w * got / total) : 0;
     if (filled > bar_w) filled = bar_w;
     ps_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, 0xFF303030);
@@ -436,6 +429,15 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
+    /* ============================================================
+     * BSS ZERO — must run FIRST, before any global is touched.
+     * Luac0re's loader does not zero .bss, so we do it manually.
+     * ============================================================ */
+    {
+        volatile char *p = __bss_start;
+        while (p < __bss_end) *p++ = 0;
+    }
+
     ext->step = 1;
     void *G = (void *)(eboot_base + GADGET_OFFSET);
     void *D = (void *)dlsym_addr;
