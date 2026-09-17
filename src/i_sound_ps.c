@@ -2,11 +2,12 @@
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
  * This file REPLACES doomgeneric/i_sound.c (excluded in Makefile).
- * It implements Doom's I_* sound API.  Sound effects are mixed into
- * a stereo buffer and submitted via dg_audio_callback() which pushes
- * them through sceAudioOutOutput on the console.
+ * Implements the modern doomgeneric I_* sound API.
  *
- * Music (Redbook / MIDI) is not supported yet — game sounds play fine.
+ * Sound effects play through dg_audio_callback(), which is defined
+ * in main.c and pushes samples via sceAudioOutOutput on the console.
+ *
+ * Music is not implemented yet (stubbed to silence).
  */
 
 #include <stdio.h>
@@ -24,7 +25,7 @@
 #include "core.h"
 #include "doomgeneric_ps.h"
 
-/* dg_audio_callback is implemented in main.c; pushes to sceAudioOut */
+/* Implemented in main.c — pushes stereo samples to sceAudioOut */
 extern void dg_audio_callback(const short *pcm, int sample_count);
 
 #define NCHANNELS   16
@@ -32,8 +33,6 @@ extern void dg_audio_callback(const short *pcm, int sample_count);
 
 typedef struct {
     int active;
-    int handle;
-    int sfx_id;
     int volume;          /* 0-127 Doom volume */
     int pan;             /* 0=left, 128=center, 255=right */
     int step;            /* pitch, 16.16 fixed point */
@@ -44,16 +43,28 @@ typedef struct {
 
 static channel_t channels[NCHANNELS];
 static short mixbuf[MIXBUF * 2];
-static int next_handle = 1;
 
-/* ====== Doom I_* sound API ====== */
+/* ============================================================
+ * Doom I_* sound API
+ * ============================================================ */
 
-void I_InitSound(void) {
+void I_InitSound(boolean use_sfx_prefix) {
+    (void)use_sfx_prefix;
     for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0;
 }
 
+void I_ShutdownSound(void) {
+    for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0;
+}
+
+int I_GetSfxLumpNum(sfxinfo_t *sfxinfo) {
+    char namebuf[16];
+    snprintf(namebuf, sizeof(namebuf), "ds%s", DEH_String(sfxinfo->name));
+    return W_GetNumForName(namebuf);
+}
+
 void I_UpdateSound(void) {
-    /* Nothing per-tick; we mix on Submit */
+    /* Nothing per-tick; mixing happens in I_SubmitSound */
 }
 
 void I_SubmitSound(void) {
@@ -98,93 +109,81 @@ void I_SubmitSound(void) {
     dg_audio_callback(mixbuf, MIXBUF);
 }
 
-void I_ShutdownSound(void) {
-    for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0;
+void I_SetChannels(void) {
+    /* Channel count is fixed at compile time. */
 }
 
-int I_GetSfxLumpNum(sfxinfo_t *sfxinfo) {
-    char namebuf[16];
-    snprintf(namebuf, sizeof(namebuf), "ds%s", DEH_String(sfxinfo->name));
-    return W_GetNumForName(namebuf);
+void I_SetSfxVolume(int volume) {
+    (void)volume;
+    /* Per-channel volumes are already set by the game logic */
 }
 
-void I_SetChannels(void) {}
+int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
+    if (channel < 0 || channel >= NCHANNELS) return -1;
+    if (!sfxinfo) return -1;
 
-void I_StartSound(int id, int vol, int sep, int pitch, int priority) {
-    /* Find a free channel */
-    int cidx = -1;
-    for (int i = 0; i < NCHANNELS; i++) {
-        if (!channels[i].active) { cidx = i; break; }
-    }
-    if (cidx < 0) cidx = 0;   /* steal channel 0 if all busy */
-
-    sfxinfo_t *sfx = &S_sfx[id];
-    int lumpnum = sfx->lumpnum;
+    int lumpnum = sfxinfo->lumpnum;
     if (lumpnum < 0) {
-        lumpnum = I_GetSfxLumpNum(sfx);
-        sfx->lumpnum = lumpnum;
+        lumpnum = I_GetSfxLumpNum(sfxinfo);
+        sfxinfo->lumpnum = lumpnum;
     }
 
     unsigned char *lump =
         (unsigned char *)W_CacheLumpNum(lumpnum, PU_STATIC);
-    if (!lump) return;
+    if (!lump) return -1;
 
     /* DMX sound format: [0x03 0x00 rate_lo rate_hi len32 pad16 samples] */
-    if (lump[0] != 0x03 || lump[1] != 0x00) return;
+    if (lump[0] != 0x03 || lump[1] != 0x00) return -1;
 
     int length = lump[4] | (lump[5] << 8) | (lump[6] << 16) | (lump[7] << 24);
     unsigned char *samples = lump + 24;
 
-    channel_t *ch = &channels[cidx];
+    channel_t *ch = &channels[channel];
     ch->active = 1;
-    ch->handle = next_handle++;
-    ch->sfx_id = id;
     ch->volume = vol;
     ch->pan = sep;
-    /* Pitch from Doom is a value where 128 = normal.
-     * We convert to 16.16 fixed-point step. */
-    int step = (pitch > 0) ? ((128 << 16) / pitch) : (1 << 16);
-    ch->step = step;
+    ch->step = 1 << 16;      /* normal pitch */
     ch->pos = 0;
     ch->data = samples;
     ch->length = length;
+
+    return channel;
 }
 
-void I_StopSound(int handle) {
-    for (int i = 0; i < NCHANNELS; i++) {
-        if (channels[i].active && channels[i].handle == handle)
-            channels[i].active = 0;
-    }
+void I_StopSound(int channel) {
+    if (channel < 0 || channel >= NCHANNELS) return;
+    channels[channel].active = 0;
 }
 
-int I_SoundIsPlaying(int handle) {
-    for (int i = 0; i < NCHANNELS; i++) {
-        if (channels[i].active && channels[i].handle == handle)
-            return 1;
-    }
-    return 0;
+boolean I_SoundIsPlaying(int channel) {
+    if (channel < 0 || channel >= NCHANNELS) return 0;
+    return channels[channel].active ? 1 : 0;
 }
 
-void I_UpdateSoundParams(int handle, int vol, int sep, int pitch) {
-    for (int i = 0; i < NCHANNELS; i++) {
-        if (channels[i].active && channels[i].handle == handle) {
-            channels[i].volume = vol;
-            channels[i].pan = sep;
-            int step = (pitch > 0) ? ((128 << 16) / pitch) : (1 << 16);
-            channels[i].step = step;
-        }
-    }
+void I_UpdateSoundParams(int channel, int vol, int sep) {
+    if (channel < 0 || channel >= NCHANNELS) return;
+    if (!channels[channel].active) return;
+    channels[channel].volume = vol;
+    channels[channel].pan = sep;
 }
 
-/* ====== Music (not implemented) ====== */
+void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
+    /* No-op: sounds are loaded on demand in I_StartSound. */
+    (void)sounds;
+    (void)num_sounds;
+}
+
+/* ============================================================
+ * Music (stubbed to silence)
+ * ============================================================ */
 
 void I_InitMusic(void) {}
 void I_ShutdownMusic(void) {}
-void I_SetMusicVolume(int volume) {}
+void I_SetMusicVolume(int volume) { (void)volume; }
 void I_PauseSong(void) {}
 void I_ResumeSong(void) {}
 void *I_RegisterSong(void *data, int len) { (void)data; (void)len; return NULL; }
 void I_UnRegisterSong(void *handle) { (void)handle; }
-void I_PlaySong(void *handle, int looping) { (void)handle; (void)looping; }
+void I_PlaySong(void *handle, boolean looping) { (void)handle; (void)looping; }
 void I_StopSong(void) {}
-int I_IsSongPlaying(void) { return 0; }
+boolean I_IsSongPlaying(void) { return 0; }
