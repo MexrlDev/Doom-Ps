@@ -1,5 +1,9 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
+ *
+ * v2: malloc pool uses sceKernelAllocateDirectMemory + sceKernelMapDirectMemory
+ *     (proven to work for the framebuffer), 32 MB pool.
+ *     fopen reads via read() loop instead of mmap().
  */
 
 #include "core.h"
@@ -9,30 +13,72 @@
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
 static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
+static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
 
 void ps_libc_init(void *G, void *D) {
     __G = G; __D = D;
-    fn_mmap   = SYM(G, D, LIBKERNEL_HANDLE, "mmap");
-    fn_munmap = SYM(G, D, LIBKERNEL_HANDLE, "munmap");
-    fn_kopen  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelOpen");
-    fn_kread  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelRead");
-    fn_kwrite = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWrite");
-    fn_kclose = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose");
-    fn_klseek = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLseek");
-    fn_kmkdir = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir");
+    fn_mmap     = SYM(G, D, LIBKERNEL_HANDLE, "mmap");
+    fn_munmap   = SYM(G, D, LIBKERNEL_HANDLE, "munmap");
+    fn_kopen    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelOpen");
+    fn_kread    = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelRead");
+    fn_kwrite   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelWrite");
+    fn_kclose   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelClose");
+    fn_klseek   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelLseek");
+    fn_kmkdir   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMkdir");
+    fn_alloc_dm = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
+    fn_map_dm   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
+    fn_dm_size  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
 }
 
-/* ===== memory (bump allocator, 256 MB pool) ===== */
-#define POOL_SIZE (256u * 1024u * 1024u)
+/* ===== memory (bump allocator, 32 MB pool via direct memory) ===== */
+#define POOL_SIZE (32u * 1024u * 1024u)
 static unsigned char *__pool = 0;
 static size_t __pool_used = 0;
 
+static void *pool_alloc(void) {
+    /* Preferred: DMEM — proven to work for framebuffer */
+    if (fn_alloc_dm && fn_map_dm) {
+        u64 total = fn_dm_size ? NC(__G, fn_dm_size, 0,0,0,0,0,0)
+                              : 0x300000000ULL;
+        u64 phys = 0;
+        s32 ret = (s32)NC(__G, fn_alloc_dm,
+                          0,                  /* searchStart */
+                          total,              /* searchEnd */
+                          POOL_SIZE,          /* len */
+                          0x200000,           /* alignment 2MB */
+                          3,                  /* memoryType */
+                          (u64)&phys);
+        if (ret == 0) {
+            void *vmem = 0;
+            ret = (s32)NC(__G, fn_map_dm,
+                          (u64)&vmem,
+                          (u64)POOL_SIZE,
+                          3,              /* PROT_READ|WRITE */
+                          0,              /* flags */
+                          phys,
+                          0x200000);
+            if (ret == 0 && vmem &&
+                (u64)vmem < 0x8000000000000000ULL) {
+                return vmem;
+            }
+        }
+    }
+    /* Fallback: mmap */
+    if (fn_mmap) {
+        void *p = (void *)NC(__G, fn_mmap,
+                             0, POOL_SIZE, 3, 0x1002, (u64)-1, 0);
+        if (p && (u64)p != (u64)-1 &&
+            (u64)p < 0x8000000000000000ULL) {
+            return p;
+        }
+    }
+    return 0;
+}
+
 void *malloc(size_t size) {
     if (!__pool) {
-        if (!fn_mmap) return 0;
-        __pool = (unsigned char *)NC(__G, fn_mmap,
-                    0, POOL_SIZE, 3, 0x1002, (u64)-1, 0);
-        if ((long)__pool == -1) { __pool = 0; return 0; }
+        __pool = (unsigned char *)pool_alloc();
+        if (!__pool) return 0;
     }
     size = (size + 15) & ~(size_t)15;
     if (__pool_used + size > POOL_SIZE) return 0;
@@ -70,7 +116,6 @@ void *memcpy(void *d, const void *s, size_t n) {
     while (n--) *dd++ = *ss++;
     return d;
 }
-
 void *memmove(void *d, const void *s, size_t n) {
     unsigned char *dd = (unsigned char *)d;
     const unsigned char *ss = (const unsigned char *)s;
@@ -78,13 +123,11 @@ void *memmove(void *d, const void *s, size_t n) {
     else { dd += n; ss += n; while (n--) *--dd = *--ss; }
     return d;
 }
-
 void *memset(void *d, int c, size_t n) {
     unsigned char *p = (unsigned char *)d;
     while (n--) *p++ = (unsigned char)c;
     return d;
 }
-
 int memcmp(const void *a, const void *b, size_t n) {
     const unsigned char *x = (const unsigned char *)a;
     const unsigned char *y = (const unsigned char *)b;
@@ -94,50 +137,40 @@ int memcmp(const void *a, const void *b, size_t n) {
 
 /* ===== string ===== */
 size_t strlen(const char *s) { size_t n = 0; while (s[n]) n++; return n; }
-
 int strcmp(const char *a, const char *b) {
     while (*a && *a == *b) { a++; b++; }
     return (unsigned char)*a - (unsigned char)*b;
 }
-
 int strncmp(const char *a, const char *b, size_t n) {
     while (n && *a && *a == *b) { a++; b++; n--; }
     return n ? (unsigned char)*a - (unsigned char)*b : 0;
 }
-
 static int __lc(int c) { return (c >= 'A' && c <= 'Z') ? c + 32 : c; }
-
 int strcasecmp(const char *a, const char *b) {
     while (*a && __lc((unsigned char)*a) == __lc((unsigned char)*b)) { a++; b++; }
     return __lc((unsigned char)*a) - __lc((unsigned char)*b);
 }
-
 int strncasecmp(const char *a, const char *b, size_t n) {
     while (n && *a && __lc((unsigned char)*a) == __lc((unsigned char)*b)) { a++; b++; n--; }
     return n ? __lc((unsigned char)*a) - __lc((unsigned char)*b) : 0;
 }
-
 char *strcpy(char *d, const char *s) { char *r = d; while ((*d++ = *s++)); return r; }
-
 char *strncpy(char *d, const char *s, size_t n) {
     char *r = d;
     while (n && (*d = *s)) { d++; s++; n--; }
     while (n--) *d++ = 0;
     return r;
 }
-
 char *strchr(const char *s, int c) {
     while (*s) { if (*s == (char)c) return (char *)s; s++; }
     return (char)c == 0 ? (char *)s : 0;
 }
-
 char *strrchr(const char *s, int c) {
     const char *last = 0;
     while (*s) { if (*s == (char)c) last = s; s++; }
     if ((char)c == 0) return (char *)s;
     return (char *)last;
 }
-
 char *strstr(const char *hay, const char *needle) {
     if (!*needle) return (char *)hay;
     for (; *hay; hay++) {
@@ -147,7 +180,6 @@ char *strstr(const char *hay, const char *needle) {
     }
     return 0;
 }
-
 char *strdup(const char *s) {
     size_t len = strlen(s) + 1;
     char *p = (char *)malloc(len);
@@ -171,7 +203,6 @@ int ispunct(int c) { return isgraph(c) && !isalnum(c); }
 int iscntrl(int c) { return (c >= 0 && c < 32) || c == 127; }
 int isblank(int c) { return c == ' ' || c == '\t'; }
 
-/* glibc's ctype internals — some code paths still reference these. */
 static const unsigned short __ctype_tbl[384]   = {0};
 static const unsigned short *__ctype_tbl_p     = __ctype_tbl + 128;
 static const int __toupper_tbl[384]            = {0};
@@ -186,7 +217,6 @@ const int **__ctype_tolower_loc(void)            { return &__tolower_tbl_p; }
 /* ===== numeric ===== */
 int abs(int x) { return x < 0 ? -x : x; }
 long labs(long x) { return x < 0 ? -x : x; }
-
 int atoi(const char *s) {
     int v = 0, neg = 0;
     while (*s == ' ' || *s == '\t') s++;
@@ -194,7 +224,6 @@ int atoi(const char *s) {
     while (*s >= '0' && *s <= '9') { v = v * 10 + (*s - '0'); s++; }
     return neg ? -v : v;
 }
-
 double atof(const char *s) { return (double)atoi(s); }
 double fabs(double x) { return x < 0 ? -x : x; }
 
@@ -249,16 +278,17 @@ FILE *fopen(const char *path, const char *mode) {
         long sz = (long)NC(__G, fn_klseek, (u64)fd, 0, 2, 0,0,0);
         NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
         if (sz < 0) sz = 0;
-        f->size = sz;
-        if (sz > 0 && fn_mmap) {
-            unsigned char *b = (unsigned char *)NC(__G, fn_mmap,
-                0, (u64)sz, 3, 0x1002, (u64)-1, 0);
-            if ((long)b == -1) { b = 0; }
+        if (sz > 0) {
+            /* Allocate from our pool, then read via read() loop.
+             * No mmap — avoids kernel VA pressure and error-return
+             * weirdness from within the shellcode. */
+            unsigned char *b = (unsigned char *)malloc((size_t)sz);
             if (b) {
                 long total = 0;
                 while (total < sz) {
                     s32 n = (s32)NC(__G, fn_kread, (u64)fd,
-                                    (u64)(b + total), (u64)(sz - total), 0,0,0);
+                                    (u64)(b + total),
+                                    (u64)(sz - total), 0,0,0);
                     if (n <= 0) break;
                     total += n;
                 }
@@ -274,8 +304,7 @@ FILE *fopen(const char *path, const char *mode) {
 
 int fclose(FILE *f) {
     if (!f || f == &__null_file) return 0;
-    if (f->buf && fn_munmap)
-        NC(__G, fn_munmap, (u64)f->buf, (u64)f->size, 0, 0, 0, 0);
+    /* pool is bump allocator — free is a no-op */
     if (f->fd >= 0 && fn_kclose)
         NC(__G, fn_kclose, (u64)f->fd, 0,0,0,0,0);
     f->fd = 0; f->buf = 0; f->pos = 0; f->size = 0;
@@ -333,13 +362,6 @@ int snprintf(char *b, size_t n, const char *fmt, ...)      { if (b && n) b[0]=0;
 int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a)
                                                            { if (b && n) b[0]=0; (void)fmt; (void)a; return 0; }
 
-/* ============================================================
- * glibc redirects sscanf to __isoc99_sscanf at the header level.
- * Attaching the mangled name via __asm__ guarantees the compiler
- * emits the exact symbol the linker is looking for, regardless of
- * what any header has already done to the identifier.
- * ============================================================ */
-
 int sscanf(const char *s, const char *fmt, ...) { (void)s; (void)fmt; return 0; }
 
 int __isoc99_sscanf(const char *s, const char *fmt, ...)
@@ -348,7 +370,6 @@ int __isoc99_sscanf(const char *s, const char *fmt, ...) {
     (void)s; (void)fmt;
     return 0;
 }
-
 int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a)
     __asm__("__isoc99_vsscanf");
 int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a) {
