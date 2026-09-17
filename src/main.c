@@ -1,15 +1,11 @@
 /*
- * doom-ps/src/main.c — v22
+ * doom-ps/src/main.c — v23
  *
- * v22 fixes:
- *   - DG_Init no longer reallocates DG_ScreenBuffer.  doomgeneric already
- *     allocates it at DOOMGENERIC_RESX*DOOMGENERIC_RESY*4 = 640*400*4 = 1 MB.
- *     Our old code overwrote the pointer with a 256 KB block, then doom wrote
- *     1 MB into it, corrupting the doom zone and hanging 2 seconds later.
- *   - blit_doom_frame reads the 640x400 framebuffer with stride 640,
- *     downsampling to 320x200 by sampling every other pixel.
- *   - Color passthrough: doomgeneric writes A8R8G8B8, PS5 format=1 is
- *     also A8R8G8B8, so R/B were being swapped (looked "inverted").
+ * v23: clear inherited SO_RCVTIMEO on the accepted client socket.
+ *      FreeBSD (PS4/PS5) inherits socket options from a listening
+ *      socket to accepted sockets.  Our 500ms accept-timeout was
+ *      inherited by the WAD client and made recv() fail whenever the
+ *      stream paused >500ms.  Reset to 30s on the client.
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -285,28 +281,17 @@ static void ps_error_display(const char *msg) {
 }
 
 /* ====================================================================
- * blit_doom_frame — v22
- *
- * DG_ScreenBuffer is 640x400 (doomgeneric upscales 320x200 -> 640x400
- * with 2x nearest-neighbor).  We downsample back to 320x200 by taking
- * every other pixel, then 6x/5x scale up to 1920x1000 on the display.
- *
- * Color: doomgeneric writes A8R8G8B8 (R at bit 16, G at bit 8, B at
- * bit 0).  PS5's pixel format 1 is also A8R8G8B8.  So we pass through
- * unmodified with forced opaque alpha.
+ * blit_doom_frame — reads 640x400 (stride 640), downsamples to 320x200,
+ * then scales to 1920x1000 on the display.  Color passthrough (A8R8G8B8).
  * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
 
     for (int dy = 0; dy < DOOM_H; dy++) {
-        /* Row stride is 640, take every other row */
         const u32 *row = doom + (dy * 2) * DOOMFB_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
-            /* Take every other pixel of the 2x-upscaled framebuffer */
             u32 rgba = row[dx * 2];
-
-            /* A8R8G8B8 -> A8R8G8B8, just force alpha to opaque */
             u32 out = rgba | 0xFF000000;
 
             int fy = OFF_Y + dy * SCALE_Y;
@@ -358,6 +343,9 @@ static void audio_drain(void) {
     }
 }
 
+/* ====================================================================
+ * recv_wad — v23: clears inherited SO_RCVTIMEO on the accepted client.
+ * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -367,8 +355,9 @@ static int recv_wad(s32 listen_fd) {
     show_loading(c, 0, "Waiting for WAD upload...");
     udp_log("DoomPS: WAD screen drawn\n");
 
+    /* 500 ms timeout on the LISTENING socket (for animated waiting). */
     if (c->setsockopt_fn) {
-        udp_log("DoomPS: setting SO_RCVTIMEO\n");
+        udp_log("DoomPS: setting SO_RCVTIMEO on listener\n");
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 500000;
         s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
@@ -387,6 +376,19 @@ static int recv_wad(s32 listen_fd) {
         if ((attempt % 20) == 19) udp_log("DoomPS: accept retry (10s)\n");
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
+
+    /* ---- Clear inherited SO_RCVTIMEO on the CLIENT socket ---- *
+     * FreeBSD (PS4/PS5) inherits socket options from the listening
+     * socket to accepted sockets.  Our 500ms accept-timeout was
+     * inherited by the WAD client and made recv() fail whenever the
+     * stream paused >500ms.  Reset to 30 seconds. */
+    if (c->setsockopt_fn) {
+        u8 tv[16] = {0};
+        *(u64 *)(tv + 8) = 30000000;   /* 30 s */
+        (void)NC(c->G, c->setsockopt_fn,
+                 (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
+        udp_log("DoomPS: client timeout cleared\n");
+    }
 
     show_wad_progress(c, 0, 1);
     udp_log("DoomPS: receiving WAD...\n");
@@ -469,11 +471,8 @@ extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
 /* ====================================================================
- * DG_Init — v22
- * Do NOT allocate DG_ScreenBuffer here.  doomgeneric_Create already
- * allocated it at DOOMGENERIC_RESX * DOOMGENERIC_RESY * 4 = 640*400*4
- * = 1 MB.  Our OLD code reallocated to 320*200*4 = 256 KB, then doom
- * wrote 1 MB into it → overflow → pool corruption → hang.
+ * DG_Init — do NOT allocate DG_ScreenBuffer.  doomgeneric_Create
+ * already allocated it at 640*400*4 = 1 MB.
  * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
