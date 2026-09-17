@@ -1,14 +1,10 @@
 /*
- * doom-ps/src/main.c — v26
+ * doom-ps/src/main.c — v27
  *
- * v26: added back O_WR_CREAT_TRUNC (was accidentally dropped in v25).
- *      Framebuffer is now 320x200 natively (matches doomgeneric's
- *      internal resolution) instead of 640x400 upscaled — 4x fewer
- *      pixels for blit_doom_frame to read, and no downsampling.
- *      Display is still scaled up to 1920x1000 (SCALE_X=6, SCALE_Y=5)
- *      so the on-screen result is identical.
- *
- * UI LOCKED to v17 spec.
+ * v27: dedicated audio thread + improved pad diagnostics.
+ *      Audio no longer blocks the render loop.
+ *      Pad logging now shows the bit NAMES so we can see exactly what
+ *      happens when Cross is pressed.
  */
 
 #include "core.h"
@@ -23,9 +19,11 @@ extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 
-/* ============================================================
- * File open flags (FreeBSD/PS4/PS5)
- * ============================================================ */
+/* Doomgeneric's native framebuffer dims — 320x200 after Makefile change */
+#define DOOMFB_W  320
+#define DOOMFB_H  200
+
+/* FreeBSD/PS4/PS5 open flags */
 #define O_WRONLY_  0x0001
 #define O_RDWR_    0x0002
 #define O_CREAT_   0x0200
@@ -33,26 +31,20 @@ extern void  I_SubmitSound(void);
 #define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
 
 /* ============================================================
- * ELF64 relocation
+ * ELF relocations
  * ============================================================ */
-typedef struct {
-    u64 r_offset;
-    u64 r_info;
-    s64 r_addend;
-} Elf64_Rela;
-
+typedef struct { u64 r_offset; u64 r_info; s64 r_addend; } Elf64_Rela;
 #define ELF64_R_TYPE(i) ((u32)((i) & 0xffffffffU))
 #define R_X86_64_RELATIVE 8
 
 static int do_relocations(u64 load_base) {
-    u64 rela_start_addr, rela_end_addr;
-    __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rela_start_addr));
-    __asm__ volatile("lea __rela_end(%%rip), %0"   : "=r"(rela_end_addr));
-
+    u64 rs, re;
+    __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rs));
+    __asm__ volatile("lea __rela_end(%%rip), %0"   : "=r"(re));
     int count = 0;
-    Elf64_Rela *r = (Elf64_Rela *)rela_start_addr;
-    Elf64_Rela *end = (Elf64_Rela *)rela_end_addr;
-    while (r < end) {
+    Elf64_Rela *r = (Elf64_Rela *)rs;
+    Elf64_Rela *e = (Elf64_Rela *)re;
+    while (r < e) {
         if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
             *(u64 *)(load_base + r->r_offset) = load_base + r->r_addend;
             count++;
@@ -77,7 +69,7 @@ static void ps_memcpy(void *dst, const void *src, u64 len) {
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 
 /* ============================================================
- * DualShock button bits (matches PS4/PS5 ScePadData.buttons)
+ * DualShock button bits
  * ============================================================ */
 #define DS_SHARE    0x0001
 #define DS_L3       0x0002
@@ -95,7 +87,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_CIRCLE   0x2000
 #define DS_CROSS    0x4000
 #define DS_SQUARE   0x8000
-#define DS_PAD_MASK 0x0000FFFF
+#define DS_PAD_MASK 0x001FFFFF
 
 /* ============================================================
  * Doom 1.9 key codes
@@ -113,7 +105,8 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RBRACKET   0x5d
 
 #define DOOM_KEY_FIRE       0xa0
-#define DOOM_KEY_RSHIFT     0xb6
+#define DOOM_KEY_RSHIFT     0xa2   /* Doom's "run" is RSHIFT-like key 0xa2 */
+#define DOOM_KEY_F1         0xbb
 #define DOOM_KEY_F2         0xbc
 #define DOOM_KEY_F3         0xbd
 
@@ -139,8 +132,6 @@ static struct ps_ctx {
 
     void *aud_open, *aud_out, *aud_close;
     s32   audio_h;
-    u8   *ring;
-    int   ring_write, ring_read, ring_count;
 
     void *pad_init_fn, *pad_geth, *pad_read;
     s32   pad_h;
@@ -157,6 +148,7 @@ static struct ps_ctx {
 } g_ctx;
 
 static char g_diag[256];
+static volatile int g_audio_thread_running = 0;
 
 static void udp_log(const char *msg) {
     struct ps_ctx *c = &g_ctx;
@@ -278,12 +270,10 @@ static void ps_error_display(const char *msg) {
 
         ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR",
                            0xFFFF4040, 6);
-        if (msg && msg[0]) {
+        if (msg && msg[0])
             ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
-        } else {
-            ps_draw_str_center(fb, 400, "(no message)",
-                               0xFFA0A0A0, 3);
-        }
+        else
+            ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
         ps_draw_str_center(fb, 900, "Reboot game to recover",
                            0xFF808080, 3);
         present(c);
@@ -292,14 +282,14 @@ static void ps_error_display(const char *msg) {
 }
 
 /* ====================================================================
- * blit_doom_frame — v26: source is now native 320x200
+ * blit_doom_frame — src is 320x200, dst is 1920x1000 (6x/5x scale)
  * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
 
     for (int dy = 0; dy < DOOM_H; dy++) {
-        const u32 *row = doom + dy * DOOM_W;   /* stride 320, no scale */
+        const u32 *row = doom + dy * DOOMFB_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
             u32 out = row[dx] | 0xFF000000;
             int fy = OFF_Y + dy * SCALE_Y;
@@ -321,24 +311,56 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
+/* ====================================================================
+ * Pad decode with detailed per-bit logging
+ * ==================================================================== */
+static const char *bit_name(u32 bit) {
+    switch (bit) {
+    case DS_SHARE:    return "Share";
+    case DS_L3:       return "L3";
+    case DS_R3:       return "R3";
+    case DS_OPTIONS:  return "Options";
+    case DS_UP:       return "Up";
+    case DS_RIGHT:    return "Right";
+    case DS_DOWN:     return "Down";
+    case DS_LEFT:     return "Left";
+    case DS_L2:       return "L2";
+    case DS_R2:       return "R2";
+    case DS_L1:       return "L1";
+    case DS_R1:       return "R1";
+    case DS_TRIANGLE: return "Triangle";
+    case DS_CIRCLE:   return "Circle";
+    case DS_CROSS:    return "Cross";
+    case DS_SQUARE:   return "Square";
+    }
+    return "?";
+}
+
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 ch = raw ^ c->pad_prev;
     c->pad_prev = raw;
 
+    /* Detailed logging for the first 200 pad changes */
     static int pad_log_count = 0;
-    if (ch != 0 && pad_log_count < 12) {
+    if (ch != 0 && pad_log_count < 200) {
         pad_log_count++;
-        char b[48]; int p = 0;
-        const char *m = "Pad: change=0x";
-        while (*m) b[p++] = *m++;
-        const char h[] = "0123456789ABCDEF";
-        for (int k = 3; k >= 0; k--) b[p++] = h[(ch >> (k*4)) & 0xF];
-        b[p++] = ' '; b[p++] = 'r'; b[p++] = 'a'; b[p++] = 'w'; b[p++] = '=';
-        b[p++] = '0'; b[p++] = 'x';
-        for (int k = 3; k >= 0; k--) b[p++] = h[(raw >> (k*4)) & 0xF];
-        b[p++] = '\n'; b[p] = 0;
-        udp_log(b);
+
+        /* Log each bit that changed with its name and press/release */
+        for (u32 b = 1; b != 0; b <<= 1) {
+            if (!(ch & b)) continue;
+
+            char buf[64]; int p = 0;
+            const char *nm = bit_name(b);
+            const char *m = (raw & b) ? "PRESS " : "REL   ";
+            while (*m) buf[p++] = *m++;
+            while (*nm && p < 30) buf[p++] = *nm++;
+            buf[p++] = ' '; buf[p++] = '0'; buf[p++] = 'x';
+            const char h[] = "0123456789ABCDEF";
+            for (int k = 7; k >= 0; k--) buf[p++] = h[(b >> (k*4)) & 0xF];
+            buf[p++] = '\n'; buf[p] = 0;
+            udp_log(buf);
+        }
     }
 
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
@@ -355,20 +377,38 @@ static void translate_pad(u32 raw) {
     MAP(DS_L1,       DOOM_KEY_F3);
     MAP(DS_R2,       DOOM_KEY_RBRACKET);
     MAP(DS_L2,       DOOM_KEY_LBRACKET);
+    /* Share (DS_SHARE) intentionally unmapped. */
 #undef MAP
 }
 
-static void audio_drain(void) {
+/* ====================================================================
+ * Audio submission (called by i_sound_ps.c → dg_audio_callback)
+ * ==================================================================== */
+void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
-    if (c->audio_h < 0 || !c->aud_out || !c->ring) return;
-    while (c->ring_count > 0) {
-        u8 *slot = c->ring + c->ring_read * RING_BYTES;
-        NC(c->G, c->aud_out, (u64)c->audio_h, (u64)slot, 0,0,0,0);
-        c->ring_read = (c->ring_read + 1) & (RING_SLOTS - 1);
-        c->ring_count--;
-    }
+    if (c->audio_h < 0 || !c->aud_out) return;
+    (void)sample_count;
+    /* Submit directly.  sceAudioOutOutput blocks until the hardware
+     * has consumed the previous buffer, so the audio thread self-paces. */
+    NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
+/* ====================================================================
+ * Audio thread — runs continuously, mixes, submits
+ * ==================================================================== */
+static void *audio_thread_fn(void *arg) {
+    (void)arg;
+    ps_sound_log("Audio: thread started\n");
+    while (g_audio_thread_running) {
+        I_SubmitSound();     /* mixes → dg_audio_callback → sceAudioOutOutput */
+    }
+    ps_sound_log("Audio: thread exiting\n");
+    return 0;
+}
+
+/* ====================================================================
+ * WAD receiver
+ * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -379,14 +419,10 @@ static int recv_wad(s32 listen_fd) {
     udp_log("DoomPS: WAD screen drawn\n");
 
     if (c->setsockopt_fn) {
-        udp_log("DoomPS: setting SO_RCVTIMEO on listener\n");
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 500000;
-        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
-                             (u64)listen_fd, 0xFFFF, 0x1006,
-                             (u64)tv, 16, 0);
-        if (so_ret != 0) udp_log("DoomPS: SO_RCVTIMEO failed\n");
-        else             udp_log("DoomPS: SO_RCVTIMEO set\n");
+        (void)NC(c->G, c->setsockopt_fn,
+                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
     }
 
     s32 client = -1;
@@ -395,10 +431,10 @@ static int recv_wad(s32 listen_fd) {
         client = (s32)NC(c->G, c->accept_fn,
                          (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client >= 0) { udp_log("DoomPS: accept returned OK\n"); break; }
-        if ((attempt % 20) == 19) udp_log("DoomPS: accept retry (10s)\n");
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
+    /* Clear inherited SO_RCVTIMEO on client */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 30000000;
@@ -425,19 +461,7 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
-    {
-        int p = 0; const char *m = "DoomPS: WAD size=";
-        while (*m) g_diag[p++] = *m++;
-        u64 v = wad_size; char tmp[24]; int t = 0;
-        if (v == 0) tmp[t++] = '0';
-        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-        while (t) g_diag[p++] = tmp[--t];
-        g_diag[p++] = '\n'; g_diag[p] = 0;
-        udp_log(g_diag);
-    }
-
     const char *wad_out = "/av_contents/content_tmp/doom.wad";
-    udp_log("DoomPS: opening WAD out file\n");
     s32 fd = (s32)NC(c->G, c->kopen,
                      (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
     diag_kopen("DoomPS: [W1r] ", wad_out, fd);
@@ -521,11 +545,7 @@ void DG_DrawFrame(void) {
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
 
-    /* Pump audio */
-    for (int i = 0; i < 8; i++) {
-        I_SubmitSound();
-        audio_drain();
-    }
+    /* Audio is now handled by the dedicated thread — no submissions here. */
 
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
@@ -560,21 +580,9 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
 }
 void DG_SetWindowTitle(const char *t) { (void)t; }
 
-void dg_audio_callback(const short *pcm, int sample_count) {
-    struct ps_ctx *c = &g_ctx;
-    if (!c->ring) return;
-    int frames = sample_count, off = 0;
-    while (frames > 0 && c->ring_count < RING_SLOTS) {
-        u8 *slot = c->ring + c->ring_write * RING_BYTES;
-        int cp = frames < SAMPLES_PER_BUF ? frames : SAMPLES_PER_BUF;
-        ps_memcpy(slot, pcm + off * 2, (u64)(cp * 4));
-        if (cp < SAMPLES_PER_BUF)
-            ps_memset(slot + cp * 4, 0, (u64)((SAMPLES_PER_BUF - cp) * 4));
-        c->ring_write = (c->ring_write + 1) & (RING_SLOTS - 1);
-        c->ring_count++; off += cp; frames -= cp;
-    }
-}
-
+/* ====================================================================
+ * _start
+ * ==================================================================== */
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
@@ -781,12 +789,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
                              SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
-    if (c->mmap_fn) {
-        c->ring = (u8 *)NC(c->G, c->mmap_fn, 0,
-                           (u64)(RING_SLOTS * RING_BYTES), 3, 0x1002,
-                           (u64)-1, 0);
-        if ((s64)c->ring == -1) c->ring = 0;
-    }
     udp_log(c->audio_h >= 0 ? "DoomPS: [34] audio up\n"
                             : "DoomPS: [34] audio N/A\n");
     ext->step = 34;
@@ -818,6 +820,23 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
     udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
 
+    /* ---- Spawn audio thread ---- */
+    if (c->audio_h >= 0 && c->aud_out) {
+        void *pthread_create = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
+        if (pthread_create) {
+            u64 thread_handle = 0;
+            g_audio_thread_running = 1;
+            s32 rc = (s32)NC(c->G, pthread_create,
+                             (u64)&thread_handle, 0,
+                             (u64)audio_thread_fn, 0,
+                             (u64)"doom_audio", 0);
+            udp_log(rc == 0 ? "DoomPS: [37b] audio thread OK\n"
+                            : "DoomPS: [37b] audio thread FAILED\n");
+        } else {
+            udp_log("DoomPS: [37b] no scePthreadCreate\n");
+        }
+    }
+
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
     const char *argv[4];
@@ -835,6 +854,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         doomgeneric_Tick();
         c->ext->frame_count = c->total_frames;
     }
+
+    g_audio_thread_running = 0;
 
     udp_log("DoomPS: exit\n");
     if (c->aud_close && c->audio_h >= 0)
