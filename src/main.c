@@ -1,27 +1,14 @@
 /*
- * doom-ps/src/main.c — v32
+ * doom-ps/src/main.c — v33
  *
- * v32:
- *   - Triangle → automap (TAB) instead of run (RSHIFT).
- *   - Touchpad click left UNMAPPED until we confirm the correct bit.
+ * v33:
+ *   - mkdir(".savegame"), mkdir("/av_contents/content_tmp/.savegame"),
+ *     mkdir("/savedata0/.savegame") at startup. Doom tries to save to
+ *     ./.savegame/doomsavN.dsg, which failed with ENOENT because the
+ *     directory never existed. Now it does.
+ *   - Touchpad left unmapped (awaiting confirmed bit value).
  *   - Share unmapped per user request.
- *   - Full mapping:
- *       D-Pad           → movement
- *       Cross           → fire
- *       Square          → use
- *       Triangle        → automap (TAB)
- *       Circle          → confirm
- *       Options         → menu (ESC)
- *       R1              → save (F2)
- *       L1              → load (F3)
- *       R2              → next weapon
- *       L2              → previous weapon
- *       L3              → strafe left  (',')
- *       R3              → strafe right ('.')
- *       Touchpad        → UNMAPPED (awaiting bit confirmation)
- *       Share           → UNMAPPED (user request)
- *
- * Logs kept as-is.  UI LOCKED to v17 spec.
+ *   - Triangle = automap.
  */
 
 #include "core.h"
@@ -35,21 +22,17 @@ extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
+extern int   mkdir(const char *path, unsigned int mode);
 
-/* Doomgeneric native framebuffer dims */
 #define DOOMFB_W  320
 #define DOOMFB_H  200
 
-/* FreeBSD/PS4/PS5 open flags */
 #define O_WRONLY_  0x0001
 #define O_RDWR_    0x0002
 #define O_CREAT_   0x0200
 #define O_TRUNC_   0x0400
 #define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
 
-/* ============================================================
- * ELF relocations
- * ============================================================ */
 typedef struct { u64 r_offset; u64 r_info; s64 r_addend; } Elf64_Rela;
 #define ELF64_R_TYPE(i) ((u32)((i) & 0xffffffffU))
 #define R_X86_64_RELATIVE 8
@@ -71,23 +54,15 @@ static int do_relocations(u64 load_base) {
     return count;
 }
 
-/* ============================================================
- * Utility
- * ============================================================ */
 static void ps_memset(void *dst, u8 val, u64 len) {
-    u8 *d = (u8 *)dst;
-    while (len--) *d++ = val;
+    u8 *d = (u8 *)dst; while (len--) *d++ = val;
 }
 static void ps_memcpy(void *dst, const void *src, u64 len) {
-    u8 *d = (u8 *)dst;
-    const u8 *s = (const u8 *)src;
+    u8 *d = (u8 *)dst; const u8 *s = (const u8 *)src;
     while (len--) *d++ = *s++;
 }
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 
-/* ============================================================
- * DualShock button bits
- * ============================================================ */
 #define DS_SHARE     0x00000001
 #define DS_L3        0x00000002
 #define DS_R3        0x00000004
@@ -104,37 +79,28 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_CIRCLE    0x00002000
 #define DS_CROSS     0x00004000
 #define DS_SQUARE    0x00008000
-#define DS_TOUCHPAD  0x00010000    /* click-in of touchpad (unconfirmed) */
+#define DS_TOUCHPAD  0x00010000
 #define DS_PAD_MASK  0x001FFFFF
 
-/* ============================================================
- * Doom 1.9 key codes
- * ============================================================ */
 #define DOOM_KEY_ESCAPE     0x1b
 #define DOOM_KEY_ENTER      0x0d
 #define DOOM_KEY_SPACE      0x20
 #define DOOM_KEY_TAB        0x09
-
 #define DOOM_KEY_LEFT       0xac
 #define DOOM_KEY_UP         0xad
 #define DOOM_KEY_RIGHT      0xae
 #define DOOM_KEY_DOWN       0xaf
-
-#define DOOM_KEY_LBRACKET   0x5b    /* prev weapon */
-#define DOOM_KEY_RBRACKET   0x5d    /* next weapon */
-#define DOOM_KEY_COMMA      0x2c    /* strafe left  */
-#define DOOM_KEY_PERIOD     0x2e    /* strafe right */
-
+#define DOOM_KEY_LBRACKET   0x5b
+#define DOOM_KEY_RBRACKET   0x5d
+#define DOOM_KEY_COMMA      0x2c
+#define DOOM_KEY_PERIOD     0x2e
 #define DOOM_KEY_USE        0xa2
 #define DOOM_KEY_FIRE       0xa3
 #define DOOM_KEY_RCTRL      0x9d
-#define DOOM_KEY_RSHIFT     0xb6    /* run */
-#define DOOM_KEY_F2         0xbc    /* save menu */
-#define DOOM_KEY_F3         0xbd    /* load menu */
+#define DOOM_KEY_RSHIFT     0xb6
+#define DOOM_KEY_F2         0xbc
+#define DOOM_KEY_F3         0xbd
 
-/* ============================================================
- * Context
- * ============================================================ */
 #define KEY_QUEUE_SIZE 32
 
 static struct ps_ctx {
@@ -143,7 +109,6 @@ static struct ps_ctx {
     void *create_eq, *wait_eq, *delete_eq, *mmap_fn;
     void *kopen, *kwrite, *kclose, *clock_gettime;
     void *accept_fn, *recv_fn, *close_fn, *sendto_fn, *setsockopt_fn, *cancel;
-
     void *vid_open, *vid_close, *vid_reg, *vid_flip, *vid_rate, *vid_evt;
     s32   video_h;
     void *vmem;
@@ -151,18 +116,14 @@ static struct ps_ctx {
     int   active_fb;
     u64   eq;
     u32   total_frames;
-
     void *aud_open, *aud_out, *aud_close;
     s32   audio_h;
-
     void *pad_init_fn, *pad_geth, *pad_read;
     s32   pad_h;
     u32   pad_prev;
     s32   user_id;
-
     struct { u8 key; u8 pressed; } key_queue[KEY_QUEUE_SIZE];
     int   key_wp, key_rp;
-
     char  wad_path[128];
     s32   log_fd;
     u8    log_sa[16];
@@ -212,27 +173,20 @@ static void present(struct ps_ctx *c) {
     c->total_frames++;
 }
 
-/* ====================================================================
- * UI LOCKED TO V17 SPEC
- * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
-
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
     ps_draw_str_center(fb, 445, "By MexrlDev", 0xFF909090, 3);
-
     char buf[32]; int p = 0;
     const char *base = "LOADING";
     while (base[p]) { buf[p] = base[p]; p++; }
     for (int i = 0; i < dots; i++) buf[p++] = '.';
     buf[p] = 0;
     ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
-
     if (status) ps_draw_str_center(fb, 700, status, 0xFFA0A0A0, 3);
-
     present(c);
 }
 
@@ -240,11 +194,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
-
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
     ps_draw_str_center(fb, 445, "By MexrlDev", 0xFF909090, 3);
-
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
     char buf[40]; int p = 0;
     const char *pre = "RECEIVING WAD ";
@@ -254,13 +206,11 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     buf[p++] = '0' + (pct % 10);
     buf[p++] = '%'; buf[p] = 0;
     ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
-
     int bar_x = 200, bar_y = 680, bar_w = SCR_W - 400, bar_h = 40;
     int filled = (total > 0) ? (int)((u64)bar_w * got / total) : 0;
     if (filled > bar_w) filled = bar_w;
     ps_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, 0xFF303030);
     ps_fill_rect(fb, bar_x, bar_y, filled, bar_h, 0xFF00FF00);
-
     present(c);
 }
 
@@ -270,13 +220,10 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
         if (c->video_h < 0 || !c->fbs[c->active_fb]) continue;
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
-
         ps_draw_str_center(fb, 300, "DOOM-PS ERROR", 0xFFFF4040, 6);
         if (line1) ps_draw_str_center(fb, 500, line1, 0xFFFFFFFF, 4);
         if (line2) ps_draw_str_center(fb, 600, line2, 0xFFA0A0A0, 3);
-        ps_draw_str_center(fb, 900, "Reboot game to recover",
-                           0xFF808080, 3);
-
+        ps_draw_str_center(fb, 900, "Reboot game to recover", 0xFF808080, 3);
         present(c);
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
     }
@@ -285,31 +232,21 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
-
     for (;;) {
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
-
-        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR",
-                           0xFFFF4040, 6);
-        if (msg && msg[0])
-            ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
-        else
-            ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
-        ps_draw_str_center(fb, 900, "Reboot game to recover",
-                           0xFF808080, 3);
+        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR", 0xFFFF4040, 6);
+        if (msg && msg[0]) ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
+        else ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
+        ps_draw_str_center(fb, 900, "Reboot game to recover", 0xFF808080, 3);
         present(c);
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
     }
 }
 
-/* ====================================================================
- * blit_doom_frame
- * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
-
     for (int dy = 0; dy < DOOM_H; dy++) {
         const u32 *row = doom + dy * DOOMFB_W;
         for (int dx = 0; dx < DOOM_W; dx++) {
@@ -381,33 +318,25 @@ static void translate_pad(u32 raw) {
 
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
 
-    /* D-pad → movement */
     MAP(DS_UP,       DOOM_KEY_UP);
     MAP(DS_DOWN,     DOOM_KEY_DOWN);
     MAP(DS_LEFT,     DOOM_KEY_LEFT);
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
 
-    /* Face buttons */
-    MAP(DS_CROSS,    DOOM_KEY_FIRE);       /* fire */
-    MAP(DS_SQUARE,   DOOM_KEY_USE);        /* use/open doors */
-    MAP(DS_TRIANGLE, DOOM_KEY_TAB);        /* automap */
-    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);      /* confirm */
+    MAP(DS_CROSS,    DOOM_KEY_FIRE);
+    MAP(DS_SQUARE,   DOOM_KEY_USE);
+    MAP(DS_TRIANGLE, DOOM_KEY_TAB);
+    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
 
-    /* Menu */
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
 
-    /* Shoulders */
-    MAP(DS_R1,       DOOM_KEY_F2);         /* save menu */
-    MAP(DS_L1,       DOOM_KEY_F3);         /* load menu */
-    MAP(DS_R2,       DOOM_KEY_RBRACKET);   /* next weapon */
-    MAP(DS_L2,       DOOM_KEY_LBRACKET);   /* prev weapon */
+    MAP(DS_R1,       DOOM_KEY_F2);
+    MAP(DS_L1,       DOOM_KEY_F3);
+    MAP(DS_R2,       DOOM_KEY_RBRACKET);
+    MAP(DS_L2,       DOOM_KEY_LBRACKET);
 
-    /* Stick clicks — strafe */
-    MAP(DS_L3,       DOOM_KEY_COMMA);      /* strafe left */
-    MAP(DS_R3,       DOOM_KEY_PERIOD);     /* strafe right */
-
-    /* Touchpad: left unmapped until bit value is confirmed.
-     * Share: unmapped per user request. */
+    MAP(DS_L3,       DOOM_KEY_COMMA);
+    MAP(DS_R3,       DOOM_KEY_PERIOD);
 
 #undef MAP
 }
@@ -422,36 +351,24 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
-    while (g_audio_thread_running) {
-        I_SubmitSound();
-    }
+    while (g_audio_thread_running) I_SubmitSound();
     ps_sound_log("Audio: thread exiting\n");
     return 0;
 }
 
-/* ====================================================================
- * WAD receiver
- * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
     if (listen_fd < 0) { udp_log("DoomPS: listen_fd < 0\n"); return -1; }
     udp_log("DoomPS: waiting for WAD on TCP...\n");
-
     show_loading(c, 0, "Waiting for WAD upload...");
-    udp_log("DoomPS: WAD screen drawn\n");
-
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 0) = 0;
         *(u64 *)(tv + 8) = 500000;
-        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
-                             (u64)listen_fd, 0xFFFF, 0x1006,
-                             (u64)tv, 16, 0);
-        if (so_ret == 0) udp_log("DoomPS: SO_RCVTIMEO set\n");
-        else             udp_log("DoomPS: SO_RCVTIMEO FAILED\n");
+        (void)NC(c->G, c->setsockopt_fn,
+                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
     }
-
     s32 client = -1;
     for (int attempt = 0; attempt < 600; attempt++) {
         u8 peer[16]; s32 plen = 16;
@@ -460,41 +377,31 @@ static int recv_wad(s32 listen_fd) {
         if (client >= 0) { udp_log("DoomPS: accept returned OK\n"); break; }
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
-
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 0) = 30;
         *(u64 *)(tv + 8) = 0;
-        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
-                             (u64)client, 0xFFFF, 0x1006,
-                             (u64)tv, 16, 0);
-        if (so_ret == 0) udp_log("DoomPS: client timeout cleared (30s)\n");
-        else             udp_log("DoomPS: client timeout FAILED\n");
+        (void)NC(c->G, c->setsockopt_fn,
+                 (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
     }
-
     show_wad_progress(c, 0, 1);
     udp_log("DoomPS: receiving WAD...\n");
-
     u8 hdr[8]; s32 got = 0;
     while (got < 8) {
         s32 n = (s32)NC(c->G, c->recv_fn,
-                        (u64)client, (u64)(hdr + got),
-                        (u64)(8 - got), 0,0,0);
+                        (u64)client, (u64)(hdr + got), (u64)(8 - got), 0,0,0);
         if (n <= 0) {
             NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
-            udp_log("DoomPS: hdr read failed\n");
             return -1;
         }
         got += n;
     }
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
-
     const char *wad_out = "/av_contents/content_tmp/doom.wad";
     s32 fd = (s32)NC(c->G, c->kopen,
                      (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
     diag_kopen("DoomPS: [W1r] ", wad_out, fd);
-
     if (fd < 0) {
         wad_out = "/savedata0/doom.wad";
         fd = (s32)NC(c->G, c->kopen,
@@ -502,7 +409,6 @@ static int recv_wad(s32 listen_fd) {
         diag_kopen("DoomPS: [W2r] ", wad_out, fd);
     }
     if (fd < 0) {
-        udp_log("DoomPS: all WAD open attempts failed\n");
         NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
         return -1;
     }
@@ -511,18 +417,15 @@ static int recv_wad(s32 listen_fd) {
         while (wad_out[i] && i < 127) { c->wad_path[i] = wad_out[i]; i++; }
         c->wad_path[i] = 0;
     }
-
     u8 chunk[WAD_CHUNK];
     u64 remaining = wad_size;
     u64 total = wad_size;
     int last_pct = -1;
     int recv_retries = 0;
-
     while (remaining > 0) {
         u64 want = remaining < WAD_CHUNK ? remaining : WAD_CHUNK;
         s32 n = (s32)NC(c->G, c->recv_fn,
                         (u64)client, (u64)chunk, (u64)want, 0,0,0);
-
         if (n > 0) {
             NC(c->G, c->kwrite, (u64)fd, (u64)chunk, (u64)n, 0,0,0);
             remaining -= (u64)n;
@@ -533,27 +436,15 @@ static int recv_wad(s32 listen_fd) {
                 show_wad_progress(c, total - remaining, total);
                 last_pct = pct;
             }
-        } else if (n == 0) {
-            break;
-        } else {
+        } else if (n == 0) break;
+        else {
             recv_retries++;
-            if (recv_retries > 30) {
-                udp_log("DoomPS: recv retries exhausted\n");
-                break;
-            }
-            if (recv_retries == 1) {
-                udp_log("DoomPS: recv timeout, retrying...\n");
-            }
+            if (recv_retries > 30) break;
         }
     }
-
     NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
     NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
-
-    if (remaining > 0) {
-        udp_log("DoomPS: WAD truncated\n");
-        return -1;
-    }
+    if (remaining > 0) return -1;
     udp_log("DoomPS: WAD written OK\n");
     show_loading(c, 3, "WAD ready, launching Doom...");
     return 0;
@@ -573,7 +464,6 @@ void DG_DrawFrame(void) {
     static int draw_count = 0;
     draw_count++;
     struct ps_ctx *c = &g_ctx;
-
     if (draw_count == 1 || draw_count == 2 || draw_count == 3) {
         char b[64]; int p = 0;
         const char *m = "DoomPS: DG_DrawFrame #";
@@ -592,11 +482,9 @@ void DG_DrawFrame(void) {
         b[p++] = '\n'; b[p] = 0;
         udp_log(b);
     }
-
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
-
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
         s32 n = (s32)NC(c->G, c->pad_read,
@@ -709,6 +597,13 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->setsockopt_fn = SYM(G, D, LIBKERNEL_HANDLE, "setsockopt");
     udp_log("DoomPS: [10] sockets\n");
     ext->step = 10;
+
+    /* Make sure .savegame directory exists for Doom. */
+    mkdir("./.savegame", 0777);
+    mkdir("/av_contents/content_tmp/.savegame", 0777);
+    mkdir("/savedata0/.savegame", 0777);
+    udp_log("DoomPS: [10b] mkdir .savegame\n");
+    ext->step = 11;
 
     if (!c->usleep_fn || !c->load_mod) {
         ext->status = -1; udp_log("DoomPS: [11] symbol check failed\n");
@@ -902,8 +797,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
 
     g_audio_thread_running = 0;
-
-    udp_log("DoomPS: exit\n");
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
     if (c->vid_close && c->video_h >= 0)
