@@ -1,11 +1,11 @@
 /*
- * doom-ps/src/main.c — v17
+ * doom-ps/src/main.c — v18
  *
- * v17 fixes:
- *   - DG_ScreenBuffer explicitly zeroed in _start (BSS is not
- *     zero-initialized by the Luac0re loader)
- *   - "By MexrlDev" credit is now scale 3 (up from 2) and sits
- *     21 px below the line above (up from 3 px)
+ * v18 fixes:
+ *   - DG_Init unconditionally allocates DG_ScreenBuffer (never trusts
+ *     the check, because GCC -Os may erase the _start write)
+ *   - volatile-forced NULL write in _start so GCC can't optimize it away
+ *   - "By MexrlDev" is now scale 4 (was 3) and sits at y=470 (was 445)
  */
 
 #include "core.h"
@@ -143,7 +143,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ====================================================================
- * LOADING screen — credit line is now bigger + more spaced
+ * LOADING screen — credit is now scale 4 with a 46px gap above it
  * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -153,18 +153,18 @@ static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    /* Credit: 21 px gap, scale 3 (was 3 px gap, scale 2) */
-    ps_draw_str_center(fb, 445, "By MexrlDev",
-                       0xFF909090, 3);
+    /* Credit line: 46 px gap, scale 4 */
+    ps_draw_str_center(fb, 470, "By MexrlDev",
+                       0xFFA0A0A0, 4);
 
     char buf[32]; int p = 0;
     const char *base = "LOADING";
     while (base[p]) { buf[p] = base[p]; p++; }
     for (int i = 0; i < dots; i++) buf[p++] = '.';
     buf[p] = 0;
-    ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
 
-    if (status) ps_draw_str_center(fb, 700, status, 0xFFA0A0A0, 3);
+    if (status) ps_draw_str_center(fb, 720, status, 0xFFA0A0A0, 3);
 
     present(c);
 }
@@ -177,8 +177,8 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    ps_draw_str_center(fb, 445, "By MexrlDev",
-                       0xFF909090, 3);
+    ps_draw_str_center(fb, 470, "By MexrlDev",
+                       0xFFA0A0A0, 4);
 
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
     char buf[40]; int p = 0;
@@ -188,9 +188,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     if (pct >= 10)  buf[p++] = '0' + ((pct / 10) % 10);
     buf[p++] = '0' + (pct % 10);
     buf[p++] = '%'; buf[p] = 0;
-    ps_draw_str_center(fb, 540, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
 
-    int bar_x = 200, bar_y = 680, bar_w = SCR_W - 400, bar_h = 40;
+    int bar_x = 200, bar_y = 700, bar_w = SCR_W - 400, bar_h = 40;
     int filled = (total > 0) ? (int)((u64)bar_w * got / total) : 0;
     if (filled > bar_w) filled = bar_w;
     ps_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, 0xFF303030);
@@ -382,18 +382,19 @@ extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
+/* ====================================================================
+ * DG_Init — v18: UNCONDITIONAL allocation.
+ * Never trusts the previous value of DG_ScreenBuffer because the
+ * Luac0re loader doesn't run an ELF loader (no .bss zeroing) and GCC
+ * -Os may hoist our _start NULL write out of existence.
+ * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
+    DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
     if (!DG_ScreenBuffer) {
-        udp_log("DoomPS: DG_Init malloc 256KB\n");
-        DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
-        if (!DG_ScreenBuffer) {
-            udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
-        } else {
-            udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
-        }
+        udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
     } else {
-        udp_log("DoomPS: DG_ScreenBuffer already set\n");
+        udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
     }
 }
 
@@ -452,10 +453,6 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     }
 }
 
-/* ====================================================================
- * _start — v17 fix: DG_ScreenBuffer explicitly zeroed (BSS not
- * zeroed by Luac0re loader).
- * ==================================================================== */
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 1;
@@ -469,11 +466,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
-    /* Explicitly zero doomgeneric's DG_ScreenBuffer.  The Luac0re
-     * loader only memcpy()s the file bytes and never zeroes .bss, so
-     * this global pointer can contain stale garbage from a previous
-     * run.  Unconditional zero before doomgeneric_Create touches it. */
-    DG_ScreenBuffer = (u32 *)0;
+    /* volatile-forced NULL write — GCC cannot optimize this away */
+    *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     ext->step = 2;
 
@@ -713,6 +707,9 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     udp_log("DoomPS: [36] WAD phase complete\n");
     ext->step = 36;
+
+    /* Re-zero one more time right before the call — belt and suspenders */
+    *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
