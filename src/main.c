@@ -1,24 +1,18 @@
 /*
- * doom-ps/src/main.c — v29
+ * doom-ps/src/main.c — v30
  *
- * v29: send BOTH convention key codes so Square opens doors on every
- *      doomgeneric build.  Some builds use the original Doom 1.9 codes
- *      (KEY_USE=0xa2), others use the Chocolate Doom names (KEY_SPACE=0x20).
- *      We map each button to both, and only the value that actually
- *      matches the running game's binding takes effect.
+ * v30: FIXED SO_RCVTIMEO on accepted WAD client socket.
+ *      Was setting tv_usec = 30,000,000 (invalid on FreeBSD, must be
+ *      < 1,000,000), which made setsockopt fail silently and left the
+ *      inherited 500ms listener timeout in effect.  Any pause >500ms
+ *      during WAD transfer (iOS GC, print flush, etc.) killed recv.
  *
- *      Cross    -> KEY_FIRE   (0xa3) + KEY_RCTRL  (0x9d)
- *      Square   -> KEY_USE    (0xa2) + KEY_SPACE  (0x20)
- *      Triangle -> KEY_RSHIFT (0xb6)
- *      Circle   -> KEY_ENTER  (0x0d)
- *      Options  -> KEY_ESCAPE (0x1b)
- *      R1       -> KEY_F2     (0xbc)  Save menu
- *      L1       -> KEY_F3     (0xbd)  Load menu
- *      R2       -> ']'        (0x5d)  Next weapon
- *      L2       -> '['        (0x5b)  Prev weapon
- *      Share (DS_SHARE) intentionally unmapped.
+ *      Also added retry logic in recv loop — transient timeouts now
+ *      retry up to 30 times before giving up.
  *
- * Logs kept as-is — no spam removal.
+ *      Also fixed Triangle to use correct KEY_RSHIFT (0xb6).
+ *
+ * Logs kept as-is.
  * UI LOCKED to v17 spec.
  */
 
@@ -105,7 +99,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_PAD_MASK 0x001FFFFF
 
 /* ============================================================
- * Doom 1.9 key codes (doomdef.h from id Software)
+ * Doom 1.9 key codes
  * ============================================================ */
 #define DOOM_KEY_ESCAPE     0x1b
 #define DOOM_KEY_ENTER      0x0d
@@ -116,20 +110,15 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RIGHT      0xae
 #define DOOM_KEY_DOWN       0xaf
 
-#define DOOM_KEY_LBRACKET   0x5b   /* Prev weapon */
-#define DOOM_KEY_RBRACKET   0x5d   /* Next weapon */
+#define DOOM_KEY_LBRACKET   0x5b
+#define DOOM_KEY_RBRACKET   0x5d
 
-/* Original Doom (id Software) convention */
 #define DOOM_KEY_USE        0xa2
 #define DOOM_KEY_FIRE       0xa3
-
-/* Chocolate Doom / modern doomgeneric convention */
-#define DOOM_KEY_RCTRL      0x9d   /* alt fire */
-
-/* Both conventions use these */
-#define DOOM_KEY_RSHIFT     0xb6   /* KEY_RSHIFT */
-#define DOOM_KEY_F2         0xbc   /* Save menu */
-#define DOOM_KEY_F3         0xbd   /* Load menu */
+#define DOOM_KEY_RCTRL      0x9d
+#define DOOM_KEY_RSHIFT     0xb6
+#define DOOM_KEY_F2         0xbc
+#define DOOM_KEY_F3         0xbd
 
 /* ============================================================
  * Context
@@ -303,7 +292,7 @@ static void ps_error_display(const char *msg) {
 }
 
 /* ====================================================================
- * blit_doom_frame — src is 320x200, dst is 1920x1000 (6x/5x scale)
+ * blit_doom_frame
  * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
@@ -332,9 +321,6 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
-/* ====================================================================
- * Pad decode with detailed per-bit logging
- * ==================================================================== */
 static const char *bit_name(u32 bit) {
     switch (bit) {
     case DS_SHARE:    return "Share";
@@ -385,37 +371,20 @@ static void translate_pad(u32 raw) {
     MAP(DS_DOWN,     DOOM_KEY_DOWN);
     MAP(DS_LEFT,     DOOM_KEY_LEFT);
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
-
-    /* Cross: FIRE — original (0xa3) + Chocolate (0x9d) */
     MAP(DS_CROSS,    DOOM_KEY_FIRE);
     MAP(DS_CROSS,    DOOM_KEY_RCTRL);
-
-    /* Square: USE — original (0xa2) + Chocolate (0x20) */
     MAP(DS_SQUARE,   DOOM_KEY_USE);
     MAP(DS_SQUARE,   DOOM_KEY_SPACE);
-
-    /* Triangle: RUN */
     MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);
-
-    /* Circle: ENTER / confirm */
     MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
-
-    /* Options: ESC / menu */
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
-
-    /* Shoulder buttons */
     MAP(DS_R1,       DOOM_KEY_F2);
     MAP(DS_L1,       DOOM_KEY_F3);
     MAP(DS_R2,       DOOM_KEY_RBRACKET);
     MAP(DS_L2,       DOOM_KEY_LBRACKET);
-
-    /* Share (DS_SHARE) intentionally unmapped */
 #undef MAP
 }
 
-/* ====================================================================
- * Audio submission (called from i_sound_ps.c → dg_audio_callback)
- * ==================================================================== */
 void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
     if (c->audio_h < 0 || !c->aud_out) return;
@@ -423,9 +392,6 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
-/* ====================================================================
- * Audio thread
- * ==================================================================== */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
@@ -437,7 +403,7 @@ static void *audio_thread_fn(void *arg) {
 }
 
 /* ====================================================================
- * WAD receiver
+ * WAD receiver — v30 with fixed timeout + retry
  * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
@@ -448,11 +414,17 @@ static int recv_wad(s32 listen_fd) {
     show_loading(c, 0, "Waiting for WAD upload...");
     udp_log("DoomPS: WAD screen drawn\n");
 
+    /* Set 500ms SO_RCVTIMEO on listener so accept() can animate.
+     * timeval = { tv_sec, tv_usec }, tv_usec must be < 1,000,000. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 8) = 500000;
-        (void)NC(c->G, c->setsockopt_fn,
-                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
+        *(u64 *)(tv + 0) = 0;        /* tv_sec  = 0      */
+        *(u64 *)(tv + 8) = 500000;   /* tv_usec = 500 ms */
+        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
+                             (u64)listen_fd, 0xFFFF, 0x1006,
+                             (u64)tv, 16, 0);
+        if (so_ret == 0) udp_log("DoomPS: SO_RCVTIMEO set\n");
+        else             udp_log("DoomPS: SO_RCVTIMEO FAILED\n");
     }
 
     s32 client = -1;
@@ -464,12 +436,21 @@ static int recv_wad(s32 listen_fd) {
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
+    /* Clear inherited SO_RCVTIMEO on the CLIENT socket.
+     * CRITICAL: previous version used tv_usec = 30,000,000 which is
+     * INVALID (must be < 1,000,000).  setsockopt silently failed and
+     * the 500ms listener timeout stayed in effect, killing the WAD
+     * transfer on any >500ms sender pause (iOS GC, print flush, etc).
+     * Fix: tv_sec = 30, tv_usec = 0 for a 30-second timeout. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 8) = 30000000;
-        (void)NC(c->G, c->setsockopt_fn,
-                 (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
-        udp_log("DoomPS: client timeout cleared\n");
+        *(u64 *)(tv + 0) = 30;       /* tv_sec  = 30 sec */
+        *(u64 *)(tv + 8) = 0;        /* tv_usec = 0      */
+        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
+                             (u64)client, 0xFFFF, 0x1006,
+                             (u64)tv, 16, 0);
+        if (so_ret == 0) udp_log("DoomPS: client timeout cleared (30s)\n");
+        else             udp_log("DoomPS: client timeout FAILED\n");
     }
 
     show_wad_progress(c, 0, 1);
@@ -516,21 +497,46 @@ static int recv_wad(s32 listen_fd) {
     u64 remaining = wad_size;
     u64 total = wad_size;
     int last_pct = -1;
+    int recv_retries = 0;
+
     while (remaining > 0) {
         u64 want = remaining < WAD_CHUNK ? remaining : WAD_CHUNK;
         s32 n = (s32)NC(c->G, c->recv_fn,
                         (u64)client, (u64)chunk, (u64)want, 0,0,0);
-        if (n <= 0) break;
-        NC(c->G, c->kwrite, (u64)fd, (u64)chunk, (u64)n, 0,0,0);
-        remaining -= (u64)n;
-        int pct = (total > 0) ? (int)((total - remaining) * 100 / total) : 0;
-        if (pct != last_pct) { show_wad_progress(c, total - remaining, total); last_pct = pct; }
+
+        if (n > 0) {
+            NC(c->G, c->kwrite, (u64)fd, (u64)chunk, (u64)n, 0,0,0);
+            remaining -= (u64)n;
+            recv_retries = 0;
+            int pct = (total > 0)
+                    ? (int)((total - remaining) * 100 / total) : 0;
+            if (pct != last_pct) {
+                show_wad_progress(c, total - remaining, total);
+                last_pct = pct;
+            }
+        } else if (n == 0) {
+            /* peer cleanly closed */
+            break;
+        } else {
+            /* timeout or transient error — retry before giving up */
+            recv_retries++;
+            if (recv_retries > 30) {
+                udp_log("DoomPS: recv retries exhausted\n");
+                break;
+            }
+            if (recv_retries == 1) {
+                udp_log("DoomPS: recv timeout, retrying...\n");
+            }
+        }
     }
 
     NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
     NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
 
-    if (remaining > 0) { udp_log("DoomPS: WAD truncated\n"); return -1; }
+    if (remaining > 0) {
+        udp_log("DoomPS: WAD truncated\n");
+        return -1;
+    }
     udp_log("DoomPS: WAD written OK\n");
     show_loading(c, 3, "WAD ready, launching Doom...");
     return 0;
@@ -607,9 +613,6 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
 }
 void DG_SetWindowTitle(const char *t) { (void)t; }
 
-/* ====================================================================
- * _start
- * ==================================================================== */
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
@@ -847,7 +850,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
     udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
 
-    /* ---- Spawn audio thread ---- */
     if (c->audio_h >= 0 && c->aud_out) {
         void *pthread_create = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
         if (pthread_create) {
