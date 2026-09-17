@@ -19,38 +19,31 @@ SECTIONS
         *(.rodata.*)
         *(.data)
         *(.data.*)
-    } :text
 
-    /* ------------------------------------------------------------------
-     * .bss marked (NOLOAD) so it occupies memory at runtime but does NOT
-     * bloat the on-disk file.  Luac0re's loader memcpy's the file bytes
-     * into mmap'd memory, then our _start prologue zeroes __bss_start ..
-     * __bss_end (see main.c).  Without (NOLOAD) the linker writes ~600 KB
-     * of zeros to the file, blowing past the 1 MB mmap and causing the
-     * "Broken pipe" + stuck LOADING screen.
-     * ------------------------------------------------------------------ */
-    .bss (NOLOAD) : {
+        /* ------------------------------------------------------------
+         * BSS is intentionally kept INSIDE .text (not NOLOAD).
+         *
+         * Why: the console-side Lua launcher on this firmware has a
+         * hard minimum on received shellcode size (~623 KB).  With
+         * BSS excluded from the file, our shellcode is only 354 KB
+         * and gets rejected with:
+         *
+         *    "short receive: got 354400 bytes, expected ~623 KB"
+         *
+         * Keeping BSS inside .text gives a ~628 KB file that the
+         * launcher accepts.  The BSS bytes are zeros in the file, so
+         * globals are already zero-initialised before _start runs —
+         * the explicit zeroing in main.c's _start becomes a harmless
+         * no-op.
+         *
+         * Symbols __bss_start / __bss_end are still defined so
+         * main.c's extern references resolve.
+         * ------------------------------------------------------------ */
         __bss_start = .;
         *(.bss)
         *(.bss.*)
         *(COMMON)
         __bss_end = .;
-    } :text
-
-    /* ------------------------------------------------------------------
-     * Pad the output file to exactly 640 KB (0xA0000).
-     *
-     * Why: the Lua launcher on the console rejects anything smaller than
-     * ~623 KB ("short receive: got N bytes, expected ~623 KB").  640 KB
-     * is safely above that and well under the 1 MB mmap.
-     *
-     * If the launcher's required size ever changes, edit the 0xA0000
-     * below.  This is a pure file-size knob; it has zero effect on the
-     * running code.
-     * ------------------------------------------------------------------ */
-    .pad : {
-        FILL(0);
-        . = 0xA0000;
     } :text
 
     /DISCARD/ : {
