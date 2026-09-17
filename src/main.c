@@ -1,6 +1,17 @@
 /*
- * doom-ps/src/main.c — v19
- *   - credit line even bigger (scale 5) with more vertical gap
+ * doom-ps/src/main.c — FINAL
+ *
+ * UI layout locked to spec:
+ *   DOOM-PS               y=280  scale=8  0xFFFFAA00
+ *   doomgeneric on Luac0re y=400 scale=3  0xFF808080
+ *   By MexrlDev           y=470  scale=4  0xFFA0A0A0
+ *   LOADING               y=570  scale=5  0xFFFFFFFF
+ *   status                y=720  scale=3  0xFFA0A0A0
+ *   progress bar          x=200 y=700 w=(SCR_W-400) h=40
+ *   DOOM-PS ERROR         y=300  scale=6  0xFFFF4040
+ *   error line 1          y=500  scale=4  0xFFFFFFFF
+ *   error line 2          y=600  scale=3  0xFFA0A0A0
+ *   Reboot game to recover y=900 scale=3  0xFF808080
  */
 
 #include "core.h"
@@ -138,28 +149,25 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ====================================================================
- * LOADING screen — credit line is now scale 5 (bigger yet), y=490
+ * LOADING — exact spec
  * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
-    ps_draw_str_center(fb, 260, "DOOM-PS", 0xFFFFAA00, 8);
-    ps_draw_str_center(fb, 380, "doomgeneric on Luac0re",
-                       0xFF808080, 3);
-    /* 66 px gap, scale 5 */
-    ps_draw_str_center(fb, 490, "By MexrlDev",
-                       0xFFB0B0B0, 5);
+    ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
+    ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
+    ps_draw_str_center(fb, 470, "By MexrlDev", 0xFFA0A0A0, 4);
 
     char buf[32]; int p = 0;
     const char *base = "LOADING";
     while (base[p]) { buf[p] = base[p]; p++; }
     for (int i = 0; i < dots; i++) buf[p++] = '.';
     buf[p] = 0;
-    ps_draw_str_center(fb, 620, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
 
-    if (status) ps_draw_str_center(fb, 760, status, 0xFFA0A0A0, 3);
+    if (status) ps_draw_str_center(fb, 720, status, 0xFFA0A0A0, 3);
 
     present(c);
 }
@@ -169,11 +177,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
-    ps_draw_str_center(fb, 260, "DOOM-PS", 0xFFFFAA00, 8);
-    ps_draw_str_center(fb, 380, "doomgeneric on Luac0re",
-                       0xFF808080, 3);
-    ps_draw_str_center(fb, 490, "By MexrlDev",
-                       0xFFB0B0B0, 5);
+    ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
+    ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
+    ps_draw_str_center(fb, 470, "By MexrlDev", 0xFFA0A0A0, 4);
 
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
     char buf[40]; int p = 0;
@@ -183,9 +189,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     if (pct >= 10)  buf[p++] = '0' + ((pct / 10) % 10);
     buf[p++] = '0' + (pct % 10);
     buf[p++] = '%'; buf[p] = 0;
-    ps_draw_str_center(fb, 620, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
 
-    int bar_x = 200, bar_y = 730, bar_w = SCR_W - 400, bar_h = 40;
+    int bar_x = 200, bar_y = 700, bar_w = SCR_W - 400, bar_h = 40;
     int filled = (total > 0) ? (int)((u64)bar_w * got / total) : 0;
     if (filled > bar_w) filled = bar_w;
     ps_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, 0xFF303030);
@@ -411,13 +417,7 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
     c->key_rp = (c->key_rp + 1) & (KEY_QUEUE_SIZE - 1);
     return 1;
 }
-void DG_SetWindowTitle(const char *t) {
-    if (t) {
-        udp_log("DoomPS: DG_SetWindowTitle(\"");
-        udp_log(t);
-        udp_log("\")\n");
-    }
-}
+void DG_SetWindowTitle(const char *t) { (void)t; }
 
 void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
