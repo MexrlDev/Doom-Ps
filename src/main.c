@@ -1,9 +1,11 @@
 /*
- * doom-ps/src/main.c — v18
+ * doom-ps/src/main.c — v19
  *
- * v18 fix: recv_wad no longer redraws show_loading() on every accept
- * timeout (which hung inside sceKernelWaitEqueue).  The waiting screen
- * is drawn ONCE before the loop.  Diagnostic UDP logs added.
+ * v19 fix: apply ELF .rela.dyn relocations at startup.
+ *   The linker resolves `&symbol` in static initializers to offsets
+ *   from 0 (e.g. 0x50000).  Luac0re's loader doesn't relocate, so
+ *   `defaults[i].location` was pointing to a low unmapped address,
+ *   crashing Doom inside M_LoadDefaults.
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -15,6 +17,39 @@
 extern char __bss_start[];
 extern char __bss_end[];
 
+/* ============================================================
+ * ELF64 relocation types
+ * ============================================================ */
+typedef struct {
+    u64 r_offset;
+    u64 r_info;
+    s64 r_addend;
+} Elf64_Rela;
+
+#define ELF64_R_TYPE(i) ((u32)((i) & 0xffffffffU))
+#define R_X86_64_RELATIVE 8
+
+static int do_relocations(u64 load_base) {
+    u64 rela_start_addr, rela_end_addr;
+    __asm__ volatile("lea __rela_start(%%rip), %0" : "=r"(rela_start_addr));
+    __asm__ volatile("lea __rela_end(%%rip), %0"   : "=r"(rela_end_addr));
+
+    int count = 0;
+    Elf64_Rela *r = (Elf64_Rela *)rela_start_addr;
+    Elf64_Rela *end = (Elf64_Rela *)rela_end_addr;
+    while (r < end) {
+        if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
+            *(u64 *)(load_base + r->r_offset) = load_base + r->r_addend;
+            count++;
+        }
+        r++;
+    }
+    return count;
+}
+
+/* ============================================================
+ * Utility
+ * ============================================================ */
 static void ps_memset(void *dst, u8 val, u64 len) {
     u8 *d = (u8 *)dst;
     while (len--) *d++ = val;
@@ -275,25 +310,15 @@ static void audio_drain(void) {
     }
 }
 
-/* ====================================================================
- * v18 recv_wad — draw once, log retries, no redraw loop
- * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
-    if (listen_fd < 0) {
-        udp_log("DoomPS: listen_fd < 0\n");
-        return -1;
-    }
+    if (listen_fd < 0) { udp_log("DoomPS: listen_fd < 0\n"); return -1; }
     udp_log("DoomPS: waiting for WAD on TCP...\n");
 
-    /* Draw the waiting screen exactly ONCE.  Redrawing inside the
-     * accept loop hangs on sceKernelWaitEqueue (flip event queue
-     * gets out of sync when flips happen faster than events drain). */
     show_loading(c, 0, "Waiting for WAD upload...");
     udp_log("DoomPS: WAD screen drawn\n");
 
-    /* 500 ms SO_RCVTIMEO on accept */
     if (c->setsockopt_fn) {
         udp_log("DoomPS: setting SO_RCVTIMEO\n");
         u8 tv[16] = {0};
@@ -310,18 +335,11 @@ static int recv_wad(s32 listen_fd) {
         u8 peer[16]; s32 plen = 16;
         client = (s32)NC(c->G, c->accept_fn,
                          (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
-        if (client >= 0) {
-            udp_log("DoomPS: accept returned OK\n");
-            break;
-        }
-        if ((attempt % 20) == 19) {
-            udp_log("DoomPS: accept retry (10s)\n");
-        }
+        if (client >= 0) { udp_log("DoomPS: accept returned OK\n"); break; }
+        if ((attempt % 20) == 19) udp_log("DoomPS: accept retry (10s)\n");
     }
-
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* Show progress screen once before the recv loop */
     show_wad_progress(c, 0, 1);
     udp_log("DoomPS: receiving WAD...\n");
 
@@ -465,7 +483,15 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
-    /* Zero BSS — Luac0re's loader does not run an ELF loader */
+    /* ============================================================
+     * 1) Apply ELF relocations.  _start is at offset 0 of the file,
+     *    so its runtime address == load base.
+     * ============================================================ */
+    u64 load_base = (u64)&_start;
+    int n_reloc = do_relocations(load_base);
+
+    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file,
+     *    but kept for safety). */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
@@ -489,6 +515,19 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     udp_log("DoomPS: [3] sendto resolved\n");
     ext->step = 3;
+
+    /* Log relocation count now that UDP is up. */
+    {
+        int p = 0; const char *m = "DoomPS: reloc count=";
+        while (*m) g_diag[p++] = *m++;
+        int v = n_reloc;
+        char tmp[16]; int t = 0;
+        if (v == 0) tmp[t++] = '0';
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) g_diag[p++] = tmp[--t];
+        g_diag[p++] = '\n'; g_diag[p] = 0;
+        udp_log(g_diag);
+    }
 
     extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
     ps_libc_init(G, D, c->log_fd, c->log_sa);
@@ -532,13 +571,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 10;
 
     if (!c->usleep_fn || !c->load_mod) {
-        ext->status = -1;
-        udp_log("DoomPS: [11] symbol check failed\n");
-        ext->step = 11;
-        return;
+        ext->status = -1; udp_log("DoomPS: [11] symbol check failed\n");
+        ext->step = 11; return;
     }
-    udp_log("DoomPS: [12] symbols OK\n");
-    ext->step = 12;
+    udp_log("DoomPS: [12] symbols OK\n"); ext->step = 12;
 
     s32 vid_mod = (s32)NC(c->G, c->load_mod,
                           (u64)"libSceVideoOut.sprx",0,0,0,0,0);
