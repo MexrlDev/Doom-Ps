@@ -1,11 +1,12 @@
 /*
  * doom-ps/src/main.c — v19
  *
- * v19 fix: apply ELF .rela.dyn relocations at startup.
- *   The linker resolves `&symbol` in static initializers to offsets
- *   from 0 (e.g. 0x50000).  Luac0re's loader doesn't relocate, so
- *   `defaults[i].location` was pointing to a low unmapped address,
- *   crashing Doom inside M_LoadDefaults.
+ * v19 fixes:
+ *   - Apply ELF .rela.dyn relocations at startup (Luac0re's loader
+ *     doesn't relocate, so absolute pointers in .data were pointing
+ *     to low unmapped addresses and Doom crashed inside M_LoadDefaults).
+ *   - Declare malloc/free explicitly (we're -ffreestanding, no stdlib.h,
+ *     so GCC treats malloc as implicit int → pointer truncation).
  *
  * UI LOCKED to v17 spec — do not change.
  */
@@ -17,8 +18,14 @@
 extern char __bss_start[];
 extern char __bss_end[];
 
+/* ps_libc.c provides these; declare them so GCC knows the return type.
+ * Without stdlib.h, malloc defaults to int, which truncates the pointer
+ * on x86-64 and produces the "int-to-pointer-cast" warning. */
+extern void *malloc(unsigned long size);
+extern void  free(void *p);
+
 /* ============================================================
- * ELF64 relocation types
+ * ELF64 relocation record + type constants
  * ============================================================ */
 typedef struct {
     u64 r_offset;
