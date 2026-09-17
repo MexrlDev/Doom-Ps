@@ -1,12 +1,15 @@
 /*
- * doom-ps/src/main.c — v31
+ * doom-ps/src/main.c — v32
  *
- * v31:
- *   - Full controller mapping:
+ * v32:
+ *   - Triangle → automap (TAB) instead of run (RSHIFT).
+ *   - Touchpad click left UNMAPPED until we confirm the correct bit.
+ *   - Share unmapped per user request.
+ *   - Full mapping:
  *       D-Pad           → movement
  *       Cross           → fire
  *       Square          → use
- *       Triangle        → run (RSHIFT)
+ *       Triangle        → automap (TAB)
  *       Circle          → confirm
  *       Options         → menu (ESC)
  *       R1              → save (F2)
@@ -15,11 +18,8 @@
  *       L2              → previous weapon
  *       L3              → strafe left  (',')
  *       R3              → strafe right ('.')
- *       Touchpad        → automap (TAB)
+ *       Touchpad        → UNMAPPED (awaiting bit confirmation)
  *       Share           → UNMAPPED (user request)
- *   - DS_TOUCHPAD = 0x00010000 (bit 16).  If touchpad doesn't fire on
- *     your pad, cycle through 0x00100000, 0x00080000, 0x00040000.
- *   - In-game "M:vol=..." / music diagnostics come from i_sound_ps.c.
  *
  * Logs kept as-is.  UI LOCKED to v17 spec.
  */
@@ -104,7 +104,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_CIRCLE    0x00002000
 #define DS_CROSS     0x00004000
 #define DS_SQUARE    0x00008000
-#define DS_TOUCHPAD  0x00010000    /* click-in of touchpad */
+#define DS_TOUCHPAD  0x00010000    /* click-in of touchpad (unconfirmed) */
 #define DS_PAD_MASK  0x001FFFFF
 
 /* ============================================================
@@ -388,28 +388,26 @@ static void translate_pad(u32 raw) {
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
 
     /* Face buttons */
-    MAP(DS_CROSS,    DOOM_KEY_FIRE);      /* fire */
-    MAP(DS_SQUARE,   DOOM_KEY_USE);       /* use  */
-    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);    /* run  */
-    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);     /* confirm */
+    MAP(DS_CROSS,    DOOM_KEY_FIRE);       /* fire */
+    MAP(DS_SQUARE,   DOOM_KEY_USE);        /* use/open doors */
+    MAP(DS_TRIANGLE, DOOM_KEY_TAB);        /* automap */
+    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);      /* confirm */
 
     /* Menu */
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
 
     /* Shoulders */
-    MAP(DS_R1,       DOOM_KEY_F2);        /* save */
-    MAP(DS_L1,       DOOM_KEY_F3);        /* load */
-    MAP(DS_R2,       DOOM_KEY_RBRACKET);  /* next weapon */
-    MAP(DS_L2,       DOOM_KEY_LBRACKET);  /* prev weapon */
+    MAP(DS_R1,       DOOM_KEY_F2);         /* save menu */
+    MAP(DS_L1,       DOOM_KEY_F3);         /* load menu */
+    MAP(DS_R2,       DOOM_KEY_RBRACKET);   /* next weapon */
+    MAP(DS_L2,       DOOM_KEY_LBRACKET);   /* prev weapon */
 
     /* Stick clicks — strafe */
-    MAP(DS_L3,       DOOM_KEY_COMMA);
-    MAP(DS_R3,       DOOM_KEY_PERIOD);
+    MAP(DS_L3,       DOOM_KEY_COMMA);      /* strafe left */
+    MAP(DS_R3,       DOOM_KEY_PERIOD);     /* strafe right */
 
-    /* Touchpad click → automap */
-    MAP(DS_TOUCHPAD, DOOM_KEY_TAB);
-
-    /* Share is intentionally UNMAPPED per user request */
+    /* Touchpad: left unmapped until bit value is confirmed.
+     * Share: unmapped per user request. */
 
 #undef MAP
 }
@@ -432,7 +430,7 @@ static void *audio_thread_fn(void *arg) {
 }
 
 /* ====================================================================
- * WAD receiver — v30 with fixed timeout + retry
+ * WAD receiver
  * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
