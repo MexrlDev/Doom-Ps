@@ -1,11 +1,28 @@
 # ============================================================
 # doom-ps/Makefile
 #
-# v19: -pie for relocations; $(shell ls|grep) for source discovery
-# (proven on this CI); objcopy dumps whole segment (not just .text).
+# v19: auto-detects the directory containing doomgeneric.c
+# (repo layout is `doomgeneric/doomgeneric/*.c` on current clones,
+#  but auto-detect handles either layout).
+# -pie for relocations; objcopy dumps whole segment (not just .text).
 # ============================================================
 
-DOOM_DIR := doomgeneric
+DOOM_ROOT := doomgeneric
+
+# ------------------------------------------------------------------
+# Auto-detect the directory that actually contains doomgeneric.c.
+# Checks (in order):
+#   1. doomgeneric/doomgeneric.c             (flat layout)
+#   2. doomgeneric/doomgeneric/doomgeneric.c (nested layout — usual)
+#   3. .                                     (sources in repo root)
+#   4. fallback to "doomgeneric" for a clear error message
+# ------------------------------------------------------------------
+DOOM_DIR := $(shell \
+    for d in "$(DOOM_ROOT)" "$(DOOM_ROOT)/$(DOOM_ROOT)" "." ; do \
+        if [ -f "$$d/doomgeneric.c" ]; then echo "$$d"; exit 0; fi; \
+    done; \
+    echo "$(DOOM_ROOT)" \
+)
 
 CC      := gcc
 OBJCOPY := objcopy
@@ -50,11 +67,7 @@ OUR_SRCS := \
     src/ps_libc.c
 
 # ------------------------------------------------------------------
-# Doomgeneric sources — shell glob (proven to work on this CI).
-# Excludes: doomgeneric_* (platform backends), i_allegro/sdl/soso/xlib/oal,
-#           i_main (has its own main), i_psp, i_videohr.
-# Keeps: doomgeneric.c, d_main.c, i_sound.c, i_video.c, i_input.c,
-#        i_timer.c, and everything else.
+# Doomgeneric sources
 # ------------------------------------------------------------------
 DOOM_SRCS := $(shell \
     ls $(DOOM_DIR)/*.c 2>/dev/null | \
@@ -72,28 +85,42 @@ OBJS := $(SRCS:.c=.o)
 all: doom_ps.bin doom_ps.elf
 
 # ------------------------------------------------------------------
-# Early sanity check — abort with a clear message if we can't find
-# doomgeneric sources.
+# Sanity check
 # ------------------------------------------------------------------
 check-doom:
-	@if [ ! -d "$(DOOM_DIR)" ]; then \
+	@if [ ! -d "$(DOOM_ROOT)" ]; then \
 	    echo ""; \
-	    echo "[!] $(DOOM_DIR)/ not found."; \
+	    echo "[!] $(DOOM_ROOT)/ not found."; \
 	    echo "    Run:  bash build.sh"; \
-	    echo "    or:   git clone --depth=1 https://github.com/ozkl/doomgeneric $(DOOM_DIR)"; \
+	    echo "    or:   git clone --depth=1 https://github.com/ozkl/doomgeneric $(DOOM_ROOT)"; \
+	    echo ""; \
+	    exit 1; \
+	fi
+	@if [ ! -f "$(DOOM_DIR)/doomgeneric.c" ]; then \
+	    echo ""; \
+	    echo "[!] doomgeneric.c not found.  DOOM_DIR=$(DOOM_DIR)"; \
+	    echo ""; \
+	    echo "    Looked in:"; \
+	    echo "      $(DOOM_ROOT)/doomgeneric.c"; \
+	    echo "      $(DOOM_ROOT)/$(DOOM_ROOT)/doomgeneric.c"; \
+	    echo "      ./doomgeneric.c"; \
+	    echo ""; \
+	    echo "    Top-level directory listing:"; \
+	    ls -la "$(DOOM_ROOT)/" 2>&1 | head -30; \
 	    echo ""; \
 	    exit 1; \
 	fi
 	@if [ -z "$(DOOM_SRCS)" ]; then \
 	    echo ""; \
-	    echo "[!] No doomgeneric .c files found in $(DOOM_DIR)/"; \
-	    echo "    Directory contents:"; \
-	    ls -la $(DOOM_DIR)/ 2>&1 | head -30; \
+	    echo "[!] No .c files found in $(DOOM_DIR)/"; \
+	    ls -la "$(DOOM_DIR)/" 2>&1 | head -30; \
 	    echo ""; \
 	    exit 1; \
 	fi
-	@echo "[OK] Found $(words $(DOOM_SRCS)) doomgeneric sources"
-	@echo "[OK] Found $(words $(OUR_SRCS)) our sources"
+	@echo "[OK] DOOM_DIR       = $(DOOM_DIR)"
+	@echo "[OK] doomgeneric.c  = $(DOOM_DIR)/doomgeneric.c"
+	@echo "[OK] Doom C sources = $(words $(DOOM_SRCS))"
+	@echo "[OK] Our C sources  = $(words $(OUR_SRCS))"
 
 # ------------------------------------------------------------------
 # Compile
@@ -114,8 +141,7 @@ doom_ps.elf: check-doom $(OBJS) linker.ld
 	@readelf -l doom_ps.elf | grep -E 'LOAD|Flags'
 
 # ------------------------------------------------------------------
-# Binary — dump the whole segment (not just .text) so .rela_out
-# (relocation table) is included.
+# Binary — dump the entire segment so .rela_out is included.
 # ------------------------------------------------------------------
 doom_ps.bin: doom_ps.elf
 	$(OBJCOPY) -O binary doom_ps.elf doom_ps.bin
@@ -145,7 +171,7 @@ size: doom_ps.bin
 	@size doom_ps.elf
 
 relocs: doom_ps.elf
-	@echo "--- .rela.dyn / .rela_out entries (first 40) ---"
+	@echo "--- relocations (first 40) ---"
 	@readelf -r doom_ps.elf 2>/dev/null | head -40 || echo "(none)"
 	@echo ""
 	@echo "--- total R_X86_64 relocations ---"
@@ -155,6 +181,7 @@ sections: doom_ps.elf
 	@readelf -S doom_ps.elf
 
 debug-src:
+	@echo "DOOM_ROOT = $(DOOM_ROOT)"
 	@echo "DOOM_DIR  = $(DOOM_DIR)"
 	@echo ""
 	@echo "OUR_SRCS  ="
