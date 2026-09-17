@@ -1,7 +1,11 @@
 /*
- * doom-ps/src/main.c — FINAL
+ * doom-ps/src/main.c — v18
  *
- * UI locked to v17 spec. BSS zeroed at start of _start.
+ * v18 fix: recv_wad no longer redraws show_loading() on every accept
+ * timeout (which hung inside sceKernelWaitEqueue).  The waiting screen
+ * is drawn ONCE before the loop.  Diagnostic UDP logs added.
+ *
+ * UI LOCKED to v17 spec — do not change.
  */
 
 #include "core.h"
@@ -142,7 +146,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ====================================================================
- * LOADING — locked to v17 spec
+ * UI LOCKED TO V17 SPEC
  * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -271,6 +275,9 @@ static void audio_drain(void) {
     }
 }
 
+/* ====================================================================
+ * v18 recv_wad — draw once, log retries, no redraw loop
+ * ==================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -280,25 +287,42 @@ static int recv_wad(s32 listen_fd) {
     }
     udp_log("DoomPS: waiting for WAD on TCP...\n");
 
+    /* Draw the waiting screen exactly ONCE.  Redrawing inside the
+     * accept loop hangs on sceKernelWaitEqueue (flip event queue
+     * gets out of sync when flips happen faster than events drain). */
+    show_loading(c, 0, "Waiting for WAD upload...");
+    udp_log("DoomPS: WAD screen drawn\n");
+
+    /* 500 ms SO_RCVTIMEO on accept */
     if (c->setsockopt_fn) {
+        udp_log("DoomPS: setting SO_RCVTIMEO\n");
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 500000;
-        (void)NC(c->G, c->setsockopt_fn,
-                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
+        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
+                             (u64)listen_fd, 0xFFFF, 0x1006,
+                             (u64)tv, 16, 0);
+        if (so_ret != 0) udp_log("DoomPS: SO_RCVTIMEO failed\n");
+        else             udp_log("DoomPS: SO_RCVTIMEO set\n");
     }
 
-    int dots = 0;
     s32 client = -1;
     for (int attempt = 0; attempt < 600; attempt++) {
         u8 peer[16]; s32 plen = 16;
         client = (s32)NC(c->G, c->accept_fn,
                          (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
-        if (client >= 0) break;
-        show_loading(c, dots, "Waiting for WAD upload...");
-        dots = (dots + 1) & 3;
+        if (client >= 0) {
+            udp_log("DoomPS: accept returned OK\n");
+            break;
+        }
+        if ((attempt % 20) == 19) {
+            udp_log("DoomPS: accept retry (10s)\n");
+        }
     }
+
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
-    show_loading(c, 0, "WAD connected, receiving...");
+
+    /* Show progress screen once before the recv loop */
+    show_wad_progress(c, 0, 1);
     udp_log("DoomPS: receiving WAD...\n");
 
     u8 hdr[8]; s32 got = 0;
@@ -316,7 +340,19 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
+    {
+        int p = 0; const char *m = "DoomPS: WAD size=";
+        while (*m) g_diag[p++] = *m++;
+        u64 v = wad_size; char tmp[24]; int t = 0;
+        if (v == 0) tmp[t++] = '0';
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) g_diag[p++] = tmp[--t];
+        g_diag[p++] = '\n'; g_diag[p] = 0;
+        udp_log(g_diag);
+    }
+
     const char *wad_out = "/av_contents/content_tmp/doom.wad";
+    udp_log("DoomPS: opening WAD out file\n");
     s32 fd = (s32)NC(c->G, c->kopen,
                      (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
     diag_kopen("DoomPS: [W1r] ", wad_out, fd);
@@ -429,10 +465,7 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
-    /* ============================================================
-     * BSS ZERO — must run FIRST, before any global is touched.
-     * Luac0re's loader does not zero .bss, so we do it manually.
-     * ============================================================ */
+    /* Zero BSS — Luac0re's loader does not run an ELF loader */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
