@@ -1,11 +1,6 @@
 /*
- * doom-ps/src/main.c — v18
- *
- * v18 fixes:
- *   - DG_Init unconditionally allocates DG_ScreenBuffer (never trusts
- *     the check, because GCC -Os may erase the _start write)
- *   - volatile-forced NULL write in _start so GCC can't optimize it away
- *   - "By MexrlDev" is now scale 4 (was 3) and sits at y=470 (was 445)
+ * doom-ps/src/main.c — v19
+ *   - credit line even bigger (scale 5) with more vertical gap
  */
 
 #include "core.h"
@@ -143,28 +138,28 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ====================================================================
- * LOADING screen — credit is now scale 4 with a 46px gap above it
+ * LOADING screen — credit line is now scale 5 (bigger yet), y=490
  * ==================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
-    ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
-    ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
+    ps_draw_str_center(fb, 260, "DOOM-PS", 0xFFFFAA00, 8);
+    ps_draw_str_center(fb, 380, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    /* Credit line: 46 px gap, scale 4 */
-    ps_draw_str_center(fb, 470, "By MexrlDev",
-                       0xFFA0A0A0, 4);
+    /* 66 px gap, scale 5 */
+    ps_draw_str_center(fb, 490, "By MexrlDev",
+                       0xFFB0B0B0, 5);
 
     char buf[32]; int p = 0;
     const char *base = "LOADING";
     while (base[p]) { buf[p] = base[p]; p++; }
     for (int i = 0; i < dots; i++) buf[p++] = '.';
     buf[p] = 0;
-    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 620, buf, 0xFFFFFFFF, 5);
 
-    if (status) ps_draw_str_center(fb, 720, status, 0xFFA0A0A0, 3);
+    if (status) ps_draw_str_center(fb, 760, status, 0xFFA0A0A0, 3);
 
     present(c);
 }
@@ -174,11 +169,11 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
-    ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
-    ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
+    ps_draw_str_center(fb, 260, "DOOM-PS", 0xFFFFAA00, 8);
+    ps_draw_str_center(fb, 380, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    ps_draw_str_center(fb, 470, "By MexrlDev",
-                       0xFFA0A0A0, 4);
+    ps_draw_str_center(fb, 490, "By MexrlDev",
+                       0xFFB0B0B0, 5);
 
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
     char buf[40]; int p = 0;
@@ -188,9 +183,9 @@ static void show_wad_progress(struct ps_ctx *c, u64 got, u64 total) {
     if (pct >= 10)  buf[p++] = '0' + ((pct / 10) % 10);
     buf[p++] = '0' + (pct % 10);
     buf[p++] = '%'; buf[p] = 0;
-    ps_draw_str_center(fb, 570, buf, 0xFFFFFFFF, 5);
+    ps_draw_str_center(fb, 620, buf, 0xFFFFFFFF, 5);
 
-    int bar_x = 200, bar_y = 700, bar_w = SCR_W - 400, bar_h = 40;
+    int bar_x = 200, bar_y = 730, bar_w = SCR_W - 400, bar_h = 40;
     int filled = (total > 0) ? (int)((u64)bar_w * got / total) : 0;
     if (filled > bar_w) filled = bar_w;
     ps_fill_rect(fb, bar_x, bar_y, bar_w, bar_h, 0xFF303030);
@@ -303,10 +298,7 @@ static int recv_wad(s32 listen_fd) {
         show_loading(c, dots, "Waiting for WAD upload...");
         dots = (dots + 1) & 3;
     }
-    if (client < 0) {
-        udp_log("DoomPS: accept failed\n");
-        return -1;
-    }
+    if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
     show_loading(c, 0, "WAD connected, receiving...");
     udp_log("DoomPS: receiving WAD...\n");
 
@@ -341,7 +333,6 @@ static int recv_wad(s32 listen_fd) {
         NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
         return -1;
     }
-
     {
         int i = 0;
         while (wad_out[i] && i < 127) { c->wad_path[i] = wad_out[i]; i++; }
@@ -360,19 +351,13 @@ static int recv_wad(s32 listen_fd) {
         NC(c->G, c->kwrite, (u64)fd, (u64)chunk, (u64)n, 0,0,0);
         remaining -= (u64)n;
         int pct = (total > 0) ? (int)((total - remaining) * 100 / total) : 0;
-        if (pct != last_pct) {
-            show_wad_progress(c, total - remaining, total);
-            last_pct = pct;
-        }
+        if (pct != last_pct) { show_wad_progress(c, total - remaining, total); last_pct = pct; }
     }
 
     NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
     NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
 
-    if (remaining > 0) {
-        udp_log("DoomPS: WAD truncated\n");
-        return -1;
-    }
+    if (remaining > 0) { udp_log("DoomPS: WAD truncated\n"); return -1; }
     udp_log("DoomPS: WAD written OK\n");
     show_loading(c, 3, "WAD ready, launching Doom...");
     return 0;
@@ -382,20 +367,11 @@ extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
-/* ====================================================================
- * DG_Init — v18: UNCONDITIONAL allocation.
- * Never trusts the previous value of DG_ScreenBuffer because the
- * Luac0re loader doesn't run an ELF loader (no .bss zeroing) and GCC
- * -Os may hoist our _start NULL write out of existence.
- * ==================================================================== */
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
     DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
-    if (!DG_ScreenBuffer) {
-        udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
-    } else {
-        udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
-    }
+    if (!DG_ScreenBuffer) udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
+    else udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
 }
 
 void DG_DrawFrame(void) {
@@ -435,7 +411,13 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
     c->key_rp = (c->key_rp + 1) & (KEY_QUEUE_SIZE - 1);
     return 1;
 }
-void DG_SetWindowTitle(const char *t) { (void)t; }
+void DG_SetWindowTitle(const char *t) {
+    if (t) {
+        udp_log("DoomPS: DG_SetWindowTitle(\"");
+        udp_log(t);
+        udp_log("\")\n");
+    }
+}
 
 void dg_audio_callback(const short *pcm, int sample_count) {
     struct ps_ctx *c = &g_ctx;
@@ -446,8 +428,7 @@ void dg_audio_callback(const short *pcm, int sample_count) {
         int cp = frames < SAMPLES_PER_BUF ? frames : SAMPLES_PER_BUF;
         ps_memcpy(slot, pcm + off * 2, (u64)(cp * 4));
         if (cp < SAMPLES_PER_BUF)
-            ps_memset(slot + cp * 4, 0,
-                      (u64)((SAMPLES_PER_BUF - cp) * 4));
+            ps_memset(slot + cp * 4, 0, (u64)((SAMPLES_PER_BUF - cp) * 4));
         c->ring_write = (c->ring_write + 1) & (RING_SLOTS - 1);
         c->ring_count++; off += cp; frames -= cp;
     }
@@ -466,7 +447,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
-    /* volatile-forced NULL write — GCC cannot optimize this away */
     *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     ext->step = 2;
@@ -527,20 +507,16 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     s32 vid_mod = (s32)NC(c->G, c->load_mod,
                           (u64)"libSceVideoOut.sprx",0,0,0,0,0);
-    udp_log("DoomPS: [13] VideoOut.sprx\n");
-    ext->step = 13;
+    udp_log("DoomPS: [13] VideoOut.sprx\n"); ext->step = 13;
     s32 aud_mod = (s32)NC(c->G, c->load_mod,
                           (u64)"libSceAudioOut.sprx",0,0,0,0,0);
-    udp_log("DoomPS: [14] AudioOut.sprx\n");
-    ext->step = 14;
+    udp_log("DoomPS: [14] AudioOut.sprx\n"); ext->step = 14;
     s32 pad_mod = (s32)NC(c->G, c->load_mod,
                           (u64)"libScePad.sprx",0,0,0,0,0);
-    udp_log("DoomPS: [15] Pad.sprx\n");
-    ext->step = 15;
+    udp_log("DoomPS: [15] Pad.sprx\n"); ext->step = 15;
     s32 usr_mod = (s32)NC(c->G, c->load_mod,
                           (u64)"libSceUserService.sprx",0,0,0,0,0);
-    udp_log("DoomPS: [16] UserService.sprx\n");
-    ext->step = 16;
+    udp_log("DoomPS: [16] UserService.sprx\n"); ext->step = 16;
 
     c->user_id = 0;
     if (usr_mod > 0) {
@@ -560,71 +536,57 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->vid_flip  = SYM(c->G, c->D, vid_mod, "sceVideoOutSubmitFlip");
     c->vid_rate  = SYM(c->G, c->D, vid_mod, "sceVideoOutSetFlipRate");
     c->vid_evt   = SYM(c->G, c->D, vid_mod, "sceVideoOutAddFlipEvent");
-    udp_log("DoomPS: [17] VideoOut fns\n");
-    ext->step = 17;
+    udp_log("DoomPS: [17] VideoOut fns\n"); ext->step = 17;
 
     c->aud_open  = SYM(c->G, c->D, aud_mod, "sceAudioOutOpen");
     c->aud_out   = SYM(c->G, c->D, aud_mod, "sceAudioOutOutput");
     c->aud_close = SYM(c->G, c->D, aud_mod, "sceAudioOutClose");
-    udp_log("DoomPS: [18] AudioOut fns\n");
-    ext->step = 18;
+    udp_log("DoomPS: [18] AudioOut fns\n"); ext->step = 18;
 
     c->pad_init_fn = SYM(c->G, c->D, pad_mod, "scePadInit");
     c->pad_geth    = SYM(c->G, c->D, pad_mod, "scePadGetHandle");
     c->pad_read    = SYM(c->G, c->D, pad_mod, "scePadRead");
-    udp_log("DoomPS: [19] Pad fns\n");
-    ext->step = 19;
+    udp_log("DoomPS: [19] Pad fns\n"); ext->step = 19;
 
     if (c->cancel) {
         u64 gs = *(u64 *)(eboot_base + EBOOT_GS_THREAD);
         if (gs) NC(c->G, c->cancel, gs, 0,0,0,0,0);
     }
     NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
-    udp_log("DoomPS: [20] GS killed\n");
-    ext->step = 20;
+    udp_log("DoomPS: [20] GS killed\n"); ext->step = 20;
 
     s32 emu_vid = *(s32 *)(eboot_base + EBOOT_VIDOUT);
     if (c->vid_close && emu_vid >= 0)
         NC(c->G, c->vid_close, (u64)emu_vid, 0,0,0,0,0);
     NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
-    udp_log("DoomPS: [21] old VO closed\n");
-    ext->step = 21;
+    udp_log("DoomPS: [21] old VO closed\n"); ext->step = 21;
 
     c->video_h = (s32)NC(c->G, c->vid_open, 0xFF, 0, 0, 0, 0, 0);
     if (c->video_h < 0) {
-        ext->status = -10;
-        udp_log("DoomPS: [22] VideoOut open FAILED\n");
-        ext->step = 22;
-        return;
+        ext->status = -10; udp_log("DoomPS: [22] VideoOut open FAILED\n");
+        ext->step = 22; return;
     }
-    udp_log("DoomPS: [23] VideoOut open OK\n");
-    ext->step = 23;
+    udp_log("DoomPS: [23] VideoOut open OK\n"); ext->step = 23;
 
     if (c->create_eq)
         NC(c->G, c->create_eq, (u64)&c->eq, (u64)"doomq",0,0,0,0);
     if (c->vid_evt && c->eq)
         NC(c->G, c->vid_evt, c->eq, (u64)c->video_h,0,0,0,0);
-    udp_log("DoomPS: [24] equeue\n");
-    ext->step = 24;
+    udp_log("DoomPS: [24] equeue\n"); ext->step = 24;
 
     u64 mem_total = c->dm_size
-                  ? NC(c->G, c->dm_size, 0,0,0,0,0,0)
-                  : 0x300000000ULL;
+                  ? NC(c->G, c->dm_size, 0,0,0,0,0,0) : 0x300000000ULL;
     u64 phys = 0;
     NC(c->G, c->alloc_dm, 0, mem_total, FB_TOTAL, 0x200000, 3, (u64)&phys);
-    udp_log("DoomPS: [25] dmem alloc\n");
-    ext->step = 25;
+    udp_log("DoomPS: [25] dmem alloc\n"); ext->step = 25;
 
     c->vmem = 0;
     NC(c->G, c->map_dm, (u64)&c->vmem, FB_TOTAL, 0x33, 0, phys, 0x200000);
     if (!c->vmem) {
-        ext->status = -21;
-        udp_log("DoomPS: [26] dmem map FAILED\n");
-        ext->step = 26;
-        return;
+        ext->status = -21; udp_log("DoomPS: [26] dmem map FAILED\n");
+        ext->step = 26; return;
     }
-    udp_log("DoomPS: [27] dmem mapped\n");
-    ext->step = 27;
+    udp_log("DoomPS: [27] dmem mapped\n"); ext->step = 27;
 
     c->fbs[0] = c->vmem;
     c->fbs[1] = (u8 *)c->vmem + FB_ALIGNED;
@@ -632,8 +594,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         ((u32 *)c->fbs[0])[i] = 0xFF000000;
         ((u32 *)c->fbs[1])[i] = 0xFF000000;
     }
-    udp_log("DoomPS: [28] FBs cleared\n");
-    ext->step = 28;
+    udp_log("DoomPS: [28] FBs cleared\n"); ext->step = 28;
 
     u8 attr[64]; ps_memset(attr, 0, 64);
     *(u32*)(attr+0)  = 0x80000000;
@@ -644,27 +605,22 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     if (NC(c->G, c->vid_reg, (u64)c->video_h, 0, (u64)c->fbs, 2,
            (u64)attr, 0) != 0) {
-        ext->status = -30;
-        udp_log("DoomPS: [30] RegisterBuffers FAILED\n");
-        ext->step = 30;
-        return;
+        ext->status = -30; udp_log("DoomPS: [30] RegisterBuffers FAILED\n");
+        ext->step = 30; return;
     }
-    udp_log("DoomPS: [31] FBs registered\n");
-    ext->step = 31;
+    udp_log("DoomPS: [31] FBs registered\n"); ext->step = 31;
     if (c->vid_rate)
         NC(c->G, c->vid_rate, (u64)c->video_h, 0,0,0,0,0);
 
     show_loading(c, 0, "Doom-PS starting up");
-    udp_log("DoomPS: [32] first frame shown\n");
-    ext->step = 32;
+    udp_log("DoomPS: [32] first frame shown\n"); ext->step = 32;
 
     if (c->aud_close)
         for (int h = 0; h < 8; h++)
             NC(c->G, c->aud_close, (u64)h,0,0,0,0,0);
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
-                             SAMPLES_PER_BUF, SAMPLE_RATE,
-                             AUDIO_S16_STEREO);
+                             SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
     if (c->mmap_fn) {
         c->ring = (u8 *)NC(c->G, c->mmap_fn, 0,
                            (u64)(RING_SLOTS * RING_BYTES), 3, 0x1002,
@@ -679,21 +635,17 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
-    udp_log("DoomPS: [34] pad query done\n");
-    ext->step = 34;
+    udp_log("DoomPS: [34] pad query done\n"); ext->step = 34;
 
     s32 tcp_listen_fd = (s32)ext->dbg[0];
-    udp_log("DoomPS: [35] entering recv_wad\n");
-    ext->step = 35;
+    udp_log("DoomPS: [35] entering recv_wad\n"); ext->step = 35;
 
     int wad_ok = (recv_wad(tcp_listen_fd) == 0);
-
     if (!wad_ok) {
         udp_log("DoomPS: WAD recv failed\n");
         show_error_and_hang(c, "WAD transfer failed",
                             "Check PC->console TCP connectivity");
     }
-
     {
         s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path,
                             (u64)0x0000, 0, 0, 0, 0);
@@ -704,11 +656,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         }
         NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
     }
+    udp_log("DoomPS: [36] WAD phase complete\n"); ext->step = 36;
 
-    udp_log("DoomPS: [36] WAD phase complete\n");
-    ext->step = 36;
-
-    /* Re-zero one more time right before the call — belt and suspenders */
     *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
     static const char arg0[] = "doom";
@@ -719,12 +668,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     argv[2] = c->wad_path;
     argv[3] = (char *)0;
 
-    udp_log("DoomPS: [37] doomgeneric_Create\n");
-    ext->step = 37;
+    udp_log("DoomPS: [37] doomgeneric_Create\n"); ext->step = 37;
     doomgeneric_Create(3, (char **)argv);
 
-    udp_log("DoomPS: [38] doomgeneric_Create returned\n");
-    ext->step = 38;
+    udp_log("DoomPS: [38] doomgeneric_Create returned\n"); ext->step = 38;
     while (1) {
         doomgeneric_Tick();
         c->ext->frame_count = c->total_frames;
