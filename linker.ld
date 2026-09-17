@@ -19,9 +19,14 @@ SECTIONS
         *(.rodata.*)
         *(.data)
         *(.data.*)
+    } :text
+
+    .bss : {
+        __bss_start = .;
         *(.bss)
         *(.bss.*)
         *(COMMON)
+        __bss_end = .;
     } :text
 
     /DISCARD/ : {
