@@ -20,30 +20,42 @@ SECTIONS
         *(.data)
         *(.data.*)
 
-        /* ------------------------------------------------------------
-         * BSS is intentionally kept INSIDE .text (not NOLOAD).
-         *
-         * Why: the console-side Lua launcher on this firmware has a
-         * hard minimum on received shellcode size (~623 KB).  With
-         * BSS excluded from the file, our shellcode is only 354 KB
-         * and gets rejected with:
-         *
-         *    "short receive: got 354400 bytes, expected ~623 KB"
-         *
-         * Keeping BSS inside .text gives a ~628 KB file that the
-         * launcher accepts.  The BSS bytes are zeros in the file, so
-         * globals are already zero-initialised before _start runs —
-         * the explicit zeroing in main.c's _start becomes a harmless
-         * no-op.
-         *
-         * Symbols __bss_start / __bss_end are still defined so
-         * main.c's extern references resolve.
-         * ------------------------------------------------------------ */
+        /* BSS is kept INSIDE .text (not NOLOAD) so the file stays
+         * around 628 KB — the console-side Lua launcher has a hard
+         * minimum of ~623 KB and rejects anything smaller.
+         * The bytes are zeros in the file, so globals start zeroed. */
         __bss_start = .;
         *(.bss)
         *(.bss.*)
         *(COMMON)
         __bss_end = .;
+    } :text
+
+    /* ------------------------------------------------------------------
+     * .rela_out — holds the ELF relocation table emitted by -pie.
+     *
+     * At runtime, _start walks __rela_start..__rela_end and adds the
+     * load base to every R_X86_64_RELATIVE entry.  This fixes absolute
+     * pointers stored in .data (like `defaults[].location = &screenblocks`)
+     * which the linker resolved to small offsets from 0.
+     * ------------------------------------------------------------------ */
+    .rela_out : {
+        __rela_start = .;
+        *(.rela.dyn)
+        *(.rela.dyn.*)
+        *(.rela.text)
+        *(.rela.text.*)
+        *(.rela.data)
+        *(.rela.data.*)
+        *(.rela.rodata)
+        *(.rela.rodata.*)
+        *(.rela.bss)
+        *(.rela.bss.*)
+        *(.rela.init_array)
+        *(.rela.fini_array)
+        *(.rela.plt)
+        *(.rela.got)
+        __rela_end = .;
     } :text
 
     /DISCARD/ : {
@@ -58,8 +70,6 @@ SECTIONS
         *(.dynamic)
         *(.gnu.hash)
         *(.gnu.version*)
-        *(.rela.*)
-        *(.rel.*)
         *(.plt)
         *(.plt.*)
     }
