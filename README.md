@@ -3,8 +3,10 @@
 Doom (via [doomgeneric](https://github.com/ozkl/doomgeneric)) running as
 homebrew on PS4 / PS5 through the **Luac0re** shellcode loader.
 
-Doom-Ps is based of [EmuC0re](https://github.com/egycnq/EmuC0re) by [egycnq](https://github.com/egycnq) and also based on [Exp-C0re](https://github.com/MexrlDev/Exp-C0re) 
-and based of [LuaC0re](https://github.com/Gezine/Luac0re) by [Gezine](https://github.com/Gezine) and also based on [doomgeneric](https://github.com/ozkl/doomgeneric)) 
+Doom-Ps is based on [EmuC0re](https://github.com/egycnq/EmuC0re) by [egycnq](https://github.com/egycnq),
+[Exp-C0re](https://github.com/MexrlDev/Exp-C0re) by MexrlDev,
+[LuaC0re](https://github.com/Gezine/Luac0re) by [Gezine](https://github.com/Gezine),
+and [doomgeneric](https://github.com/ozkl/doomgeneric) by [ozkl](https://github.com/ozkl).
 
 ---
 
@@ -16,12 +18,12 @@ doom-ps/
 │   ├── core.h              types, offsets, native_call (from EmuC0re)
 │   ├── main.c              _start + all doomgeneric callbacks
 │   ├── doomgeneric_ps.h    public API header
-│   └── i_sound_ps.c        audio backend
+│   ├── i_sound_ps.c        audio backend (dedicated thread)
+│   └── ps_libc.c           freestanding libc (printf, malloc, fopen, etc.)
 ├── Makefile
 ├── linker.ld               base-0 single RWX segment (from EmuC0re)
 ├── doom_launcher.lua       Luac0re payload (mirrors nes.lua)
-├── wad_sender.py           streams WAD to console over TCP
-├── log_server.py           receives UDP debug log from shellcode
+├── doom-luncher.py         launcher: streams shellcode + WAD over TCP
 ├── build.sh                one-shot clone + build
 └── .github/workflows/
     └── build.yml           GitHub Actions CI
@@ -53,7 +55,9 @@ ready to paste into doom_launcher.lua).
 
 ## Deploy
 
-### 1. Edit doom_launcher.lua
+## Deploy
+
+### 1. Edit `doom_launcher.lua`
 
 ```lua
 local PC_IP    = "192.168.1.100"  -- your PC
@@ -62,39 +66,39 @@ local WAD_PORT = 5000
 local shellcode_hex = "..."       -- paste from `make hex` or doom_ps.hex
 ```
 
-### 2. Start log receiver on PC
+### 2. Run the launcher from your PC
 
 ```sh
-python3 log_server.py --port 9027
+python3 doom-luncher.py 192.168.1.50 /path/to/DOOM.WAD
 ```
 
-### 3. Send Lua payload to console via Luac0re
+The launcher:
 
-### 4. Send the WAD
+1. Sends `doom_launcher.lua` to the console on port 9026
+2. TCP-scans ports 5001..5020 for the shellcode receiver
+3. Streams `doom_ps.bin` to that port
+4. Streams the WAD to port 5000
 
-```sh
-python3 wad_sender.py 192.168.1.50 /path/to/DOOM.WAD
-```
-
-wad_sender retries for 30 s so you don't need to time it perfectly.
-Shellcode writes to `/savedata0/doom.wad` then launches Doom.
+It retries for 25 s so you don't need to time it perfectly.
+Shellcode writes the WAD to `/av_contents/content_tmp/doom.wad`
+(falls back to `/savedata0/doom.wad`), then boots Doom.
 
 ---
 
 ## Controls
 
-| Button       | Action               |
-|--------------|----------------------|
-| D-Pad        | Move / turn          |
-| Cross ×      | Fire                 |
-| Square □     | Use / open           |
-| Circle ○     | Enter / confirm      |
-| Options      | Escape / menu        |
-| Triangle △   | Automap              |
-| L1           | Run                  |
-| R1           | Strafe               |
-| Share + ×□○△ | Weapons 1–4          |
-| L3 + ×□○     | Weapons 5–7          |
+| Button       | Action                    |
+|--------------|---------------------------|
+| D-Pad        | Move / turn               |
+| Cross ×      | Fire                      |
+| Square □     | Use / open door           |
+| Triangle △   | Run (hold)                |
+| Circle ○     | Enter / confirm           |
+| Options      | Escape / main menu        |
+| R1           | Save menu (F2)            |
+| L1           | Load menu (F3)            |
+| R2           | Next weapon               |
+| L2           | Previous weapon           |
 
 ---
 
@@ -115,23 +119,27 @@ different game, update these three constants in `src/core.h`:
 
 | Symptom | Fix |
 |---------|-----|
-| Black screen | Check EBOOT_VIDOUT offset for your host game |
-| Crash on start | Check EBOOT_GS_THREAD — wrong thread cancel target |
-| WAD transfer stalls | Firewall blocking port 5000, or Lua not yet at accept() |
-| No audio | Normal — audio_h < 0 means libSceAudioOut unavailable, game still runs |
-| Linker errors in CI | doomgeneric API changed — check i_sound.h for `mixsound` symbol name |
+| Black screen | Check `EBOOT_VIDOUT` offset for your host game |
+| Crash on start | Check `EBOOT_GS_THREAD` — wrong thread cancel target |
+| WAD transfer stalls | Firewall blocking port 5000, or Lua not yet at `accept()` |
+| No sound | Look for `DoomPS: [34] audio up` in the UDP log — if it says `audio N/A`, `libSceAudioOut` failed to open |
+| Sound plays but no gunshots | Look for `Snd: start pistol` in the log. If absent, check `I_StartSound` in `i_sound_ps.c` |
+| Square doesn't open doors | Both original (`0xa2`) and Chocolate (`0x20`) key codes are sent — make sure you're within 64 units of the door and facing it |
+| Linker errors in CI | Clone layout changed — the Makefile auto-detects both flat (`doomgeneric/*.c`) and nested (`doomgeneric/doomgeneric/*.c`) layouts |
 
 ---
 
 ## Credits
-* MexrlDev - Project Development
+
+* **MexrlDev** — Project Development
 
 **Special Thanks To**
- - [egycnq](https://github.com/egycnq) for [EmuC0re](https://github.com/egycnq/EmuC0re)
- - [Gezine](https://github.com/Gezine) for [Luac0re](https://github.com/Gezine/Luac0re)
- - Claude & Deepseek models for codes development bug researching
+- [egycnq](https://github.com/egycnq) for [EmuC0re](https://github.com/egycnq/EmuC0re)
+- [Gezine](https://github.com/Gezine) for [Luac0re](https://github.com/Gezine/Luac0re)
+- [ozkl](https://github.com/ozkl) for [doomgeneric](https://github.com/ozkl/doomgeneric)
+- [shahrilnet](https://github.com/shahrilnet) & [n0llptr](https://github.com/n0llptr) for [remote_lua_loader](https://github.com/shahrilnet/remote_lua_loader)
+- Claude & Deepseek models for code development and bug research
 
 ---
 
-
-# Epeical
+#
