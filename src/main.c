@@ -1,11 +1,12 @@
 /*
- * doom-ps/src/main.c — v13
+ * doom-ps/src/main.c — v14
  *
- * Fixes over v12:
- *   - WAD path cascade now tries 9 paths × 4 flag variants with hex logging
- *   - Relative paths (doom.wad, ./doom.wad) tried too
+ * Fixes over v13:
+ *   - O_CREAT/O_TRUNC use PS4/PS5 values (0x100 / 0x1000)
+ *   - WAD open attempts unrolled, no nested-function stack frames
+ *   - Single static diag buffer (no stack recursion in native_call)
  *   - "By MexrlDev" credit line under "doomgeneric on Luac0re"
- *   - Error screen now says "Reboot game to recover"
+ *   - Error screen says "Reboot game to recover"
  */
 
 #include "core.h"
@@ -25,14 +26,6 @@ static void ps_memcpy(void *dst, const void *src, u64 len) {
     while (len--) *d++ = *s++;
 }
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
-
-static void hex32(char *b, u32 v) {
-    const char h[] = "0123456789ABCDEF";
-    b[0]='0'; b[1]='x';
-    for (int i = 0; i < 8; i++)
-        b[2+i] = h[(v >> ((7-i)*4)) & 0xF];
-    b[10] = 0;
-}
 
 /* ========================================================================
  * DualShock bits
@@ -75,33 +68,13 @@ static void hex32(char *b, u32 v) {
 #define DG_KEY_7 '7'
 
 /* ========================================================================
- * WAD output paths + flags to try
+ * PS4/PS5 file open flags — CORRECTED for libkernel
  * ======================================================================== */
-static const char *WAD_PATHS[] = {
-    "/av_contents/content_tmp/doom.wad",
-    "/temp0/doom.wad",
-    "/tmp/doom.wad",
-    "/savedata0/doom.wad",
-    "/data/doom.wad",
-    "/user/data/doom.wad",
-    "/host/doom.wad",
-    "doom.wad",
-    "./doom.wad",
-    (const char *)0
-};
-
-/* O_* flag values (FreeBSD / PS4 / PS5) */
-#define O_WRONLY 0x0001
-#define O_RDWR   0x0002
-#define O_CREAT  0x0200
-#define O_TRUNC  0x0400
-
-static const int WAD_FLAGS[] = {
-    O_WRONLY | O_CREAT | O_TRUNC,   /* 0x0601 - what EmuC0re uses */
-    O_RDWR   | O_CREAT | O_TRUNC,   /* 0x0602 */
-    O_WRONLY | O_CREAT,             /* 0x0201 */
-    O_RDWR   | O_CREAT,             /* 0x0202 */
-};
+#define O_RDONLY_  0x0000
+#define O_WRONLY_  0x0001
+#define O_RDWR_    0x0002
+#define O_CREAT_   0x0100   /* PS4/PS5 value (not FreeBSD desktop) */
+#define O_TRUNC_   0x1000   /* PS4/PS5 value */
 
 /* ========================================================================
  * Global context
@@ -142,6 +115,9 @@ static struct ps_ctx {
     struct ext_args *ext;
 } g_ctx;
 
+/* Single static diag buffer — no per-call stack allocation */
+static char g_diag[256];
+
 /* ========================================================================
  * UDP log
  * ======================================================================== */
@@ -151,6 +127,25 @@ static void udp_log(const char *msg) {
     NC(c->G, c->sendto_fn,
        (u64)c->log_fd, (u64)msg, (u64)ps_strlen(msg),
        0, (u64)c->log_sa, 16);
+}
+
+/* Log "DoomPS: <prefix><path> fd=0xNNNNNNNN\n" */
+static void diag_kopen(const char *prefix, const char *path, s32 fd) {
+    int p = 0;
+    const char *m = prefix;
+    while (*m && p < 40) g_diag[p++] = *m++;
+    int i = 0;
+    while (path[i] && p < 110) g_diag[p++] = path[i++];
+    g_diag[p++] = ' ';
+    g_diag[p++] = 'f'; g_diag[p++] = 'd'; g_diag[p++] = '=';
+    g_diag[p++] = '0'; g_diag[p++] = 'x';
+    const char h[] = "0123456789ABCDEF";
+    u32 v = (u32)fd;
+    for (int k = 0; k < 8; k++)
+        g_diag[p++] = h[(v >> (28 - k*4)) & 0xF];
+    g_diag[p++] = '\n';
+    g_diag[p] = 0;
+    udp_log(g_diag);
 }
 
 /* ========================================================================
@@ -169,7 +164,7 @@ static void present(struct ps_ctx *c) {
 }
 
 /* ========================================================================
- * On-screen LOADING / WAD progress / error
+ * On-screen LOADING / progress / error
  * ======================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
@@ -179,9 +174,7 @@ static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re",
                        0xFF808080, 3);
-    /* Credit line: 3px below the line above.
-     * "doomgeneric on Luac0re" ends at y = 400 + 8*3 = 424.
-     * Credit at y = 427, scale 2 (16px tall). */
+    /* By MexrlDev — 3px below the previous line */
     ps_draw_str_center(fb, 427, "By MexrlDev",
                        0xFF606060, 2);
 
@@ -309,48 +302,7 @@ static void audio_drain(void) {
 }
 
 /* ========================================================================
- * WAD path cascade — try every path × every flag combo, log each result
- * ======================================================================== */
-static s32 try_create_wad_diag(const char *path, int flags) {
-    struct ps_ctx *c = &g_ctx;
-    if (!c->kopen) return -1;
-    s32 fd = (s32)NC(c->G, c->kopen,
-                     (u64)path, (u64)(u32)flags, 0x1FF, 0,0,0);
-
-    /* Log: "  X  /path/here  fd=0xDEADBEEF" */
-    char b[200]; int p = 0;
-    b[p++]=' '; b[p++]=' '; b[p++]=' ';
-    b[p++] = (fd >= 0) ? '+' : '.';
-    b[p++]=' ';
-    const char *pp = path;
-    while (*pp && p < 140) b[p++] = *pp++;
-    while (p < 100) b[p++] = ' ';
-    hex32(b + p, (u32)fd);
-    p += 10;
-    b[p++]='\n'; b[p]=0;
-    udp_log(b);
-    return fd;
-}
-
-static s32 try_all_wad_paths(char *chosen_out, int chosen_size) {
-    for (int i = 0; WAD_PATHS[i]; i++) {
-        for (int j = 0; j < 4; j++) {
-            s32 fd = try_create_wad_diag(WAD_PATHS[i], WAD_FLAGS[j]);
-            if (fd >= 0) {
-                int k = 0;
-                while (WAD_PATHS[i][k] && k < chosen_size-1) {
-                    chosen_out[k] = WAD_PATHS[i][k]; k++;
-                }
-                chosen_out[k] = 0;
-                return fd;
-            }
-        }
-    }
-    return -1;
-}
-
-/* ========================================================================
- * WAD receive
+ * WAD receive — unrolled open attempts, checkpoints at each step
  * ======================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
@@ -405,25 +357,82 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
-    /* Print size then try every path */
+    /* Print WAD size */
     {
-        char b[80]; int p = 0;
-        const char *m = "DoomPS: WAD size = "; while (*m) b[p++]=*m++;
+        int p = 0;
+        const char *m = "DoomPS: WAD size = ";
+        while (*m) g_diag[p++] = *m++;
         u64 v = wad_size;
         char tmp[24]; int t = 0;
-        if (v == 0) { tmp[t++]='0'; }
+        if (v == 0) tmp[t++] = '0';
         while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-        while (t) b[p++] = tmp[--t];
-        b[p++]='\n'; b[p]=0;
-        udp_log(b);
+        while (t) g_diag[p++] = tmp[--t];
+        g_diag[p++] = '\n'; g_diag[p] = 0;
+        udp_log(g_diag);
     }
-    udp_log("DoomPS: trying WAD paths...\n");
 
-    char chosen[128]; chosen[0] = 0;
-    s32 fd = try_all_wad_paths(chosen, 128);
+    /* ================================================================
+     * Unrolled open attempts — no nested functions, single static buffer,
+     * correct PS4/PS5 O_CREAT/O_TRUNC values.
+     * ================================================================ */
+    const char *wad_out = (const char *)0;
+    s32 fd = -1;
+
+    udp_log("DoomPS: [W1] kopen /av_contents/content_tmp/doom.wad 0x1101\n");
+    fd = (s32)NC(c->G, c->kopen,
+                 (u64)"/av_contents/content_tmp/doom.wad",
+                 (u64)0x1101, 0x1FF, 0,0,0);
+    diag_kopen("DoomPS: [W1r] ", "/av_contents/content_tmp/doom.wad", fd);
+    if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
 
     if (fd < 0) {
-        udp_log("DoomPS: all WAD paths failed\n");
+        udp_log("DoomPS: [W2] kopen /tmp/doom.wad 0x1101\n");
+        fd = (s32)NC(c->G, c->kopen,
+                     (u64)"/tmp/doom.wad",
+                     (u64)0x1101, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W2r] ", "/tmp/doom.wad", fd);
+        if (fd >= 0) wad_out = "/tmp/doom.wad";
+    }
+
+    if (fd < 0) {
+        udp_log("DoomPS: [W3] kopen /savedata0/doom.wad 0x1101\n");
+        fd = (s32)NC(c->G, c->kopen,
+                     (u64)"/savedata0/doom.wad",
+                     (u64)0x1101, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W3r] ", "/savedata0/doom.wad", fd);
+        if (fd >= 0) wad_out = "/savedata0/doom.wad";
+    }
+
+    if (fd < 0) {
+        udp_log("DoomPS: [W4] kopen /temp0/doom.wad 0x1101\n");
+        fd = (s32)NC(c->G, c->kopen,
+                     (u64)"/temp0/doom.wad",
+                     (u64)0x1101, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W4r] ", "/temp0/doom.wad", fd);
+        if (fd >= 0) wad_out = "/temp0/doom.wad";
+    }
+
+    if (fd < 0) {
+        udp_log("DoomPS: [W5] kopen doom.wad 0x1101\n");
+        fd = (s32)NC(c->G, c->kopen,
+                     (u64)"doom.wad",
+                     (u64)0x1101, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W5r] ", "doom.wad", fd);
+        if (fd >= 0) wad_out = "doom.wad";
+    }
+
+    /* Fallback: try RDWR instead of WRONLY */
+    if (fd < 0) {
+        udp_log("DoomPS: [W6] kopen /av_contents/content_tmp/doom.wad 0x1102\n");
+        fd = (s32)NC(c->G, c->kopen,
+                     (u64)"/av_contents/content_tmp/doom.wad",
+                     (u64)0x1102, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W6r] ", "/av_contents/content_tmp/doom.wad", fd);
+        if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
+    }
+
+    if (fd < 0 || !wad_out) {
+        udp_log("DoomPS: all WAD open attempts failed\n");
         NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
         return -1;
     }
@@ -431,18 +440,20 @@ static int recv_wad(s32 listen_fd) {
     /* Save chosen path */
     {
         int i = 0;
-        while (chosen[i] && i < 127) { c->wad_path[i] = chosen[i]; i++; }
+        while (wad_out[i] && i < 127) { c->wad_path[i] = wad_out[i]; i++; }
         c->wad_path[i] = 0;
     }
     {
-        char b[160]; int p = 0;
-        const char *m = "DoomPS: using "; while (*m) b[p++]=*m++;
+        int p = 0;
+        const char *m = "DoomPS: using ";
+        while (*m) g_diag[p++] = *m++;
         int i = 0;
-        while (c->wad_path[i] && p < 150) b[p++] = c->wad_path[i++];
-        b[p++]='\n'; b[p]=0;
-        udp_log(b);
+        while (c->wad_path[i] && p < 250) g_diag[p++] = c->wad_path[i++];
+        g_diag[p++] = '\n'; g_diag[p] = 0;
+        udp_log(g_diag);
     }
 
+    /* Stream the WAD data */
     u8 chunk[WAD_CHUNK];
     u64 remaining = wad_size;
     u64 total = wad_size;
@@ -800,7 +811,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     }
 
     {
-        s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path, 0, 0, 0,0,0);
+        s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path,
+                            (u64)0x0000, 0, 0, 0, 0);
         if (check < 0) {
             udp_log("DoomPS: WAD verify failed\n");
             show_error_and_hang(c, "WAD missing after transfer",
