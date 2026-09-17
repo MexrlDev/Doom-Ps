@@ -1,8 +1,10 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v4: printf/fprintf/puts/exit log their args to UDP so we can see
- *     doom's own error messages in the iPhone log.
+ * v5: fopen logs path BEFORE kopen (so a hang is diagnosable).
+ *     strdup bounded to 4096 bytes to avoid infinite scan.
+ *     printf/puts/exit log their args to UDP so we can see doom's
+ *     own error messages in the iPhone log.
  */
 
 #include "core.h"
@@ -11,7 +13,7 @@
 /* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
-static void *fn_kopen, *fn_kread, __attribute__((unused)) *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
+static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
 static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
 static void *fn_sendto;
 
@@ -22,7 +24,7 @@ static int __log_ready = 0;
 static void ps_libc_log(const char *msg) {
     if (!__log_ready || __log_fd < 0 || !fn_sendto) return;
     u64 n = 0;
-    while (msg[n]) n++;
+    while (n < 512 && msg[n]) n++;
     if (n == 0) return;
     NC(__G, fn_sendto, (u64)__log_fd, (u64)msg, n, 0, (u64)__log_sa, 16);
 }
@@ -241,12 +243,37 @@ char *strstr(const char *hay, const char *needle) {
     }
     return 0;
 }
+
+static int __strdup_count = 0;
+
 char *strdup(const char *s) {
-    size_t len = strlen(s) + 1;
-    char *p = (char *)malloc(len);
-    if (p) strcpy(p, s);
+    if (!s) return 0;
+
+    size_t len = 0;
+    while (len < 4096 && s[len]) len++;
+    if (len >= 4096) {
+        ps_libc_log("ps_libc: strdup: NO NULL in 4096 bytes\n");
+        return 0;
+    }
+
+    if (__strdup_count < 60) {
+        __strdup_count++;
+        char b[160]; int p = 0;
+        const char *pre = "ps_libc: strdup(\"";
+        while (*pre && p < 24) b[p++] = *pre++;
+        for (size_t k = 0; k < len && p < 130; k++) b[p++] = s[k];
+        b[p++] = '"'; b[p++] = ')'; b[p++] = '\n'; b[p] = 0;
+        ps_libc_log(b);
+    }
+
+    char *p = (char *)malloc(len + 1);
+    if (p) {
+        for (size_t k = 0; k < len; k++) p[k] = s[k];
+        p[len] = 0;
+    }
     return p;
 }
+
 char *strtok(char *s, const char *delim) {
     static char *last = 0;
     if (s) last = s;
@@ -325,9 +352,7 @@ unsigned long strtoul(const char *s, char **endptr, int base) {
     return (unsigned long)strtol(s, endptr, base);
 }
 long long atoll(const char *s) { return (long long)atoi(s); }
-long strtol_ll(const char *s, char **e, int b) { return strtol(s, e, b); }
 
-/* qsort — insertion sort, small enough for our needs */
 void qsort(void *base, size_t n, size_t sz,
            int (*cmp)(const void *, const void *)) {
     unsigned char *b = (unsigned char *)base;
@@ -389,23 +414,35 @@ static FILE *alloc_slot(void) {
 
 static int __fopen_count = 0;
 
+/* === v5: LOG THE PATH BEFORE kopen — so a hang is diagnosable === */
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
-    int writable = (mode[0] == 'w' || mode[0] == 'a');
+
+    if (__fopen_count < 32) {
+        __fopen_count++;
+        char b[240]; int p = 0;
+        const char *pre = "ps_libc: fopen ENTRY path=\"";
+        while (*pre && p < 40) b[p++] = *pre++;
+        int i = 0;
+        while (i < 150 && path && path[i] && p < 220) b[p++] = path[i++];
+        b[p++] = '"';
+        b[p++] = ' ';
+        b[p++] = 'm';
+        b[p++] = '=';
+        b[p++] = (mode && mode[0]) ? mode[0] : '?';
+        b[p++] = '\n'; b[p] = 0;
+        ps_libc_log(b);
+    }
+
+    int writable = (mode && (mode[0] == 'w' || mode[0] == 'a')) ? 1 : 0;
     int flags = writable ? 0x601 : 0x0000;
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
 
-    if (__fopen_count < 24) {
-        __fopen_count++;
-        char b[200]; int p = 0;
-        const char *pre = "ps_libc: fopen ";
-        while (*pre && p < 40) b[p++] = *pre++;
-        int i = 0;
-        while (path[i] && p < 130) b[p++] = path[i++];
-        b[p++] = ' '; b[p++] = 'm'; b[p++] = '='; b[p++] = mode[0];
-        b[p++] = ' '; b[p++] = 'f'; b[p++] = 'd'; b[p++] = '=';
-        b[p++] = '0'; b[p++] = 'x';
+    if (__fopen_count <= 32) {
+        char b[80]; int p = 0;
+        const char *pre = "ps_libc: fopen fd=0x";
+        while (*pre && p < 24) b[p++] = *pre++;
         const char h[] = "0123456789ABCDEF";
         u32 v = (u32)fd;
         for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
@@ -488,7 +525,6 @@ int fseek(FILE *f, long off, int whence) {
     else if (whence == 2) f->pos = f->size + off;
     return 0;
 }
-
 long ftell(FILE *f)  { return f ? f->pos : -1; }
 int  fflush(FILE *f) { (void)f; return 0; }
 int  feof(FILE *f)   { return f ? (f->pos >= f->size) : 1; }
@@ -504,67 +540,33 @@ int mkdir(const char *path, unsigned int mode) {
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
-/* ============================================================
- * printf family — DO log the format string (without args).
- * This is how we will see doom's own error messages.
- * ============================================================ */
 int printf(const char *fmt, ...) {
-    if (fmt) {
-        ps_libc_log("[stdout] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (fmt) { ps_libc_log("[stdout] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
-
 int fprintf(FILE *f, const char *fmt, ...) {
     (void)f;
-    if (fmt) {
-        ps_libc_log("[fprintf] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (fmt) { ps_libc_log("[fprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
-
 int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) {
     (void)f; (void)a;
-    if (fmt) {
-        ps_libc_log("[vfprintf] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (fmt) { ps_libc_log("[vfprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
-
 int sprintf(char *b, const char *fmt, ...) {
     if (b) b[0] = 0;
-    if (fmt) {
-        ps_libc_log("[sprintf] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (fmt) { ps_libc_log("[sprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
-
 int snprintf(char *b, size_t n, const char *fmt, ...) {
     if (b && n) b[0] = 0;
-    if (fmt) {
-        ps_libc_log("[snprintf] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (fmt) { ps_libc_log("[snprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
-
 int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a) {
-    if (b && n) b[0] = 0;
-    (void)a;
-    if (fmt) {
-        ps_libc_log("[vsnprintf] ");
-        ps_libc_log(fmt);
-        ps_libc_log("\n");
-    }
+    if (b && n) b[0] = 0; (void)a;
+    if (fmt) { ps_libc_log("[vsnprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
 }
 
@@ -573,37 +575,28 @@ int sscanf(const char *s, const char *fmt, ...) { (void)s; (void)fmt; return 0; 
 int __isoc99_sscanf(const char *s, const char *fmt, ...)
     __asm__("__isoc99_sscanf");
 int __isoc99_sscanf(const char *s, const char *fmt, ...) {
-    (void)s; (void)fmt;
-    return 0;
+    (void)s; (void)fmt; return 0;
 }
 int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a)
     __asm__("__isoc99_vsscanf");
 int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a) {
-    (void)s; (void)fmt; (void)a;
-    return 0;
+    (void)s; (void)fmt; (void)a; return 0;
 }
 
 int puts(const char *s) {
-    if (s) {
-        ps_libc_log("[puts] ");
-        ps_libc_log(s);
-        ps_libc_log("\n");
-    }
+    if (s) { ps_libc_log("[puts] "); ps_libc_log(s); ps_libc_log("\n"); }
     return 0;
 }
 int putchar(int c) {
-    char b[3]; b[0] = (char)c; b[1] = '\n'; b[2] = 0;
+    char b[3]; b[0] = (char)c; b[1] = 0; b[2] = 0;
     ps_libc_log("[putchar] ");
     ps_libc_log(b);
+    ps_libc_log("\n");
     return c;
 }
 int fputs(const char *s, FILE *f) {
     (void)f;
-    if (s) {
-        ps_libc_log("[fputs] ");
-        ps_libc_log(s);
-        ps_libc_log("\n");
-    }
+    if (s) { ps_libc_log("[fputs] "); ps_libc_log(s); ps_libc_log("\n"); }
     return 0;
 }
 int fputc(int c, FILE *f)        { (void)f; (void)c; return c; }
@@ -612,14 +605,8 @@ int getc(FILE *f)                { (void)f; return -1; }
 int ungetc(int c, FILE *f)       { (void)f; return c; }
 char *fgets(char *b, int n, FILE *f) { if (b && n) b[0]=0; (void)f; return 0; }
 
-/* ===== process ===== */
 int atexit(void (*fn)(void)) { (void)fn; return 0; }
-
-char *getenv(const char *name) {
-    (void)name;
-    return 0;
-}
-
+char *getenv(const char *name) { (void)name; return 0; }
 void _exit(int code) { (void)code; for (;;) {} }
 
 void exit(int code) {
