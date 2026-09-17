@@ -1,18 +1,17 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v14:
- *   - T=6 (score-end) skip: some WAD masters contain spurious score-end
- *     bytes mid-track. Real Doom's sound card ignored them. We now
- *     only honor T=6 when it's within 100 bytes of mus_track_end.
- *     Otherwise we skip it and keep reading. This is why E1M1 ended
- *     after 6 events; now it plays the full track.
- *   - Volume boost: MUSIC_AMPL 80->120, SFX_HEADROOM 4->3,
- *     OUT_BOOST 2/1->3/2.
- *   - Soft-clip knees softened (linear up to 16000, 3:1 to 22000,
- *     10:1 to 30000, hard limit).
- *   - Diagnostics: event byte offset + full 64-byte score dump per
- *     song (title + E1M1 + menu music all get dumps now).
+ * v15 — AMPLITUDE RESET + ALIASING FILTER
+ *   - MUSIC_AMPL 120 → 32.  A 4-voice chord was producing ±48,000
+ *     pre-clip; the 240× effective gain drove the soft-clip into a
+ *     wall of harmonics = the buzzing you heard.
+ *   - OUT_BOOST 3/2 → 1/1.  No final boost.
+ *   - SFX_HEADROOM 3 → 4.
+ *   - One-pole LPF (~5.5 kHz) on the music path.  Removes the
+ *     harmonics above Nyquist that would otherwise alias down as
+ *     inharmonic buzz.
+ *   - Soft-clip: linear to 20000, 4:1 to 26000, 8:1 to 30000.
+ *   - T=6 spurious score-end skip retained (E1M1 quirk).
  */
 
 #include <stdio.h>
@@ -44,11 +43,11 @@ int snd_sfxvolume   = 8;
 #define MUS_TICKS_PER_SEC   140
 #define MUS_DEFAULT_TICK_US (1000000 / MUS_TICKS_PER_SEC)
 
-#define SFX_HEADROOM   3
-#define MUSIC_AMPL     120
+#define SFX_HEADROOM   4
+#define MUSIC_AMPL     32
 
-#define OUT_BOOST_NUM  3
-#define OUT_BOOST_DEN  2
+#define OUT_BOOST_NUM  1
+#define OUT_BOOST_DEN  1
 
 #define FADE_MAX       1024
 #define FADE_STEP_IN   6
@@ -83,6 +82,9 @@ typedef struct {
 static channel_t channels[NCHANNELS];
 static s32   mix_accum[MIXBUF * 2];
 static short mix_final[MIXBUF * 2];
+
+/* One-pole LPF for the music path (removes aliasing harmonics). */
+static s32 g_mus_lpf = 0;
 
 typedef struct {
     int active, note, channel, releasing;
@@ -235,7 +237,6 @@ static void mus_process_tick(void) {
             break;
         }
 
-        int pos_before = mus_pos;
         unsigned char ev = mus_data[mus_pos++];
         int type = (ev >> 4) & 0x07;
         int chan = ev & 0x0F;
@@ -243,7 +244,6 @@ static void mus_process_tick(void) {
         dbg_event++;
         if (dbg_event <= 40) {
             log_num("M: ev #", dbg_event, "");
-            log_num("M: ev pos=", pos_before, "");
             log_num("M: ev T=", type, "");
             log_num("M: ev C=", chan, "");
         }
@@ -275,11 +275,8 @@ static void mus_process_tick(void) {
             mus_pos += 2;
             break;
         case 6:
-            /* Only honor T=6 if it's near the end of the score. Some
-             * WAD masters embed spurious score-end bytes mid-track. */
             if (mus_pos + 100 < mus_track_end) {
                 log_str("M: skip spurious T=6");
-                /* fall through to read delay */
             } else {
                 mus_end_of_track = 1;
             }
@@ -386,18 +383,23 @@ static void music_render_accum(s32 *accum, int frames) {
         }
 
         mix = mix * MUSIC_AMPL * vol / 15;
-        accum[i * 2]     += mix;
-        accum[i * 2 + 1] += mix;
+
+        /* One-pole LPF, alpha = 0.5 → ~5.5 kHz cutoff.  Removes the
+         * harmonics above Nyquist that aliased down as buzz. */
+        g_mus_lpf += (mix - g_mus_lpf) / 2;
+
+        accum[i * 2]     += g_mus_lpf;
+        accum[i * 2 + 1] += g_mus_lpf;
     }
 }
 
 static inline s16 soft_clip(s32 v) {
-    if (v > 16000)  v = 16000 + (v - 16000) / 3;
-    if (v > 22000)  v = 22000 + (v - 22000) / 10;
-    if (v > 30000)  v = 30000 + (v - 30000) / 32;
-    if (v > 32767)  v =  32767;
-    if (v < -16000) v = -16000 + (v + 16000) / 3;
-    if (v < -22000) v = -22000 + (v + 22000) / 10;
+    if (v > 20000) v = 20000 + (v - 20000) / 4;
+    if (v > 26000) v = 26000 + (v - 26000) / 8;
+    if (v > 30000) v = 30000 + (v - 30000) / 32;
+    if (v > 32767) v = 32767;
+    if (v < -20000) v = -20000 + (v + 20000) / 4;
+    if (v < -26000) v = -26000 + (v + 26000) / 8;
     if (v < -30000) v = -30000 + (v + 30000) / 32;
     if (v < -32768) v = -32768;
     return (s16)v;
@@ -410,6 +412,7 @@ void I_InitSound(boolean use_sfx_prefix) {
     for (int i = 0; i < NCHANNELS; i++)
         channels[i].active = channels[i].releasing = channels[i].fade = 0;
     init_music_tables();
+    g_mus_lpf = 0;
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
@@ -530,6 +533,7 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 
 void I_InitMusic(void) {
     init_music_tables();
+    g_mus_lpf = 0;
     log_str("I_InitMusic done");
 }
 
