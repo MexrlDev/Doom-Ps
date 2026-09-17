@@ -808,4 +808,68 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
                              SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
-    if (c->
+    if (c->mmap_fn) {
+        c->ring = (u8 *)NC(c->G, c->mmap_fn, 0,
+                           (u64)(RING_SLOTS * RING_BYTES), 3, 0x1002,
+                           (u64)-1, 0);
+        if ((s64)c->ring == -1) c->ring = 0;
+    }
+    udp_log(c->audio_h >= 0 ? "DoomPS: [34] audio up\n"
+                            : "DoomPS: [34] audio N/A\n");
+    ext->step = 34;
+
+    if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
+    if (c->pad_geth)
+        c->pad_h = (s32)NC(c->G, c->pad_geth,
+                           (u64)c->user_id, 0, 0, 0, 0, 0);
+    udp_log("DoomPS: [35] pad query done\n"); ext->step = 35;
+
+    s32 tcp_listen_fd = (s32)ext->dbg[0];
+    udp_log("DoomPS: [36] entering recv_wad\n"); ext->step = 36;
+
+    int wad_ok = (recv_wad(tcp_listen_fd) == 0);
+    if (!wad_ok) {
+        udp_log("DoomPS: WAD recv failed\n");
+        show_error_and_hang(c, "WAD transfer failed",
+                            "Check PC->console TCP connectivity");
+    }
+    {
+        s32 check = (s32)NC(c->G, c->kopen, (u64)c->wad_path,
+                            (u64)0x0000, 0, 0, 0, 0);
+        if (check < 0) {
+            udp_log("DoomPS: WAD verify failed\n");
+            show_error_and_hang(c, "WAD missing after transfer",
+                                c->wad_path);
+        }
+        NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
+    }
+    udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
+
+    static const char arg0[] = "doom";
+    static const char arg1[] = "-iwad";
+    const char *argv[4];
+    argv[0] = arg0;
+    argv[1] = arg1;
+    argv[2] = c->wad_path;
+    argv[3] = (char *)0;
+
+    udp_log("DoomPS: [38] doomgeneric_Create\n"); ext->step = 38;
+    doomgeneric_Create(3, (char **)argv);
+
+    udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
+    udp_log("DoomPS: entering tick loop\n");
+    while (1) {
+        doomgeneric_Tick();
+        c->ext->frame_count = c->total_frames;
+    }
+
+    udp_log("DoomPS: exit\n");
+    if (c->aud_close && c->audio_h >= 0)
+        NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
+    if (c->vid_close && c->video_h >= 0)
+        NC(c->G, c->vid_close, (u64)c->video_h, 0,0,0,0,0);
+    if (c->delete_eq && c->eq)
+        NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
+    ext->status = 0;
+    ext->step   = 99;
+}
