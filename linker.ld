@@ -15,15 +15,23 @@ SECTIONS
         *(.text._start)
         *(.text)
         *(.text.*)
+
         *(.rodata)
         *(.rodata.*)
+
         *(.data)
         *(.data.*)
+        *(.data.rel)
+        *(.data.rel.*)
+        *(.data.rel.ro)
+        *(.data.rel.ro.*)
 
-        /* BSS is kept INSIDE .text (not NOLOAD) so the file stays
-         * around 628 KB — the console-side Lua launcher has a hard
-         * minimum of ~623 KB and rejects anything smaller.
-         * The bytes are zeros in the file, so globals start zeroed. */
+        /* GOT tables — needed by -fpie code */
+        *(.got)
+        *(.got.plt)
+
+        /* BSS inside .text so file stays ~628 KB.
+         * Bytes are zeros; _start zeroes it again harmlessly. */
         __bss_start = .;
         *(.bss)
         *(.bss.*)
@@ -31,14 +39,11 @@ SECTIONS
         __bss_end = .;
     } :text
 
-    /* ------------------------------------------------------------------
-     * .rela_out — holds the ELF relocation table emitted by -pie.
-     *
-     * At runtime, _start walks __rela_start..__rela_end and adds the
-     * load base to every R_X86_64_RELATIVE entry.  This fixes absolute
-     * pointers stored in .data (like `defaults[].location = &screenblocks`)
-     * which the linker resolved to small offsets from 0.
-     * ------------------------------------------------------------------ */
+    /* ------------------------------------------------------------
+     * .rela_out — holds the ELF relocation table.
+     * _start walks __rela_start..__rela_end and applies load_base
+     * to every R_X86_64_RELATIVE entry.
+     * ------------------------------------------------------------ */
     .rela_out : {
         __rela_start = .;
         *(.rela.dyn)
@@ -47,29 +52,33 @@ SECTIONS
         *(.rela.text.*)
         *(.rela.data)
         *(.rela.data.*)
+        *(.rela.data.rel)
+        *(.rela.data.rel.*)
         *(.rela.rodata)
         *(.rela.rodata.*)
         *(.rela.bss)
         *(.rela.bss.*)
+        *(.rela.got)
+        *(.rela.got.*)
         *(.rela.init_array)
         *(.rela.fini_array)
-        *(.rela.plt)
-        *(.rela.got)
         __rela_end = .;
     } :text
 
+    /* Safe to discard */
     /DISCARD/ : {
         *(.comment)
         *(.note.*)
-        *(.eh_frame*)
-        *(.got)
-        *(.got.plt)
+        *(.eh_frame)
+        *(.eh_frame.*)
         *(.interp)
         *(.dynsym)
         *(.dynstr)
         *(.dynamic)
         *(.gnu.hash)
-        *(.gnu.version*)
+        *(.gnu.version)
+        *(.gnu.version_d)
+        *(.gnu.version_r)
         *(.plt)
         *(.plt.*)
     }
