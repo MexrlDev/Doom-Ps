@@ -1,17 +1,14 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v17:
- *   - CRITICAL: SFX playback rate.  Doom's DMX lumps are 11025 Hz,
- *     but ch->step was 1<<16 = "1 input sample per output sample".
- *     At 48000 Hz output, that's a 4.35x speedup (chipmunk + fast).
- *     Now step = (11025 << 16) / SAMPLE_RATE  →  15052.
- *   - Music volume conversion: Doom sends 0-120 to I_SetMusicVolume
- *     (its menu value 0-15 is pre-multiplied by 8).  Was dividing by
- *     64; now /120 so default 8 stays 8/15 and slider max 120 → 15.
- *   - MUSIC_AMPL 32 → 48 (50% louder).
- *   - Event logging 40 → 100, note logging 30 → 200.
- *   - One-pole LPF, soft clip, T=6 spurious skip retained.
+ * v18:
+ *   - MUS parser rewritten for "packed 3-byte event" format used by
+ *     Doom's WAD musics.  Each event is [byte][data][data] with no
+ *     inter-event delay byte.  Events fire 2 ticks apart.
+ *   - MUSIC_AMPL 48 → 72 (50% louder).
+ *   - SFX_HEADROOM 4 (unchanged), OUT_BOOST 1.
+ *   - Kept: one-pole LPF on music, soft-clip limiter, DMX 11025 Hz
+ *     step for SFX.
  */
 
 #include <stdio.h>
@@ -40,21 +37,20 @@ int snd_sfxvolume   = 8;
 #define NCHANNELS           16
 #define MIXBUF              512
 #define MUSIC_MAX_NOTES     24
-#define MUS_TICKS_PER_SEC   140
-#define MUS_DEFAULT_TICK_US (1000000 / MUS_TICKS_PER_SEC)
 
-/* SFX headroom: 4 → 4 concurrent full-volume sounds fit under ±32767. */
 #define SFX_HEADROOM   4
+#define MUSIC_AMPL     72
 
-/* Music: typical 4-voice chord at vel 64 → mix=256.  × 48 × vol/15. */
-#define MUSIC_AMPL     48
-
-/* DMX sample rate for Doom SFX lumps (dsXXX).  Output is 48000. */
 #define DMX_SAMPLE_RATE 11025
 
 #define FADE_MAX       1024
 #define FADE_STEP_IN   6
 #define FADE_STEP_OUT  3
+
+/* MUS packed-event scheduling.  Each event fires this many ticks after
+ * the previous.  2 ticks ≈ 14 ms, roughly matching Doom's actual DMX
+ * event density for level musics. */
+#define MUS_TICKS_PER_EVENT 2
 
 static int dbg_submit = 0;
 static int dbg_tick   = 0;
@@ -98,19 +94,15 @@ typedef struct { unsigned char *data; int len; int is_mus; } song_t;
 
 static music_note_t mus_notes[MUSIC_MAX_NOTES];
 
-static unsigned char *mus_data   = 0;
-static int      mus_len          = 0;
-static int      mus_pos          = 0;
-static int      mus_track_start  = 0;
-static int      mus_track_end    = 0;
-static int      mus_loop         = 0;
-static int      mus_playing      = 0;
-static int      mus_end_of_track = 0;
-static int      mus_is_mus       = 0;
-static int      mus_us_per_tick  = MUS_DEFAULT_TICK_US;
-static int      mus_sample_acc   = 0;
-static unsigned mus_current_tick    = 0;
-static unsigned mus_next_event_tick = 0;
+static unsigned char *mus_data     = 0;
+static int      mus_len            = 0;
+static int      mus_pos            = 0;
+static int      mus_track_start    = 0;
+static int      mus_track_end      = 0;
+static int      mus_loop           = 0;
+static int      mus_playing        = 0;
+static int      mus_is_mus         = 0;
+static int      mus_next_event_tick = 0;
 
 static unsigned int note_phase_inc_table[128];
 
@@ -183,188 +175,105 @@ static void music_all_notes_off(void) {
         mus_notes[i].active = mus_notes[i].releasing = 0;
 }
 
-static int mus_read_varlen(void) {
-    int v = 0;
-    for (int i = 0; i < 4 && mus_pos < mus_track_end; i++) {
-        unsigned char b = mus_data[mus_pos++];
-        v = (v << 7) | (b & 0x7F);
-        if (!(b & 0x80)) break;
-    }
-    return v;
-}
-
-/* 64-byte hex dump.  Buffer must be >= 9 + 64*3 + 2 = 203 bytes. */
-static void dump_score_bytes(void) {
-    char b[320]; int p = 0;
-    const char *pre = "M: hdr64:";
-    while (*pre && p < 32) b[p++] = *pre++;
-    const char h[] = "0123456789ABCDEF";
-    for (int i = 0; i < 64 && (mus_track_start + i) < mus_track_end; i++) {
-        if (p >= 315) break;
-        b[p++] = ' ';
-        unsigned char c = mus_data[mus_track_start + i];
-        b[p++] = h[(c >> 4) & 0xF];
-        b[p++] = h[c & 0xF];
-    }
-    b[p++] = '\n'; b[p] = 0;
-    ps_sound_log(b);
-}
-
-static void mus_process_tick(void) {
-    if (!mus_playing) return;
-
-    dbg_tick++;
-    if (dbg_tick == 1 || dbg_tick == 1000 || dbg_tick == 5000) {
-        log_num("M: tick #", dbg_tick, "");
-    }
-
-    if (mus_end_of_track) {
+/* 3-byte event reader.  Each event = 1 header byte + 2 data bytes. */
+static void mus_process_event(void) {
+    if (mus_pos + 2 >= mus_track_end) {
         if (mus_loop) {
             log_str("M: loop restart");
-            mus_pos             = mus_track_start;
-            mus_current_tick    = 0;
-            mus_sample_acc      = 0;
-            mus_end_of_track    = 0;
+            mus_pos = mus_track_start;
             music_all_notes_off();
-            mus_next_event_tick = (unsigned)mus_read_varlen();
+            g_mus_lpf = 0;
+            mus_next_event_tick = MUS_TICKS_PER_EVENT;
         } else {
-            log_str("M: END (once)");
+            log_str("M: END");
             mus_playing = 0;
             music_all_notes_off();
         }
         return;
     }
 
-    while (!mus_end_of_track && mus_current_tick >= mus_next_event_tick) {
-        if (mus_pos >= mus_track_end) {
-            mus_end_of_track = 1;
-            break;
-        }
+    unsigned char ev = mus_data[mus_pos];
+    unsigned char d1 = mus_data[mus_pos + 1];
+    unsigned char d2 = mus_data[mus_pos + 2];
+    mus_pos += 3;
 
-        unsigned char ev = mus_data[mus_pos++];
-        int type = (ev >> 4) & 0x07;
-        int chan = ev & 0x0F;
+    int type = (ev >> 4) & 0x07;
+    int chan = ev & 0x0F;
 
-        dbg_event++;
-        if (dbg_event <= 100) {
-            log_num("M: ev #", dbg_event, "");
-            log_num("M: ev T=", type, "");
-            log_num("M: ev C=", chan, "");
-        }
-
-        switch (type) {
-        case 0:
-            if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
-            music_note_off_chan(chan, mus_data[mus_pos++]);
-            break;
-        case 1:
-            if (mus_pos + 1 >= mus_track_end) { mus_end_of_track = 1; break; }
-            {
-                int note = mus_data[mus_pos++];
-                int vel  = mus_data[mus_pos++];
-                if (vel == 0) music_note_off_chan(chan, note);
-                else          music_note_on(note, vel, chan);
-            }
-            break;
-        case 2:
-            if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
-            mus_pos++;
-            break;
-        case 3:
-            if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
-            mus_pos++;
-            break;
-        case 4:
-            if (mus_pos + 1 >= mus_track_end) { mus_end_of_track = 1; break; }
-            mus_pos += 2;
-            break;
-        case 6:
-            if (mus_pos + 100 < mus_track_end) {
-                log_str("M: skip spurious T=6");
-            } else {
-                mus_end_of_track = 1;
-            }
-            break;
-        default:
-            mus_end_of_track = 1;
-            break;
-        }
-        if (mus_end_of_track) break;
-
-        if (mus_pos < mus_track_end) {
-            int delay = mus_read_varlen();
-            mus_next_event_tick = mus_current_tick + (unsigned)delay;
-        } else {
-            mus_end_of_track = 1;
-        }
+    dbg_event++;
+    if (dbg_event <= 100) {
+        log_num("M: ev #", dbg_event, "");
+        log_num("M: ev T=", type, "");
+        log_num("M: ev C=", chan, "");
     }
 
-    mus_current_tick++;
+    switch (type) {
+    case 0: music_note_off_chan(chan, d1); break;
+    case 1: music_note_on(d1 & 0x7F, d2 ? d2 : 64, chan); break;
+    case 2: break;                               /* pitch bend — ignored */
+    case 3: break;                               /* system event — ignored */
+    case 4: break;                               /* controller — ignored */
+    case 6: break;                               /* embedded score-end — skip */
+    default: break;
+    }
 }
 
 static void mus_parse_header(void) {
-    mus_end_of_track    = 0;
-    mus_current_tick    = 0;
-    mus_next_event_tick = 0;
-    mus_sample_acc      = 0;
+    mus_pos = mus_track_start;
     music_all_notes_off();
+    g_mus_lpf = 0;
 
-    if (!mus_data || mus_len < 16) { mus_end_of_track = 1; return; }
+    if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
         mus_data[2] != 'S' || mus_data[3] != 0x1A) {
         log_str("Music: bad MUS magic");
-        mus_end_of_track = 1;
+        mus_playing = 0;
         return;
     }
 
-    int score_len   = mus_data[4]  | (mus_data[5]  << 8);
-    int score_start = mus_data[6]  | (mus_data[7]  << 8);
-    log_num("M: lump_len=", mus_len, "");
-    log_num("M: score_len=", score_len, "");
+    int score_start = mus_data[6] | (mus_data[7] << 8);
     log_num("M: score_start=", score_start, "");
-    log_num("M: prim_ch=", mus_data[8] | (mus_data[9] << 8), "");
-    log_num("M: sec_ch=", mus_data[10] | (mus_data[11] << 8), "");
-    log_num("M: inst=", mus_data[12] | (mus_data[13] << 8), "");
+    log_num("M: len=", mus_len, "");
 
     if (score_start < 16 || score_start >= mus_len) {
         log_str("Music: bad MUS score offset");
-        mus_end_of_track = 1;
+        mus_playing = 0;
         return;
     }
 
-    mus_track_start = score_start;
-    mus_track_end   = mus_len;
-    mus_pos         = score_start;
-    mus_next_event_tick = (unsigned)mus_read_varlen();
-    log_num("M: first delay=", (int)mus_next_event_tick, "");
+    mus_track_start    = score_start;
+    mus_track_end      = mus_len;
+    mus_pos            = score_start;
+    mus_next_event_tick = MUS_TICKS_PER_EVENT;
 
-    dump_score_bytes();
     log_str("Music: MUS loaded");
 }
-
-static void midi_process_tick(void) { mus_end_of_track = 1; }
 
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
+    int us_per_tick = 1000000 / 140;   /* 140 Hz DMX tick */
     int us_per_sample = 1000000 / SAMPLE_RATE;
     if (us_per_sample < 1) us_per_sample = 1;
 
     int vol = snd_musicvolume;
     if (vol < 0)   vol = 0;
-    /* Doom menu value 0-15 is pre-multiplied by 8 before reaching
-     * I_SetMusicVolume.  Normalize 0-120 → 0-15. */
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
+    static int tick_acc = 0;
+
     for (int i = 0; i < frames; i++) {
         if (mus_playing) {
-            mus_sample_acc += us_per_sample;
-            while (mus_sample_acc >= mus_us_per_tick) {
-                mus_sample_acc -= mus_us_per_tick;
-                if (mus_is_mus) mus_process_tick();
-                else            midi_process_tick();
-                if (!mus_playing) break;
+            tick_acc += us_per_sample;
+            while (tick_acc >= us_per_tick) {
+                tick_acc -= us_per_tick;
+                mus_next_event_tick--;
+                if (mus_next_event_tick <= 0) {
+                    mus_process_event();
+                    if (!mus_playing) break;
+                    mus_next_event_tick = MUS_TICKS_PER_EVENT;
+                }
             }
         }
         if (!mus_playing) break;
@@ -508,7 +417,6 @@ int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
     channel_t *ch = &channels[channel];
     ch->active = 1; ch->releasing = 0; ch->fade = 0;
     ch->volume = vol; ch->pan = sep;
-    /* DMX lumps are 11025 Hz; output is SAMPLE_RATE Hz.  step is 16.16. */
     ch->step   = (DMX_SAMPLE_RATE << 16) / SAMPLE_RATE;
     ch->pos    = 0;
     ch->data   = samples;
@@ -595,13 +503,17 @@ void I_UnRegisterSong(void *handle) { (void)handle; }
 void I_PlaySong(void *handle, boolean looping) {
     song_t *s = (song_t *)handle;
     if (!s) { log_str("Music: PlaySong NULL"); return; }
-    mus_data = s->data; mus_len = s->len; mus_loop = looping ? 1 : 0;
+    mus_data   = s->data;
+    mus_len    = s->len;
+    mus_loop   = looping ? 1 : 0;
     mus_is_mus = s->is_mus;
     if (mus_is_mus == -1) { log_str("Music: unsupported format"); return; }
-    if (!mus_is_mus)      { log_str("Music: MIDI not supported"); return; }
 
     mus_parse_header();
-    if (mus_end_of_track) { log_str("Music: parse failed"); return; }
+    if (!mus_playing && mus_pos >= mus_track_end) {
+        log_str("Music: parse failed");
+        return;
+    }
 
     mus_playing = 1;
     log_str(looping ? "Music: playing (loop)" : "Music: playing once");
