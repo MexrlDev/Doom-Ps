@@ -1,16 +1,14 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v5: fopen logs path BEFORE kopen (so a hang is diagnosable).
- *     strdup bounded to 4096 bytes to avoid infinite scan.
- *     printf/puts/exit log their args to UDP so we can see doom's
- *     own error messages in the iPhone log.
+ * v6: putchar/fputc/fputs SILENT (doom spams them per-char, dropping UDP logs).
+ *     malloc logs first 64 allocations so we see the sequence.
+ *     fopen logs path BEFORE kopen.
  */
 
 #include "core.h"
 #include <stddef.h>
 
-/* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
 static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
@@ -114,17 +112,28 @@ static void pool_init(void) {
     ps_libc_log("ps_libc: POOL_INIT FAILED - no memory\n");
 }
 
-static int __first_malloc_logged = 0;
+static int __malloc_count = 0;
 
 void *malloc(size_t size) {
     if (!__pool) {
         pool_init();
         if (!__pool) return 0;
     }
-    if (!__first_malloc_logged) {
-        __first_malloc_logged = 1;
-        log_hex("ps_libc: first malloc size=", (u64)size);
-        log_hex("ps_libc: pool size=", (u64)__pool_size);
+    if (__malloc_count < 64) {
+        int n = __malloc_count++;
+        char b[80]; int p = 0;
+        const char *pre = "ps_libc: malloc #";
+        while (*pre) b[p++] = *pre++;
+        if (n >= 10) b[p++] = '0' + (n / 10) % 10;
+        b[p++] = '0' + n % 10;
+        b[p++] = ' '; b[p++] = 's'; b[p++] = 'i'; b[p++] = 'z'; b[p++] = 'e';
+        b[p++] = '=';
+        b[p++] = '0'; b[p++] = 'x';
+        const char h[] = "0123456789ABCDEF";
+        u32 v = (u32)size;
+        for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
+        b[p++] = '\n'; b[p] = 0;
+        ps_libc_log(b);
     }
     size = (size + 15) & ~(size_t)15;
     if (__pool_used + size > __pool_size) {
@@ -248,15 +257,13 @@ static int __strdup_count = 0;
 
 char *strdup(const char *s) {
     if (!s) return 0;
-
     size_t len = 0;
     while (len < 4096 && s[len]) len++;
     if (len >= 4096) {
         ps_libc_log("ps_libc: strdup: NO NULL in 4096 bytes\n");
         return 0;
     }
-
-    if (__strdup_count < 60) {
+    if (__strdup_count < 32) {
         __strdup_count++;
         char b[160]; int p = 0;
         const char *pre = "ps_libc: strdup(\"";
@@ -265,7 +272,6 @@ char *strdup(const char *s) {
         b[p++] = '"'; b[p++] = ')'; b[p++] = '\n'; b[p] = 0;
         ps_libc_log(b);
     }
-
     char *p = (char *)malloc(len + 1);
     if (p) {
         for (size_t k = 0; k < len; k++) p[k] = s[k];
@@ -382,7 +388,6 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
     return 0;
 }
 
-/* ===== errno ===== */
 static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
 
@@ -414,11 +419,10 @@ static FILE *alloc_slot(void) {
 
 static int __fopen_count = 0;
 
-/* === v5: LOG THE PATH BEFORE kopen — so a hang is diagnosable === */
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
 
-    if (__fopen_count < 32) {
+    if (__fopen_count < 64) {
         __fopen_count++;
         char b[240]; int p = 0;
         const char *pre = "ps_libc: fopen ENTRY path=\"";
@@ -439,7 +443,7 @@ FILE *fopen(const char *path, const char *mode) {
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
 
-    if (__fopen_count <= 32) {
+    if (__fopen_count <= 64) {
         char b[80]; int p = 0;
         const char *pre = "ps_libc: fopen fd=0x";
         while (*pre && p < 24) b[p++] = *pre++;
@@ -540,6 +544,7 @@ int mkdir(const char *path, unsigned int mode) {
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
+/* printf family — logs FORMAT STRING only */
 int printf(const char *fmt, ...) {
     if (fmt) { ps_libc_log("[stdout] "); ps_libc_log(fmt); ps_libc_log("\n"); }
     return 0;
@@ -587,19 +592,16 @@ int puts(const char *s) {
     if (s) { ps_libc_log("[puts] "); ps_libc_log(s); ps_libc_log("\n"); }
     return 0;
 }
-int putchar(int c) {
-    char b[3]; b[0] = (char)c; b[1] = 0; b[2] = 0;
-    ps_libc_log("[putchar] ");
-    ps_libc_log(b);
-    ps_libc_log("\n");
-    return c;
-}
-int fputs(const char *s, FILE *f) {
-    (void)f;
-    if (s) { ps_libc_log("[fputs] "); ps_libc_log(s); ps_libc_log("\n"); }
-    return 0;
-}
-int fputc(int c, FILE *f)        { (void)f; (void)c; return c; }
+
+/* ============================================================
+ * putchar / fputc / fputs — SILENT.
+ * Doom spams these per character, which floods UDP and drops
+ * the important log lines.  We just return the input char.
+ * ============================================================ */
+int putchar(int c)               { return c; }
+int fputc(int c, FILE *f)        { (void)f; return c; }
+int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
+
 int fgetc(FILE *f)               { (void)f; return -1; }
 int getc(FILE *f)                { (void)f; return -1; }
 int ungetc(int c, FILE *f)       { (void)f; return c; }
