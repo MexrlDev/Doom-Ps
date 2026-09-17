@@ -1,22 +1,26 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v8:
- *   - SFX mixed in an int32 accumulator (was int16 per-sample,
- *     clipped badly with 3+ overlapping sounds → the "cutting"
- *     heard on rapid fire).
- *   - Soft-clip limiter on the final mix: loud passages compress
- *     smoothly instead of hard-clipping.
- *   - Per-channel fade envelope on SFX (256-sample attack + release,
- *     ~5 ms @ 48 kHz) so retriggered channels don't click.
- *   - MUS format support (Doom WAD lumps are MUS, not MIDI).
- *   - Diagnostic: log first 4 bytes of every registered song so we
- *     can prove the format is being detected.
+ * v9:
+ *   - Music amplitude raised from ×4 to ×32.  Previous level was ~270
+ *     peak per voice (≈ -41 dBFS) — technically playing but completely
+ *     inaudible next to a single gunshot at ±32512.  Now ~2160 peak
+ *     per voice at default music volume, and the soft-clip gives
+ *     headroom for 8 concurrent voices.
+ *   - SFX amplitude divided by 4 to leave headroom so 4 simultaneous
+ *     sounds don't hard-clip into each other (the "cutting").
+ *   - Two-stage soft-clip: gentle compression above 16384, firmer
+ *     above 24576, hard limit at 32767.  Loud passages compress
+ *     smoothly instead of garbling.
+ *   - Longer SFX envelopes: 2 ms fade-in, 5 ms fade-out.
+ *   - Diagnostic: log the first 20 note-on events with note number and
+ *     velocity, so we can confirm music events are firing.
+ *   - MUS + MIDI parsing unchanged (already working per your log).
  *
- * If your UDP log still shows "Music: registered song" after this
- * build, the linker did NOT pick up this file — run
+ * After replacing, you MUST run:
  *     make clean && make
- * and re-deploy doom_ps.bin.
+ * If the new .bin is the same size as before, the linker reused the
+ * cached object file and none of this shipped.
  */
 
 #include <stdio.h>
@@ -45,35 +49,48 @@ int snd_sfxdevice   = 0;
 int snd_musicvolume = 8;   /* 0..15 */
 int snd_sfxvolume   = 8;
 
-#define NCHANNELS          16
-#define MIXBUF             512
-#define MUSIC_MAX_NOTES    24
-#define MUS_TICKS_PER_SEC  140
+#define NCHANNELS           16
+#define MIXBUF              512
+#define MUSIC_MAX_NOTES     24
+#define MUS_TICKS_PER_SEC   140
 #define MUS_DEFAULT_TICK_US (1000000 / MUS_TICKS_PER_SEC)   /* ~7143 us */
 
-#define FADE_MAX           256      /* 256 samples @ 48 kHz ≈ 5.3 ms */
-#define FADE_STEP          2
+/* --- Amplitude balancing -------------------------------------
+ * Single gunshot at vol 127 is ±32512 (full int16).  We divide SFX
+ * by this so four simultaneous sounds fit under ±32767 with no
+ * clipping.
+ * Music is built from 24 voices × ±127 = ±3048 max.  We multiply by
+ * 32 so a typical 4-voice chord lands around ±13000, comparable to
+ * a mid-volume SFX.  Soft-clip handles the extremes.            */
+#define SFX_HEADROOM   4
+#define MUSIC_AMPL     32
+
+/* SFX envelope — fade in/out over a few ms to kill clicks.
+ * 128 steps @ 48 kHz ≈ 2.7 ms per step, so attack reaches full in
+ * ~128 samples (2.7 ms) and release ends in ~128 samples.        */
+#define FADE_MAX       1024
+#define FADE_STEP_IN   8
+#define FADE_STEP_OUT  4
 
 /* ============================================================
  * SFX channel
  * ============================================================ */
 typedef struct {
     int active;
-    int releasing;      /* 1 = fading out, will stop */
-    int volume;         /* 0..127 */
-    int pan;            /* 0..255, 128 = center */
-    int step;           /* 16.16 sample-position increment */
-    int pos;            /* 16.16 sample position */
+    int releasing;
+    int volume;
+    int pan;
+    int step;
+    int pos;
     const unsigned char *data;
     int length;
-    int fade;           /* 0..FADE_MAX amplitude envelope */
+    int fade;
 } channel_t;
 
 static channel_t channels[NCHANNELS];
 
-/* Int32 mix accumulator. All SFX + music summed here, then soft-clipped
- * into a short buffer at the end. This is the key fix for the clipping. */
-static s32 mix_accum[MIXBUF * 2];
+/* Accumulator: int32 so simultaneous sources never overflow. */
+static s32   mix_accum[MIXBUF * 2];
 static short mix_final[MIXBUF * 2];
 
 /* ============================================================
@@ -81,19 +98,19 @@ static short mix_final[MIXBUF * 2];
  * ============================================================ */
 typedef struct {
     int active;
-    int note;               /* 0..127 */
-    int channel;            /* 0..15 */
-    int releasing;          /* 1 = fade out */
-    unsigned int phase;     /* 32-bit, MSB = square state */
+    int note;
+    int channel;
+    int releasing;
+    unsigned int phase;
     unsigned int phase_inc;
-    int env;                /* current amplitude 0..127 */
+    int env;
     int env_target;
 } music_note_t;
 
 typedef struct {
     unsigned char *data;
     int len;
-    int is_mus;             /* 1 = MUS, 0 = MIDI, -1 = unknown */
+    int is_mus;
 } song_t;
 
 static music_note_t mus_notes[MUSIC_MAX_NOTES];
@@ -112,12 +129,13 @@ static int      mus_sample_acc   = 0;
 static unsigned mus_current_tick    = 0;
 static unsigned mus_next_event_tick = 0;
 static unsigned char mus_running_status = 0;
-static unsigned char mus_channel_vol[16];
-static unsigned char mus_channel_prog[16];
 
 static unsigned int note_phase_inc_table[128];
 
-/* 32-bit phase increment: freq * 2^32 / SAMPLE_RATE */
+/* 32-bit phase increment: freq * 2^32 / SAMPLE_RATE.
+ * The square wave reads bit 31 of the phase, so this gives the
+ * correct audible pitch.  (An earlier version used 16.16 increments
+ * here, which made every note ~65000× too low — a sub-Hz rumble.) */
 static void init_music_tables(void) {
     const double k    = 4294967296.0 / (double)SAMPLE_RATE;
     const double semi = 1.0594630943592953;
@@ -136,6 +154,8 @@ static void init_music_tables(void) {
 /* ============================================================
  * Music voice allocation
  * ============================================================ */
+static int note_on_log_count = 0;
+
 static void music_note_off_chan(int chan, int note) {
     for (int i = 0; i < MUSIC_MAX_NOTES; i++) {
         if (mus_notes[i].active && !mus_notes[i].releasing &&
@@ -151,6 +171,22 @@ static void music_note_on(int note, int vel, int chan) {
     if (vel <= 0) { music_note_off_chan(chan, note); return; }
     if (vel > 127)  vel = 127;
 
+    if (note_on_log_count < 20) {
+        note_on_log_count++;
+        char b[40]; int p = 0;
+        const char *pre = "M:note ";
+        while (*pre) b[p++] = *pre++;
+        b[p++] = '0' + (note / 10) % 10;
+        b[p++] = '0' + note % 10;
+        b[p++] = ' ';
+        b[p++] = 'v';
+        b[p++] = '0' + (vel / 100) % 10;
+        b[p++] = '0' + (vel / 10) % 10;
+        b[p++] = '0' + vel % 10;
+        b[p++] = '\n'; b[p] = 0;
+        ps_sound_log(b);
+    }
+
     int slot = -1, free_slot = -1, releasing_slot = -1;
     for (int i = 0; i < MUSIC_MAX_NOTES; i++) {
         if (mus_notes[i].active &&
@@ -165,7 +201,6 @@ static void music_note_on(int note, int vel, int chan) {
         if      (free_slot      >= 0) slot = free_slot;
         else if (releasing_slot >= 0) slot = releasing_slot;
         else {
-            /* steal the quietest voice */
             slot = 0;
             int best = 0x7FFFFFFF;
             for (int i = 0; i < MUSIC_MAX_NOTES; i++) {
@@ -183,7 +218,7 @@ static void music_note_on(int note, int vel, int chan) {
     mus_notes[slot].releasing  = 0;
     mus_notes[slot].phase      = 0;
     mus_notes[slot].phase_inc  = note_phase_inc_table[note];
-    mus_notes[slot].env        = 0;       /* fade-in from silence */
+    mus_notes[slot].env        = 0;
     mus_notes[slot].env_target = vel;
 }
 
@@ -234,12 +269,11 @@ static void mus_process_tick(void) {
         int chan = ev & 0x0F;
 
         switch (type) {
-        case 0:                         /* Release note */
+        case 0:
             if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
             music_note_off_chan(chan, mus_data[mus_pos++]);
             break;
-
-        case 1: {                       /* Play note */
+        case 1: {
             if (mus_pos + 1 >= mus_track_end) {
                 mus_end_of_track = 1; break;
             }
@@ -249,32 +283,23 @@ static void mus_process_tick(void) {
             else          music_note_on(note, vel, chan);
             break;
         }
-
-        case 2:                         /* Pitch bend — ignored */
+        case 2:
             if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
             mus_pos++;
             break;
-
-        case 3:                         /* System event — ignored */
+        case 3:
             if (mus_pos >= mus_track_end) { mus_end_of_track = 1; break; }
             mus_pos++;
             break;
-
-        case 4: {                       /* Controller change */
+        case 4:
             if (mus_pos + 1 >= mus_track_end) {
                 mus_end_of_track = 1; break;
             }
-            int ctrl = mus_data[mus_pos++];
-            int val  = mus_data[mus_pos++];
-            if      (ctrl == 0) mus_channel_prog[chan] = (unsigned char)val;
-            else if (ctrl == 3) mus_channel_vol[chan]  = (unsigned char)val;
+            mus_pos += 2;
             break;
-        }
-
-        case 6:                         /* Score end */
+        case 6:
             mus_end_of_track = 1;
             break;
-
         default:
             mus_end_of_track = 1;
             break;
@@ -319,18 +344,13 @@ static void mus_parse_header(void) {
     mus_track_end   = mus_len;
     mus_pos         = score_start;
     mus_us_per_tick = MUS_DEFAULT_TICK_US;
-
-    for (int i = 0; i < 16; i++) {
-        mus_channel_vol[i]  = 127;
-        mus_channel_prog[i] = 0;
-    }
-
     mus_next_event_tick = (unsigned)mus_read_varlen();
+
     ps_sound_log("Music: MUS loaded");
 }
 
 /* ============================================================
- * MIDI fallback (custom WADs that ship real .mid data)
+ * MIDI fallback
  * ============================================================ */
 static int midi_read_varlen(void) {
     int v = 0;
@@ -344,27 +364,19 @@ static int midi_read_varlen(void) {
 
 static void midi_execute_event(void) {
     if (mus_pos >= mus_track_end) { mus_end_of_track = 1; return; }
-
     unsigned char status = mus_data[mus_pos];
-    if (status < 0x80) {
-        status = mus_running_status;
-    } else {
-        mus_pos++;
-        mus_running_status = status;
-    }
+    if (status < 0x80) status = mus_running_status;
+    else { mus_pos++; mus_running_status = status; }
     unsigned char type = status & 0xF0;
     int chan = status & 0x0F;
 
     switch (type) {
     case 0x80:
         if (mus_pos + 2 > mus_track_end) { mus_end_of_track = 1; return; }
-        music_note_off_chan(chan, mus_data[mus_pos]);
-        mus_pos += 2;
-        break;
+        music_note_off_chan(chan, mus_data[mus_pos]); mus_pos += 2; break;
     case 0x90: {
         if (mus_pos + 2 > mus_track_end) { mus_end_of_track = 1; return; }
-        int note = mus_data[mus_pos];
-        int vel  = mus_data[mus_pos + 1];
+        int note = mus_data[mus_pos], vel = mus_data[mus_pos + 1];
         mus_pos += 2;
         if (vel == 0) music_note_off_chan(chan, note);
         else          music_note_on(note, vel, chan);
@@ -372,12 +384,10 @@ static void midi_execute_event(void) {
     }
     case 0xA0: case 0xB0: case 0xE0:
         if (mus_pos + 2 > mus_track_end) { mus_end_of_track = 1; return; }
-        mus_pos += 2;
-        break;
+        mus_pos += 2; break;
     case 0xC0: case 0xD0:
         if (mus_pos + 1 > mus_track_end) { mus_end_of_track = 1; return; }
-        mus_pos += 1;
-        break;
+        mus_pos += 1; break;
     case 0xF0:
         if (status == 0xFF) {
             if (mus_pos + 1 > mus_track_end) { mus_end_of_track = 1; return; }
@@ -392,15 +402,12 @@ static void midi_execute_event(void) {
             if (mus_pos > mus_track_end) mus_pos = mus_track_end;
         }
         break;
-    default:
-        mus_end_of_track = 1;
-        break;
+    default: mus_end_of_track = 1; break;
     }
 }
 
 static void midi_process_tick(void) {
     if (!mus_playing) return;
-
     if (mus_end_of_track) {
         if (mus_loop) {
             mus_pos             = mus_track_start;
@@ -411,12 +418,10 @@ static void midi_process_tick(void) {
             music_all_notes_off();
             mus_next_event_tick = (unsigned)midi_read_varlen();
         } else {
-            mus_playing = 0;
-            music_all_notes_off();
+            mus_playing = 0; music_all_notes_off();
         }
         return;
     }
-
     while (!mus_end_of_track && mus_current_tick >= mus_next_event_tick) {
         midi_execute_event();
         if (mus_end_of_track) break;
@@ -431,21 +436,14 @@ static void midi_process_tick(void) {
 }
 
 static void midi_parse_header(void) {
-    mus_end_of_track    = 0;
-    mus_current_tick    = 0;
-    mus_next_event_tick = 0;
-    mus_running_status  = 0;
-    mus_sample_acc      = 0;
-    music_all_notes_off();
+    mus_end_of_track = 0; mus_current_tick = 0; mus_next_event_tick = 0;
+    mus_running_status = 0; mus_sample_acc = 0; music_all_notes_off();
 
     if (!mus_data || mus_len < 14) { mus_end_of_track = 1; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'T' ||
         mus_data[2] != 'h' || mus_data[3] != 'd') {
-        ps_sound_log("Music: bad MIDI magic");
-        mus_end_of_track = 1;
-        return;
+        mus_end_of_track = 1; return;
     }
-
     int ppqn = (mus_data[12] << 8) | mus_data[13];
     if (ppqn == 0 || ppqn > 0x7FFF) ppqn = 96;
     mus_us_per_tick = 500000 / ppqn;
@@ -470,12 +468,11 @@ static void midi_parse_header(void) {
                  | (mus_data[p+6] << 8)  |  mus_data[p+7];
         p += 8 + clen;
     }
-    ps_sound_log("Music: no MTrk");
     mus_end_of_track = 1;
 }
 
 /* ============================================================
- * Music render — adds into the int32 accumulator
+ * Music render — adds into int32 accumulator at MUSIC_AMPL×
  * ============================================================ */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
@@ -505,30 +502,62 @@ static void music_render_accum(s32 *accum, int frames) {
             if (!n->active) continue;
 
             if (n->releasing) {
-                n->env -= 4;
-                if (n->env <= 0) {
-                    n->env = 0;
-                    n->active = 0;
-                    continue;
-                }
+                n->env -= 6;
+                if (n->env <= 0) { n->env = 0; n->active = 0; continue; }
             } else if (n->env < n->env_target) {
-                n->env += 8;
+                n->env += 10;
                 if (n->env > n->env_target) n->env = n->env_target;
             }
 
+            /* 50% duty square wave — no DC offset, cheap, and the
+             * dominant harmonic content matches OPL2 closely enough
+             * for Doom's MUS tracks. */
             int sample = (n->phase & 0x80000000) ? -1 : 1;
             sample *= n->env;
             mix += sample;
             n->phase += n->phase_inc;
         }
 
-        /* 24 voices × 127 = 3048 peak; scale by 4 → up to 12192 per
-         * sample.  SFX then add on top; both go into int32 and the
-         * soft-clip at the end handles overflow. */
-        mix = mix * 4 * vol / 15;
+        /* Typical 4-voice chord at vel=100 → mix ≈ 400.
+         * 400 × 32 × 8 / 15 = 6826  — comparable to a mid-volume SFX,
+         * clearly audible under gunfire and explosions.  8 voices at
+         * full velocity → 1016 × 32 × 8/15 = 17340, well inside the
+         * soft-clip window. */
+        mix = mix * MUSIC_AMPL * vol / 15;
         accum[i * 2]     += mix;
         accum[i * 2 + 1] += mix;
     }
+}
+
+/* ============================================================
+ * Soft-clip limiter
+ *
+ *   |v| <= 16384  : linear (single sounds stay crisp)
+ *   16384 < |v| <= 24576 : gentle 2.5:1 knee
+ *   |v| > 24576   : firmer 4:1 knee
+ *   |v| > 32767   : hard limit as last resort
+ *
+ * With SFX divided by 4 and music at ×32, typical playback peaks
+ * under 24576 and never touches the hard limiter.  Only dozens of
+ * simultaneous sounds enter the compression zone, and there they
+ * squash smoothly instead of garbling.
+ * ============================================================ */
+static inline s16 soft_clip(s32 v) {
+    if (v > 16384) {
+        v = 16384 + (v - 16384) * 2 / 5;
+    }
+    if (v > 24576) {
+        v = 24576 + (v - 24576) / 4;
+    }
+    if (v > 32767)  v =  32767;
+    if (v < -16384) {
+        v = -16384 + (v + 16384) * 2 / 5;
+    }
+    if (v < -24576) {
+        v = -24576 + (v + 24576) / 4;
+    }
+    if (v < -32768) v = -32768;
+    return (s16)v;
 }
 
 /* ============================================================
@@ -544,7 +573,27 @@ void I_InitSound(boolean use_sfx_prefix) {
         channels[i].fade      = 0;
     }
     init_music_tables();
-    if (snd_musicdevice == 0) snd_musicdevice = 3;   /* General MIDI */
+    if (snd_musicdevice == 0) snd_musicdevice = 3;
+
+    /* Log the initial music volume so we can verify Doom isn't
+     * muting us via config file. */
+    char b[40]; int p = 0;
+    const char *m = "I_InitSound: musicvol=";
+    while (*m) b[p++] = *m++;
+    b[p++] = '0' + (snd_musicvolume / 10) % 10;
+    b[p++] = '0' + snd_musicvolume % 10;
+    b[p++] = ' ';
+    b[p++] = 's';
+    b[p++] = 'f';
+    b[p++] = 'x';
+    b[p++] = 'v';
+    b[p++] = 'o';
+    b[p++] = 'l';
+    b[p++] = '=';
+    b[p++] = '0' + (snd_sfxvolume / 10) % 10;
+    b[p++] = '0' + snd_sfxvolume % 10;
+    b[p++] = '\n'; b[p] = 0;
+    ps_sound_log(b);
     ps_sound_log("I_InitSound done");
 }
 
@@ -565,10 +614,9 @@ void I_SetSfxVolume(int volume) { (void)volume; }
 /* ------------------------------------------------------------
  * The main mixing function.
  *
- * All SFX are summed into an int32 accumulator with per-channel
- * fade envelopes.  Music is then added on top.  Finally a
- * soft-clip limiter compresses loud passages instead of hard-
- * clipping them.  This is the fix for the "cutting" on rapid fire.
+ * SFX go into int32 with SFX_HEADROOM headroom per channel and a
+ * short fade envelope.  Music adds on top at MUSIC_AMPL.  Final
+ * soft-clip limiter prevents any hard-clipping artifact.
  * ------------------------------------------------------------ */
 void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF * 2; i++) mix_accum[i] = 0;
@@ -591,23 +639,20 @@ void I_SubmitSound(void) {
             int idx = pos >> 16;
             if (idx >= length) { ch->active = 0; break; }
 
-            /* Envelope: fade up on attack, fade down on release.
-             * A 256-sample window is ~5 ms — short enough to feel
-             * instant, long enough to kill clicks. */
+            /* Fade envelope — 2 ms attack, 5 ms release at 48 kHz */
             if (releasing) {
-                fade -= FADE_STEP;
-                if (fade <= 0) {
-                    ch->active = 0;
-                    break;
-                }
+                fade -= FADE_STEP_OUT;
+                if (fade <= 0) { ch->active = 0; break; }
             } else if (fade < FADE_MAX) {
-                fade += FADE_STEP;
+                fade += FADE_STEP_IN;
                 if (fade > FADE_MAX) fade = FADE_MAX;
             }
 
-            int sample = ((int)data[idx] - 128) << 8;   /* ±32768 */
+            int sample = ((int)data[idx] - 128) << 8;
             sample = sample * fade / FADE_MAX;
             sample = sample * vol / 127;
+            /* Headroom so 4 simultaneous sounds fit under ±32767. */
+            sample /= SFX_HEADROOM;
 
             int lgain = 255 - pan;
             int rgain = pan;
@@ -623,20 +668,9 @@ void I_SubmitSound(void) {
     /* ---- Music ---- */
     music_render_accum(mix_accum, MIXBUF);
 
-    /* ---- Soft-clip limiter ----
-     * Below 3/4 full-scale: linear passthrough (single sounds stay
-     * loud and clean).  Above: 2:1 compression.  Anything still over
-     * gets hard-clipped as a last resort. */
+    /* ---- Limiter ---- */
     for (int i = 0; i < MIXBUF * 2; i++) {
-        int v = mix_accum[i];
-        if (v > 24576) {
-            v = 24576 + (v - 24576) / 2;
-            if (v > 32767) v = 32767;
-        } else if (v < -24576) {
-            v = -24576 + (v + 24576) / 2;
-            if (v < -32768) v = -32768;
-        }
-        mix_final[i] = (short)v;
+        mix_final[i] = soft_clip(mix_accum[i]);
     }
 
     dg_audio_callback(mix_final, MIXBUF);
@@ -663,7 +697,7 @@ int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
     channel_t *ch = &channels[channel];
     ch->active    = 1;
     ch->releasing = 0;
-    ch->fade      = 0;              /* ramps up, hides retrigger click */
+    ch->fade      = 0;
     ch->volume    = vol;
     ch->pan       = sep;
     ch->step      = 1 << 16;
@@ -675,8 +709,7 @@ int I_StartSound(sfxinfo_t *sfxinfo, int channel, int vol, int sep) {
 
 void I_StopSound(int channel) {
     if (channel < 0 || channel >= NCHANNELS) return;
-    /* Do NOT zero `active` — let the mixer fade it out so there's no
-     * click when Doom reuses the channel for the next gunshot. */
+    /* Fade out instead of cut — kills the click on channel reuse. */
     channels[channel].releasing = 1;
 }
 
@@ -693,8 +726,7 @@ void I_UpdateSoundParams(int channel, int vol, int sep) {
 }
 
 void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
-    (void)sounds;
-    (void)num_sounds;
+    (void)sounds; (void)num_sounds;
 }
 
 /* ============================================================
@@ -712,12 +744,18 @@ void I_ShutdownMusic(void) {
 
 void I_SetMusicVolume(int volume) {
     snd_musicvolume = volume;
+    char b[32]; int p = 0;
+    const char *m = "M:vol=";
+    while (*m) b[p++] = *m++;
+    b[p++] = '0' + (volume / 10) % 10;
+    b[p++] = '0' + volume % 10;
+    b[p++] = '\n'; b[p] = 0;
+    ps_sound_log(b);
 }
 
 void I_PauseSong(void) {
-    for (int i = 0; i < MUSIC_MAX_NOTES; i++) {
+    for (int i = 0; i < MUSIC_MAX_NOTES; i++)
         if (mus_notes[i].active) mus_notes[i].env = 0;
-    }
 }
 
 void I_ResumeSong(void) {}
@@ -730,10 +768,6 @@ void *I_RegisterSong(void *data, int len) {
     memcpy(s->data, data, len);
     s->len = len;
 
-    /* Diagnostic: log the first 4 magic bytes as hex.  If your log
-     * shows "Music: fmt=4D 55 53 1A" then you're on this build and the
-     * lump is MUS.  If it shows "Music: registered song" (no fmt line),
-     * the linker did not pick up this file — `make clean && make`. */
     if (len >= 4) {
         char b[40]; int p = 0;
         const char *pre = "Music: fmt=";
@@ -763,10 +797,7 @@ void *I_RegisterSong(void *data, int len) {
     return s;
 }
 
-void I_UnRegisterSong(void *handle) {
-    /* ps_libc malloc is a bump allocator — no free */
-    (void)handle;
-}
+void I_UnRegisterSong(void *handle) { (void)handle; }
 
 void I_PlaySong(void *handle, boolean looping) {
     song_t *s = (song_t *)handle;
@@ -800,10 +831,5 @@ void I_StopSong(void) {
     music_all_notes_off();
 }
 
-boolean I_IsSongPlaying(void) {
-    return mus_playing ? 1 : 0;
-}
-
-boolean I_MusicIsPlaying(void) {
-    return mus_playing ? 1 : 0;
-}
+boolean I_IsSongPlaying(void)  { return mus_playing ? 1 : 0; }
+boolean I_MusicIsPlaying(void) { return mus_playing ? 1 : 0; }
