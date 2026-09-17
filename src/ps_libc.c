@@ -1,14 +1,18 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v6: putchar/fputc/fputs SILENT (doom spams them per-char, dropping UDP logs).
- *     malloc logs first 64 allocations so we see the sequence.
- *     fopen logs path BEFORE kopen.
+ * v7: REAL vsnprintf implementation.
+ *   - Handles %s %d %i %u %x %X %c %p %% plus 'l'/'ll'/'h' length mods.
+ *   - printf/fprintf/vfprintf call vsnprintf into a buffer, then UDP log
+ *     the FORMATTED output so we can finally see Doom's real error messages.
+ *   - putchar/fputc/fputs remain silent (spam avoidance).
  */
 
 #include "core.h"
 #include <stddef.h>
+#include <stdarg.h>
 
+/* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
 static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
@@ -45,6 +49,290 @@ void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa) {
     __log_fd = log_fd;
     for (int i = 0; i < 16; i++) __log_sa[i] = log_sa[i];
     __log_ready = 1;
+}
+
+/* ============================================================
+ * vsnprintf engine — supports the specifiers Doom actually uses.
+ * ============================================================ */
+
+typedef struct {
+    char *buf;
+    size_t cap;   /* max bytes we may write incl. NUL */
+    size_t pos;   /* current logical length (may exceed cap) */
+    int    ovf;   /* set if pos >= cap */
+} _out;
+
+static void _putc(_out *o, char c) {
+    if (o->pos + 1 < o->cap) {
+        o->buf[o->pos] = c;
+    } else {
+        o->ovf = 1;
+    }
+    o->pos++;
+}
+
+static void _puts(_out *o, const char *s) {
+    if (!s) s = "(null)";
+    while (*s) _putc(o, *s++);
+}
+
+/* unsigned integer in base 10 or 16 */
+static void _putu(_out *o, unsigned long long v, int base, int upper,
+                  int min_width, char pad_with) {
+    char tmp[32];
+    int t = 0;
+    const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
+    if (v == 0) tmp[t++] = '0';
+    while (v) { tmp[t++] = digits[v % base]; v /= base; }
+    /* pad */
+    while (min_width > t) { _putc(o, pad_with); min_width--; }
+    while (t) _putc(o, tmp[--t]);
+}
+
+/* signed integer in base 10 */
+static void _putd(_out *o, long long v, int min_width, int zero_pad) {
+    if (v < 0) {
+        _putc(o, '-');
+        v = -v;
+        if (min_width > 0) min_width--;
+    }
+    _putu(o, (unsigned long long)v, 10, 0, min_width, zero_pad ? '0' : ' ');
+}
+
+/* Minimal float — enough for %f, %g with default precision. */
+static void _putf(_out *o, double d) {
+    if (d < 0) { _putc(o, '-'); d = -d; }
+    unsigned long long ip = (unsigned long long)d;
+    _putu(o, ip, 10, 0, 0, ' ');
+    _putc(o, '.');
+    double frac = d - (double)ip;
+    for (int i = 0; i < 6; i++) {
+        frac *= 10.0;
+        int digit = (int)frac;
+        _putc(o, '0' + digit);
+        frac -= digit;
+    }
+}
+
+int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
+    _out o = { buf, n, 0, 0 };
+    if (!buf || n == 0) {
+        /* counting only — still walk the format */
+        o.buf = (char *)0;
+        o.cap = 0;
+    }
+    if (!fmt) {
+        if (n) buf[0] = 0;
+        return 0;
+    }
+
+    while (*fmt) {
+        if (*fmt != '%') {
+            _putc(&o, *fmt++);
+            continue;
+        }
+        fmt++;  /* skip % */
+
+        if (*fmt == '%') { _putc(&o, '%'); fmt++; continue; }
+
+        /* flags */
+        int zero_pad = 0, left = 0;
+        for (;;) {
+            if (*fmt == '0') { zero_pad = 1; fmt++; }
+            else if (*fmt == '-') { left = 1; fmt++; }
+            else if (*fmt == '+' || *fmt == ' ' || *fmt == '#') { fmt++; }
+            else break;
+        }
+        (void)left;
+
+        /* width */
+        int width = 0;
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
+
+        /* precision — parse and skip */
+        if (*fmt == '.') {
+            fmt++;
+            while (*fmt >= '0' && *fmt <= '9') fmt++;
+        }
+
+        /* length modifier */
+        int is_long = 0, is_ll = 0, is_short = 0;
+        for (;;) {
+            if (*fmt == 'l') {
+                if (is_long) is_ll = 1;
+                is_long = 1;
+                fmt++;
+            } else if (*fmt == 'h') { is_short = 1; fmt++; }
+            else if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { is_long = 1; fmt++; }
+            else break;
+        }
+        (void)is_short;
+
+        switch (*fmt) {
+        case 'd': case 'i': {
+            long long v;
+            if (is_ll) v = va_arg(ap, long long);
+            else if (is_long) v = va_arg(ap, long);
+            else v = va_arg(ap, int);
+            _putd(&o, v, width, zero_pad);
+            break;
+        }
+        case 'u': {
+            unsigned long long v;
+            if (is_ll) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned);
+            _putu(&o, v, 10, 0, width, zero_pad ? '0' : ' ');
+            break;
+        }
+        case 'x': {
+            unsigned long long v;
+            if (is_ll) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned);
+            _putu(&o, v, 16, 0, width, zero_pad ? '0' : ' ');
+            break;
+        }
+        case 'X': {
+            unsigned long long v;
+            if (is_ll) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned);
+            _putu(&o, v, 16, 1, width, zero_pad ? '0' : ' ');
+            break;
+        }
+        case 'o': {
+            unsigned long long v;
+            if (is_ll) v = va_arg(ap, unsigned long long);
+            else if (is_long) v = va_arg(ap, unsigned long);
+            else v = va_arg(ap, unsigned);
+            _putu(&o, v, 8, 0, width, zero_pad ? '0' : ' ');
+            break;
+        }
+        case 'p': {
+            void *p = va_arg(ap, void *);
+            _puts(&o, "0x");
+            _putu(&o, (unsigned long long)p, 16, 0, 0, ' ');
+            break;
+        }
+        case 's': {
+            const char *s = va_arg(ap, const char *);
+            _puts(&o, s);
+            break;
+        }
+        case 'c': {
+            int c = va_arg(ap, int);
+            _putc(&o, (char)c);
+            break;
+        }
+        case 'f': case 'F': case 'g': case 'G': case 'e': case 'E': {
+            double d = va_arg(ap, double);
+            _putf(&o, d);
+            break;
+        }
+        case 'n': {
+            int *p = va_arg(ap, int *);
+            if (p) *p = (int)o.pos;
+            break;
+        }
+        case 0:
+            goto done;
+        default:
+            _putc(&o, '%');
+            _putc(&o, *fmt);
+            break;
+        }
+        fmt++;
+    }
+
+done:
+    /* NUL-terminate */
+    if (n) {
+        if (o.pos < n) buf[o.pos] = 0;
+        else           buf[n - 1] = 0;
+    }
+    return (int)o.pos;
+}
+
+int snprintf(char *buf, size_t n, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, n, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+int vsprintf(char *buf, const char *fmt, va_list ap) {
+    return vsnprintf(buf, (size_t)-1, fmt, ap);
+}
+
+int sprintf(char *buf, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, (size_t)-1, fmt, ap);
+    va_end(ap);
+    return r;
+}
+
+/* ============================================================
+ * printf family — format into a buffer, then UDP log.
+ * ============================================================ */
+
+static int __printf_count = 0;
+
+static void log_printf_output(const char *tag, const char *buf, int len) {
+    if (__printf_count >= 200) return;
+    __printf_count++;
+
+    char out[560]; int p = 0;
+    /* "[tag] " */
+    while (tag && *tag && p < 20) out[p++] = *tag++;
+    /* space */
+    out[p++] = ' ';
+    /* buffer up to ~500 chars */
+    int i = 0;
+    while (i < len && i < 500 && p < 550) out[p++] = buf[i++];
+    out[p++] = '\n'; out[p] = 0;
+    ps_libc_log(out);
+}
+
+int vprintf(const char *fmt, va_list ap) {
+    char buf[512];
+    int r = vsnprintf(buf, sizeof(buf), fmt, ap);
+    log_printf_output("[stdout]", buf, r);
+    return r;
+}
+
+int printf(const char *fmt, ...) {
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_printf_output("[stdout]", buf, r);
+    return r;
+}
+
+int vfprintf(FILE *f, const char *fmt, va_list ap) {
+    (void)f;
+    char buf[512];
+    int r = vsnprintf(buf, sizeof(buf), fmt, ap);
+    log_printf_output("[stderr]", buf, r);
+    return r;
+}
+
+int fprintf(FILE *f, const char *fmt, ...) {
+    (void)f;
+    char buf[512];
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    log_printf_output("[fprintf]", buf, r);
+    return r;
 }
 
 /* ===== memory pool ===== */
@@ -422,7 +710,7 @@ static int __fopen_count = 0;
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
 
-    if (__fopen_count < 64) {
+    if (__fopen_count < 32) {
         __fopen_count++;
         char b[240]; int p = 0;
         const char *pre = "ps_libc: fopen ENTRY path=\"";
@@ -443,7 +731,7 @@ FILE *fopen(const char *path, const char *mode) {
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
 
-    if (__fopen_count <= 64) {
+    if (__fopen_count <= 32) {
         char b[80]; int p = 0;
         const char *pre = "ps_libc: fopen fd=0x";
         while (*pre && p < 24) b[p++] = *pre++;
@@ -544,60 +832,125 @@ int mkdir(const char *path, unsigned int mode) {
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
-/* printf family — logs FORMAT STRING only */
-int printf(const char *fmt, ...) {
-    if (fmt) { ps_libc_log("[stdout] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
-}
-int fprintf(FILE *f, const char *fmt, ...) {
-    (void)f;
-    if (fmt) { ps_libc_log("[fprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
-}
-int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) {
-    (void)f; (void)a;
-    if (fmt) { ps_libc_log("[vfprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
-}
-int sprintf(char *b, const char *fmt, ...) {
-    if (b) b[0] = 0;
-    if (fmt) { ps_libc_log("[sprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
-}
-int snprintf(char *b, size_t n, const char *fmt, ...) {
-    if (b && n) b[0] = 0;
-    if (fmt) { ps_libc_log("[snprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
-}
-int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a) {
-    if (b && n) b[0] = 0; (void)a;
-    if (fmt) { ps_libc_log("[vsnprintf] "); ps_libc_log(fmt); ps_libc_log("\n"); }
-    return 0;
+/* ============================================================
+ * sscanf — minimal: parse %d %i %u %x %s %c and skip whitespace.
+ * Returns number of items matched.  Needed by Doom's config parser.
+ * ============================================================ */
+int vsscanf(const char *s, const char *fmt, va_list ap) {
+    int matched = 0;
+    if (!s || !fmt) return 0;
+    while (*fmt) {
+        if (*fmt == ' ' || *fmt == '\t') { fmt++; continue; }
+        if (*fmt != '%') {
+            if (*s == *fmt) { s++; fmt++; continue; }
+            else return matched;
+        }
+        fmt++;
+        /* skip width / length (basic) */
+        while (*fmt >= '0' && *fmt <= '9') fmt++;
+        int is_long = 0;
+        while (*fmt == 'l' || *fmt == 'h') { if (*fmt=='l') is_long = 1; fmt++; }
+        switch (*fmt) {
+        case 'd': case 'i': {
+            while (*s == ' ' || *s == '\t') s++;
+            int neg = 0;
+            if (*s == '-') { neg = 1; s++; }
+            else if (*s == '+') s++;
+            long v = 0; int any = 0;
+            while (*s >= '0' && *s <= '9') { v = v*10 + (*s-'0'); s++; any = 1; }
+            if (!any) return matched;
+            if (is_long) *va_arg(ap, long *) = neg ? -v : v;
+            else *va_arg(ap, int *) = neg ? -(int)v : (int)v;
+            matched++;
+            break;
+        }
+        case 'u': {
+            while (*s == ' ' || *s == '\t') s++;
+            unsigned long v = 0; int any = 0;
+            while (*s >= '0' && *s <= '9') { v = v*10 + (*s-'0'); s++; any = 1; }
+            if (!any) return matched;
+            if (is_long) *va_arg(ap, unsigned long *) = v;
+            else *va_arg(ap, unsigned *) = (unsigned)v;
+            matched++;
+            break;
+        }
+        case 'x': case 'X': {
+            while (*s == ' ' || *s == '\t') s++;
+            if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+            unsigned long v = 0; int any = 0;
+            for (;;) {
+                int d;
+                if (*s >= '0' && *s <= '9') d = *s - '0';
+                else if (*s >= 'a' && *s <= 'f') d = *s - 'a' + 10;
+                else if (*s >= 'A' && *s <= 'F') d = *s - 'A' + 10;
+                else break;
+                v = v*16 + d; s++; any = 1;
+            }
+            if (!any) return matched;
+            if (is_long) *va_arg(ap, unsigned long *) = v;
+            else *va_arg(ap, unsigned *) = (unsigned)v;
+            matched++;
+            break;
+        }
+        case 's': {
+            while (*s == ' ' || *s == '\t') s++;
+            char *out = va_arg(ap, char *);
+            int any = 0;
+            while (*s && *s != ' ' && *s != '\t' && *s != '\n') { *out++ = *s++; any = 1; }
+            *out = 0;
+            if (!any) return matched;
+            matched++;
+            break;
+        }
+        case 'c': {
+            char *out = va_arg(ap, char *);
+            if (*s) { *out = *s++; matched++; }
+            break;
+        }
+        case '%': {
+            if (*s == '%') { s++; }
+            else return matched;
+            break;
+        }
+        default:
+            /* unknown specifier — bail out */
+            return matched;
+        }
+        fmt++;
+    }
+    return matched;
 }
 
-int sscanf(const char *s, const char *fmt, ...) { (void)s; (void)fmt; return 0; }
-
+int sscanf(const char *s, const char *fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
+}
 int __isoc99_sscanf(const char *s, const char *fmt, ...)
     __asm__("__isoc99_sscanf");
 int __isoc99_sscanf(const char *s, const char *fmt, ...) {
-    (void)s; (void)fmt; return 0;
+    va_list ap;
+    va_start(ap, fmt);
+    int r = vsscanf(s, fmt, ap);
+    va_end(ap);
+    return r;
 }
-int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a)
+int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap)
     __asm__("__isoc99_vsscanf");
-int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a) {
-    (void)s; (void)fmt; (void)a; return 0;
+int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap) {
+    return vsscanf(s, fmt, ap);
 }
+
+/* ===== puts / putchar family ===== */
 
 int puts(const char *s) {
     if (s) { ps_libc_log("[puts] "); ps_libc_log(s); ps_libc_log("\n"); }
     return 0;
 }
 
-/* ============================================================
- * putchar / fputc / fputs — SILENT.
- * Doom spams these per character, which floods UDP and drops
- * the important log lines.  We just return the input char.
- * ============================================================ */
+/* Silence these to avoid UDP spam. */
 int putchar(int c)               { return c; }
 int fputc(int c, FILE *f)        { (void)f; return c; }
 int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
