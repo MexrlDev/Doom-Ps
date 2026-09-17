@@ -1,6 +1,6 @@
 name: Build doom-ps
 
-# Manual only — nothing fires on push, PR, tag, schedule, or other workflow.
+# Manual
 on:
   workflow_dispatch:
     inputs:
@@ -53,7 +53,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: doom-ps-${{ github.sha }}
+          name: Doom-Ps
           path: |
             doom_ps.elf
             doom_ps.bin
