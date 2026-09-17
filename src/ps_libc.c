@@ -1,18 +1,42 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v7: REAL vsnprintf implementation.
- *   - Handles %s %d %i %u %x %X %c %p %% plus 'l'/'ll'/'h' length mods.
- *   - printf/fprintf/vfprintf call vsnprintf into a buffer, then UDP log
- *     the FORMATTED output so we can finally see Doom's real error messages.
- *   - putchar/fputc/fputs remain silent (spam avoidance).
+ * v8: real vsnprintf + real sscanf + error capture for on-screen display.
+ *   - vsnprintf handles %s %d %i %u %x %X %o %c %p %f %%
+ *   - printf/fprintf/vfprintf format into a buffer, then UDP log the result
+ *   - vfprintf also captures the last stderr message so exit() can display it
+ *   - sscanf handles %d %i %u %x %s %c %%
+ *   - putchar/fputc/fputs silent (spam avoidance)
  */
 
 #include "core.h"
 #include <stddef.h>
 #include <stdarg.h>
 
+/* FILE is used by the printf family below; the full struct is defined
+ * later in the stdio section.  Forward-declare the typedef here. */
 typedef struct _ps_file FILE;
+
+/* ============================================================
+ * Error capture — the last message written to stderr is saved so
+ * exit() can hand it to main.c's display callback.
+ * ============================================================ */
+static void (*__error_cb)(const char *msg) = 0;
+static char __last_err[256];
+static int  __last_err_len = 0;
+
+void ps_libc_set_error_cb(void (*cb)(const char *msg)) {
+    __error_cb = cb;
+}
+
+static void __capture_err(const char *s, int len) {
+    int i = 0;
+    __last_err_len = 0;
+    while (i < len && __last_err_len < 255) {
+        __last_err[__last_err_len++] = s[i++];
+    }
+    __last_err[__last_err_len] = 0;
+}
 
 /* ===== one-time init ===== */
 static void *__G, *__D;
@@ -54,14 +78,13 @@ void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa) {
 }
 
 /* ============================================================
- * vsnprintf engine — supports the specifiers Doom actually uses.
+ * vsnprintf engine
  * ============================================================ */
-
 typedef struct {
     char *buf;
-    size_t cap;   /* max bytes we may write incl. NUL */
-    size_t pos;   /* current logical length (may exceed cap) */
-    int    ovf;   /* set if pos >= cap */
+    size_t cap;
+    size_t pos;
+    int    ovf;
 } _out;
 
 static void _putc(_out *o, char c) {
@@ -78,7 +101,6 @@ static void _puts(_out *o, const char *s) {
     while (*s) _putc(o, *s++);
 }
 
-/* unsigned integer in base 10 or 16 */
 static void _putu(_out *o, unsigned long long v, int base, int upper,
                   int min_width, char pad_with) {
     char tmp[32];
@@ -86,12 +108,10 @@ static void _putu(_out *o, unsigned long long v, int base, int upper,
     const char *digits = upper ? "0123456789ABCDEF" : "0123456789abcdef";
     if (v == 0) tmp[t++] = '0';
     while (v) { tmp[t++] = digits[v % base]; v /= base; }
-    /* pad */
     while (min_width > t) { _putc(o, pad_with); min_width--; }
     while (t) _putc(o, tmp[--t]);
 }
 
-/* signed integer in base 10 */
 static void _putd(_out *o, long long v, int min_width, int zero_pad) {
     if (v < 0) {
         _putc(o, '-');
@@ -101,7 +121,6 @@ static void _putd(_out *o, long long v, int min_width, int zero_pad) {
     _putu(o, (unsigned long long)v, 10, 0, min_width, zero_pad ? '0' : ' ');
 }
 
-/* Minimal float — enough for %f, %g with default precision. */
 static void _putf(_out *o, double d) {
     if (d < 0) { _putc(o, '-'); d = -d; }
     unsigned long long ip = (unsigned long long)d;
@@ -119,7 +138,6 @@ static void _putf(_out *o, double d) {
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
     _out o = { buf, n, 0, 0 };
     if (!buf || n == 0) {
-        /* counting only — still walk the format */
         o.buf = (char *)0;
         o.cap = 0;
     }
@@ -133,11 +151,10 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             _putc(&o, *fmt++);
             continue;
         }
-        fmt++;  /* skip % */
+        fmt++;
 
         if (*fmt == '%') { _putc(&o, '%'); fmt++; continue; }
 
-        /* flags */
         int zero_pad = 0, left = 0;
         for (;;) {
             if (*fmt == '0') { zero_pad = 1; fmt++; }
@@ -147,20 +164,17 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         }
         (void)left;
 
-        /* width */
         int width = 0;
         while (*fmt >= '0' && *fmt <= '9') {
             width = width * 10 + (*fmt - '0');
             fmt++;
         }
 
-        /* precision — parse and skip */
         if (*fmt == '.') {
             fmt++;
             while (*fmt >= '0' && *fmt <= '9') fmt++;
         }
 
-        /* length modifier */
         int is_long = 0, is_ll = 0, is_short = 0;
         for (;;) {
             if (*fmt == 'l') {
@@ -251,7 +265,6 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
     }
 
 done:
-    /* NUL-terminate */
     if (n) {
         if (o.pos < n) buf[o.pos] = 0;
         else           buf[n - 1] = 0;
@@ -280,9 +293,8 @@ int sprintf(char *buf, const char *fmt, ...) {
 }
 
 /* ============================================================
- * printf family — format into a buffer, then UDP log.
+ * printf family
  * ============================================================ */
-
 static int __printf_count = 0;
 
 static void log_printf_output(const char *tag, const char *buf, int len) {
@@ -290,11 +302,8 @@ static void log_printf_output(const char *tag, const char *buf, int len) {
     __printf_count++;
 
     char out[560]; int p = 0;
-    /* "[tag] " */
     while (tag && *tag && p < 20) out[p++] = *tag++;
-    /* space */
     out[p++] = ' ';
-    /* buffer up to ~500 chars */
     int i = 0;
     while (i < len && i < 500 && p < 550) out[p++] = buf[i++];
     out[p++] = '\n'; out[p] = 0;
@@ -323,6 +332,7 @@ int vfprintf(FILE *f, const char *fmt, va_list ap) {
     char buf[512];
     int r = vsnprintf(buf, sizeof(buf), fmt, ap);
     log_printf_output("[stderr]", buf, r);
+    __capture_err(buf, r);       /* capture for exit() display */
     return r;
 }
 
@@ -682,7 +692,6 @@ static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
 
 /* ===== stdio ===== */
-typedef struct _ps_file FILE;
 struct _ps_file {
     int fd;
     int writable;
@@ -691,7 +700,7 @@ struct _ps_file {
     unsigned char *buf;
 };
 
-static FILE __null_file = { -1, 0, 0, 0, 0 };
+static struct _ps_file __null_file = { -1, 0, 0, 0, 0 };
 FILE *stderr = &__null_file;
 FILE *stdout = &__null_file;
 FILE *stdin  = &__null_file;
@@ -835,8 +844,7 @@ int mkdir(const char *path, unsigned int mode) {
 }
 
 /* ============================================================
- * sscanf — minimal: parse %d %i %u %x %s %c and skip whitespace.
- * Returns number of items matched.  Needed by Doom's config parser.
+ * sscanf — minimal parser
  * ============================================================ */
 int vsscanf(const char *s, const char *fmt, va_list ap) {
     int matched = 0;
@@ -848,7 +856,6 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             else return matched;
         }
         fmt++;
-        /* skip width / length (basic) */
         while (*fmt >= '0' && *fmt <= '9') fmt++;
         int is_long = 0;
         while (*fmt == 'l' || *fmt == 'h') { if (*fmt=='l') is_long = 1; fmt++; }
@@ -915,7 +922,6 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             break;
         }
         default:
-            /* unknown specifier — bail out */
             return matched;
         }
         fmt++;
@@ -946,13 +952,10 @@ int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap) {
 }
 
 /* ===== puts / putchar family ===== */
-
 int puts(const char *s) {
     if (s) { ps_libc_log("[puts] "); ps_libc_log(s); ps_libc_log("\n"); }
     return 0;
 }
-
-/* Silence these to avoid UDP spam. */
 int putchar(int c)               { return c; }
 int fputc(int c, FILE *f)        { (void)f; return c; }
 int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
@@ -977,6 +980,11 @@ void exit(int code) {
     b[p++] = ')'; b[p++] = ' '; b[p++] = '*'; b[p++] = '*'; b[p++] = '*';
     b[p++] = '\n'; b[p] = 0;
     ps_libc_log(b);
+
+    /* If main.c installed a callback, display the error on screen. */
+    if (__error_cb && __last_err_len > 0) {
+        __error_cb(__last_err);
+    }
     for (;;) {}
 }
 
