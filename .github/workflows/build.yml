@@ -1,5 +1,4 @@
 name: Build doom-ps
-
 # Manual
 on:
   workflow_dispatch:
@@ -8,40 +7,36 @@ on:
         description: "doomgeneric ref (branch/tag/commit)"
         required: false
         default: "master"
-
 jobs:
   build:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-
       - name: Install build tools
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential git binutils file python3
-
       - name: Verify toolchain
         run: |
           gcc     --version | head -n1
           objcopy --version | head -n1
           make    --version | head -n1
           python3 --version
-
       - name: Clone doomgeneric
         run: |
           git clone --depth=1 --branch "${{ inputs.doomgeneric_ref }}" \
             https://github.com/ozkl/doomgeneric doomgeneric
           git -C doomgeneric log -1 --oneline
-
+      - name: Clean before build
+        run: |
+          rm -rf build
+          rm -f doom_ps.elf doom_ps.bin doom_ps.hex
       - name: Build
-        run: make -j"$(nproc)"
-
+        run: ./build.sh
       - name: Hex payload
         run: make hex
-
       - name: Inspect artifacts
         run: |
           ls -lh doom_ps.elf doom_ps.bin doom_ps.hex
@@ -49,7 +44,6 @@ jobs:
           echo "---- Program headers ----" ; readelf -l doom_ps.elf
           echo "---- Section headers ----" ; readelf -S doom_ps.elf
           echo "---- Hex size ----"        ; wc -c doom_ps.hex
-
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
