@@ -1,8 +1,11 @@
 /*
- * doom-ps/src/main.c — v20
+ * doom-ps/src/main.c — v21
  *
- * v20: on-screen error display when Doom calls exit()/I_Error.
- *      UI LOCKED to v17 spec.
+ * v21: DG_DrawFrame logs call count (1, 2, 3, then every 60) and
+ *      "present entering/returned" for the first 3 frames so we can
+ *      pinpoint where Doom hangs after the title screen renders.
+ *
+ * UI LOCKED to v17 spec — do not change.
  */
 
 #include "core.h"
@@ -250,10 +253,7 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
     }
 }
 
-/* --------------------------------------------------------------------
- * Called by ps_libc.c's exit() when Doom hits I_Error.
- * Shows the message on the TV.  Never returns.
- * -------------------------------------------------------------------- */
+/* Called by ps_libc.c's exit() when Doom hits I_Error. */
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
@@ -454,13 +454,45 @@ void DG_Init(void) {
     else udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
 }
 
+/* ====================================================================
+ * DG_DrawFrame — v21 diagnostic: logs 1st, 2nd, 3rd frame and then
+ * every 60 frames.  Also logs "present entering/returned" for the
+ * first 3 frames so we can pinpoint where the hang occurs.
+ * ==================================================================== */
 void DG_DrawFrame(void) {
+    static int draw_count = 0;
+    draw_count++;
     struct ps_ctx *c = &g_ctx;
-    if (c->total_frames == 0) udp_log("DoomPS: DG_DrawFrame first call\n");
+
+    /* Log frame count */
+    if (draw_count == 1 || draw_count == 2 || draw_count == 3) {
+        char b[64]; int p = 0;
+        const char *m = "DoomPS: DG_DrawFrame #";
+        while (*m) b[p++] = *m++;
+        b[p++] = '0' + draw_count;
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    } else if ((draw_count % 60) == 0) {
+        char b[64]; int p = 0;
+        const char *m = "DoomPS: DG_DrawFrame #";
+        while (*m) b[p++] = *m++;
+        int v = draw_count;
+        char tmp[16]; int t = 0;
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) b[p++] = tmp[--t];
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    }
+
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
+
+    if (draw_count <= 3) udp_log("DoomPS: present entering\n");
     present(c);
+    if (draw_count <= 3) udp_log("DoomPS: present returned\n");
+
     if (c->ext) c->ext->frame_count = c->total_frames;
     audio_drain();
+
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
         s32 n = (s32)NC(c->G, c->pad_read,
@@ -471,6 +503,7 @@ void DG_DrawFrame(void) {
         }
     }
 }
+
 void DG_SleepMs(unsigned int ms) {
     struct ps_ctx *c = &g_ctx;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, (u64)ms * 1000ULL, 0,0,0,0,0);
@@ -708,8 +741,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     show_loading(c, 0, "Doom-PS starting up");
     udp_log("DoomPS: [32] first frame shown\n"); ext->step = 32;
 
-    /* Install the error display callback so future I_Error / exit()
-     * shows the message on TV. */
     ps_libc_set_error_cb(ps_error_display);
     udp_log("DoomPS: error callback installed\n");
     ext->step = 33;
@@ -771,6 +802,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     doomgeneric_Create(3, (char **)argv);
 
     udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
+    udp_log("DoomPS: entering tick loop\n");
     while (1) {
         doomgeneric_Tick();
         c->ext->frame_count = c->total_frames;
