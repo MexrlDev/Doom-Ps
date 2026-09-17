@@ -1,12 +1,9 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v3: removed `snd_channels` — it's defined in doomgeneric/s_sound.c,
- *     redefining it caused a link error ("multiple definition").
- *
- * Implements the modern doomgeneric I_* sound API.  Sound effects
- * play through dg_audio_callback() (defined in main.c), which pushes
- * samples via sceAudioOutOutput on the console.  Music is stubbed.
+ * v4: fixed sample scaling.  8-bit DMX samples need a <<8 shift to
+ *     fill the 16-bit range; without it the output was -45 dB (silent).
+ *     Also added debug logging so we can see sounds being triggered.
  */
 
 #include <stdio.h>
@@ -24,12 +21,13 @@
 #include "core.h"
 #include "doomgeneric_ps.h"
 
-/* Implemented in main.c — pushes stereo samples to sceAudioOut */
 extern void dg_audio_callback(const short *pcm, int sample_count);
 
+/* Doom-era UDP log — declared in main.c */
+extern void ps_sound_log(const char *msg);
+
 /* ============================================================
- * Global sound configuration.
- * NOTE: snd_channels is defined in s_sound.c — DO NOT redefine.
+ * Globals
  * ============================================================ */
 int snd_musicdevice = 0;
 int snd_sfxdevice   = 0;
@@ -51,20 +49,17 @@ typedef struct {
 
 static channel_t channels[NCHANNELS];
 static short mixbuf[MIXBUF * 2];
+static int sound_log_count = 0;
 
 /* ============================================================
- * Config variable binding
+ * Lifecycle
  * ============================================================ */
-void I_BindSoundVariables(void) {
-    /* No config vars exposed to user yet. */
-}
+void I_BindSoundVariables(void) {}
 
-/* ============================================================
- * Sound lifecycle
- * ============================================================ */
 void I_InitSound(boolean use_sfx_prefix) {
     (void)use_sfx_prefix;
     for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0;
+    ps_sound_log("I_InitSound done");
 }
 
 void I_ShutdownSound(void) {
@@ -81,21 +76,31 @@ void I_UpdateSound(void) {}
 void I_SetChannels(void) {}
 void I_SetSfxVolume(int volume) { (void)volume; }
 
+/* ============================================================
+ * Mixer — the actual sound output.  Called by main.c 8x per frame.
+ * ============================================================ */
 void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF * 2; i++) mixbuf[i] = 0;
 
+    int any_active = 0;
     for (int c = 0; c < NCHANNELS; c++) {
         channel_t *ch = &channels[c];
         if (!ch->active) continue;
+        any_active = 1;
 
         int pos = ch->pos;
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
             if (idx >= ch->length) { ch->active = 0; break; }
 
-            int sample = (int)ch->data[idx] - 128;
+            /* DMX: 8-bit unsigned PCM centered at 128.
+             * Convert to signed and shift up to 16-bit range. */
+            int sample = ((int)ch->data[idx] - 128) << 8;
+
+            /* Doom volume is 0-127, scale to 0-255 range then divide. */
             sample = sample * ch->volume / 96;
 
+            /* Stereo pan: 0=left, 128=center, 255=right */
             int left  = sample * (255 - ch->pan) / 255;
             int right = sample * ch->pan / 255;
 
@@ -107,6 +112,18 @@ void I_SubmitSound(void) {
         ch->pos = pos;
     }
 
+    /* Log first few mixing attempts so we can debug */
+    if (any_active && sound_log_count < 8) {
+        sound_log_count++;
+        char b[64]; int p = 0;
+        const char *m = "Audio: mixing slot #";
+        while (*m) b[p++] = *m++;
+        b[p++] = '0' + sound_log_count;
+        b[p++] = '\n'; b[p] = 0;
+        ps_sound_log(b);
+    }
+
+    /* Soft clip */
     for (int i = 0; i < MIXBUF * 2; i++) {
         if (mixbuf[i] > 32767) mixbuf[i] = 32767;
         else if (mixbuf[i] < -32768) mixbuf[i] = -32768;
@@ -173,7 +190,7 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 }
 
 /* ============================================================
- * Music (stubbed to silence)
+ * Music (stubbed)
  * ============================================================ */
 void I_InitMusic(void) {}
 void I_ShutdownMusic(void) {}
