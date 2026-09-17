@@ -1,13 +1,13 @@
 /*
- * doom-ps/src/main.c — v38
+ * doom-ps/src/main.c — v39
  *
- * v38:
- *   - Quit Game fix: Circle press now sends 'y' (yes) in addition to
- *     Enter (menu select), and Cross press sends 'n' (no) in addition
- *     to Fire/RCTRL.  Doom's QuitDoom prompt only accepts key_menu_confirm
- *     ('y') or key_menu_abort ('n') — neither Enter nor Fire confirmed
- *     it before, so the dialog was a dead end.
- *   - All other bindings unchanged.
+ * v39:
+ *   - FIXED Quit Game crash: ps_longjmp now does addq $8, %rsp after
+ *     restoring rsp, because the saved rsp pointed at the return
+ *     address (which a normal ret would have popped).  Without this,
+ *     every local variable in _start was 8 bytes off and the final
+ *     ret popped garbage.
+ *   - Everything else identical to v38.
  */
 
 #include "core.h"
@@ -99,8 +99,8 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RSHIFT     0xb6
 #define DOOM_KEY_F2         0xbc
 #define DOOM_KEY_F3         0xbd
-#define DOOM_KEY_Y          0x79    /* key_menu_confirm */
-#define DOOM_KEY_N          0x6e    /* key_menu_abort   */
+#define DOOM_KEY_Y          0x79
+#define DOOM_KEY_N          0x6e
 
 #define KEY_QUEUE_SIZE 32
 
@@ -136,7 +136,15 @@ static volatile int g_audio_thread_running = 0;
 
 /* ---- setjmp/longjmp ----
  * g_jmp_buf is intentionally NON-static so the naked asm can reference
- * it by name.  Naked functions use BASIC asm: no clobbers, single %. */
+ * it by name.
+ *
+ * ps_setjmp saves %rsp at the moment of entry (which is caller_rsp - 8,
+ * because the call instruction pushed the return address).
+ * ps_longjmp restores %rsp to that value, then adds 8 to simulate the
+ * pop that a normal `ret` would have performed.  Without the +8, every
+ * local variable in the caller would be 8 bytes off and the final ret
+ * would pop garbage.
+ */
 void *g_jmp_buf[8];
 static int   g_exit_requested = 0;
 
@@ -163,6 +171,7 @@ __attribute__((naked)) static void ps_longjmp(void) {
         "movq 0(%rax), %rbx\n\t"
         "movq 8(%rax), %rbp\n\t"
         "movq 16(%rax), %rsp\n\t"
+        "addq $8, %rsp\n\t"
         "movq 24(%rax), %r12\n\t"
         "movq 32(%rax), %r13\n\t"
         "movq 40(%rax), %r14\n\t"
@@ -374,10 +383,7 @@ static void translate_pad(u32 raw) {
     MAP(DS_TRIANGLE, DOOM_KEY_TAB);
     MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
 
-    /* Quit Game dialog accepts only key_menu_confirm ('y') and
-     * key_menu_abort ('n').  Circle = yes, Cross = no.  These extra
-     * keys are harmless during normal play — nothing in-game is bound
-     * to plain 'y' or 'n'. */
+    /* Quit Game dialog: Circle = 'y' (yes), Cross = 'n' (no). */
     if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
     if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
 
