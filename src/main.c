@@ -1,19 +1,27 @@
 /*
- * doom-ps/src/main.c — v30
+ * doom-ps/src/main.c — v31
  *
- * v30: FIXED SO_RCVTIMEO on accepted WAD client socket.
- *      Was setting tv_usec = 30,000,000 (invalid on FreeBSD, must be
- *      < 1,000,000), which made setsockopt fail silently and left the
- *      inherited 500ms listener timeout in effect.  Any pause >500ms
- *      during WAD transfer (iOS GC, print flush, etc.) killed recv.
+ * v31:
+ *   - Full controller mapping:
+ *       D-Pad           → movement
+ *       Cross           → fire
+ *       Square          → use
+ *       Triangle        → run (RSHIFT)
+ *       Circle          → confirm
+ *       Options         → menu (ESC)
+ *       R1              → save (F2)
+ *       L1              → load (F3)
+ *       R2              → next weapon
+ *       L2              → previous weapon
+ *       L3              → strafe left  (',')
+ *       R3              → strafe right ('.')
+ *       Touchpad        → automap (TAB)
+ *       Share           → UNMAPPED (user request)
+ *   - DS_TOUCHPAD = 0x00010000 (bit 16).  If touchpad doesn't fire on
+ *     your pad, cycle through 0x00100000, 0x00080000, 0x00040000.
+ *   - In-game "M:vol=..." / music diagnostics come from i_sound_ps.c.
  *
- *      Also added retry logic in recv loop — transient timeouts now
- *      retry up to 30 times before giving up.
- *
- *      Also fixed Triangle to use correct KEY_RSHIFT (0xb6).
- *
- * Logs kept as-is.
- * UI LOCKED to v17 spec.
+ * Logs kept as-is.  UI LOCKED to v17 spec.
  */
 
 #include "core.h"
@@ -80,23 +88,24 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 /* ============================================================
  * DualShock button bits
  * ============================================================ */
-#define DS_SHARE    0x0001
-#define DS_L3       0x0002
-#define DS_R3       0x0004
-#define DS_OPTIONS  0x0008
-#define DS_UP       0x0010
-#define DS_RIGHT    0x0020
-#define DS_DOWN     0x0040
-#define DS_LEFT     0x0080
-#define DS_L2       0x0100
-#define DS_R2       0x0200
-#define DS_L1       0x0400
-#define DS_R1       0x0800
-#define DS_TRIANGLE 0x1000
-#define DS_CIRCLE   0x2000
-#define DS_CROSS    0x4000
-#define DS_SQUARE   0x8000
-#define DS_PAD_MASK 0x001FFFFF
+#define DS_SHARE     0x00000001
+#define DS_L3        0x00000002
+#define DS_R3        0x00000004
+#define DS_OPTIONS   0x00000008
+#define DS_UP        0x00000010
+#define DS_RIGHT     0x00000020
+#define DS_DOWN      0x00000040
+#define DS_LEFT      0x00000080
+#define DS_L2        0x00000100
+#define DS_R2        0x00000200
+#define DS_L1        0x00000400
+#define DS_R1        0x00000800
+#define DS_TRIANGLE  0x00001000
+#define DS_CIRCLE    0x00002000
+#define DS_CROSS     0x00004000
+#define DS_SQUARE    0x00008000
+#define DS_TOUCHPAD  0x00010000    /* click-in of touchpad */
+#define DS_PAD_MASK  0x001FFFFF
 
 /* ============================================================
  * Doom 1.9 key codes
@@ -104,21 +113,24 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_ESCAPE     0x1b
 #define DOOM_KEY_ENTER      0x0d
 #define DOOM_KEY_SPACE      0x20
+#define DOOM_KEY_TAB        0x09
 
 #define DOOM_KEY_LEFT       0xac
 #define DOOM_KEY_UP         0xad
 #define DOOM_KEY_RIGHT      0xae
 #define DOOM_KEY_DOWN       0xaf
 
-#define DOOM_KEY_LBRACKET   0x5b
-#define DOOM_KEY_RBRACKET   0x5d
+#define DOOM_KEY_LBRACKET   0x5b    /* prev weapon */
+#define DOOM_KEY_RBRACKET   0x5d    /* next weapon */
+#define DOOM_KEY_COMMA      0x2c    /* strafe left  */
+#define DOOM_KEY_PERIOD     0x2e    /* strafe right */
 
 #define DOOM_KEY_USE        0xa2
 #define DOOM_KEY_FIRE       0xa3
 #define DOOM_KEY_RCTRL      0x9d
-#define DOOM_KEY_RSHIFT     0xb6
-#define DOOM_KEY_F2         0xbc
-#define DOOM_KEY_F3         0xbd
+#define DOOM_KEY_RSHIFT     0xb6    /* run */
+#define DOOM_KEY_F2         0xbc    /* save menu */
+#define DOOM_KEY_F3         0xbd    /* load menu */
 
 /* ============================================================
  * Context
@@ -323,22 +335,23 @@ static void push_key(u8 key, u8 pressed) {
 
 static const char *bit_name(u32 bit) {
     switch (bit) {
-    case DS_SHARE:    return "Share";
-    case DS_L3:       return "L3";
-    case DS_R3:       return "R3";
-    case DS_OPTIONS:  return "Options";
-    case DS_UP:       return "Up";
-    case DS_RIGHT:    return "Right";
-    case DS_DOWN:     return "Down";
-    case DS_LEFT:     return "Left";
-    case DS_L2:       return "L2";
-    case DS_R2:       return "R2";
-    case DS_L1:       return "L1";
-    case DS_R1:       return "R1";
-    case DS_TRIANGLE: return "Triangle";
-    case DS_CIRCLE:   return "Circle";
-    case DS_CROSS:    return "Cross";
-    case DS_SQUARE:   return "Square";
+    case DS_SHARE:     return "Share";
+    case DS_L3:        return "L3";
+    case DS_R3:        return "R3";
+    case DS_OPTIONS:   return "Options";
+    case DS_UP:        return "Up";
+    case DS_RIGHT:     return "Right";
+    case DS_DOWN:      return "Down";
+    case DS_LEFT:      return "Left";
+    case DS_L2:        return "L2";
+    case DS_R2:        return "R2";
+    case DS_L1:        return "L1";
+    case DS_R1:        return "R1";
+    case DS_TRIANGLE:  return "Triangle";
+    case DS_CIRCLE:    return "Circle";
+    case DS_CROSS:     return "Cross";
+    case DS_SQUARE:    return "Square";
+    case DS_TOUCHPAD:  return "Touchpad";
     }
     return "?";
 }
@@ -367,21 +380,37 @@ static void translate_pad(u32 raw) {
     }
 
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
+
+    /* D-pad → movement */
     MAP(DS_UP,       DOOM_KEY_UP);
     MAP(DS_DOWN,     DOOM_KEY_DOWN);
     MAP(DS_LEFT,     DOOM_KEY_LEFT);
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
-    MAP(DS_CROSS,    DOOM_KEY_FIRE);
-    MAP(DS_CROSS,    DOOM_KEY_RCTRL);
-    MAP(DS_SQUARE,   DOOM_KEY_USE);
-    MAP(DS_SQUARE,   DOOM_KEY_SPACE);
-    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);
-    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
+
+    /* Face buttons */
+    MAP(DS_CROSS,    DOOM_KEY_FIRE);      /* fire */
+    MAP(DS_SQUARE,   DOOM_KEY_USE);       /* use  */
+    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);    /* run  */
+    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);     /* confirm */
+
+    /* Menu */
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
-    MAP(DS_R1,       DOOM_KEY_F2);
-    MAP(DS_L1,       DOOM_KEY_F3);
-    MAP(DS_R2,       DOOM_KEY_RBRACKET);
-    MAP(DS_L2,       DOOM_KEY_LBRACKET);
+
+    /* Shoulders */
+    MAP(DS_R1,       DOOM_KEY_F2);        /* save */
+    MAP(DS_L1,       DOOM_KEY_F3);        /* load */
+    MAP(DS_R2,       DOOM_KEY_RBRACKET);  /* next weapon */
+    MAP(DS_L2,       DOOM_KEY_LBRACKET);  /* prev weapon */
+
+    /* Stick clicks — strafe */
+    MAP(DS_L3,       DOOM_KEY_COMMA);
+    MAP(DS_R3,       DOOM_KEY_PERIOD);
+
+    /* Touchpad click → automap */
+    MAP(DS_TOUCHPAD, DOOM_KEY_TAB);
+
+    /* Share is intentionally UNMAPPED per user request */
+
 #undef MAP
 }
 
@@ -414,12 +443,10 @@ static int recv_wad(s32 listen_fd) {
     show_loading(c, 0, "Waiting for WAD upload...");
     udp_log("DoomPS: WAD screen drawn\n");
 
-    /* Set 500ms SO_RCVTIMEO on listener so accept() can animate.
-     * timeval = { tv_sec, tv_usec }, tv_usec must be < 1,000,000. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 0) = 0;        /* tv_sec  = 0      */
-        *(u64 *)(tv + 8) = 500000;   /* tv_usec = 500 ms */
+        *(u64 *)(tv + 0) = 0;
+        *(u64 *)(tv + 8) = 500000;
         s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
                              (u64)listen_fd, 0xFFFF, 0x1006,
                              (u64)tv, 16, 0);
@@ -436,16 +463,10 @@ static int recv_wad(s32 listen_fd) {
     }
     if (client < 0) { udp_log("DoomPS: accept failed\n"); return -1; }
 
-    /* Clear inherited SO_RCVTIMEO on the CLIENT socket.
-     * CRITICAL: previous version used tv_usec = 30,000,000 which is
-     * INVALID (must be < 1,000,000).  setsockopt silently failed and
-     * the 500ms listener timeout stayed in effect, killing the WAD
-     * transfer on any >500ms sender pause (iOS GC, print flush, etc).
-     * Fix: tv_sec = 30, tv_usec = 0 for a 30-second timeout. */
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
-        *(u64 *)(tv + 0) = 30;       /* tv_sec  = 30 sec */
-        *(u64 *)(tv + 8) = 0;        /* tv_usec = 0      */
+        *(u64 *)(tv + 0) = 30;
+        *(u64 *)(tv + 8) = 0;
         s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
                              (u64)client, 0xFFFF, 0x1006,
                              (u64)tv, 16, 0);
@@ -515,10 +536,8 @@ static int recv_wad(s32 listen_fd) {
                 last_pct = pct;
             }
         } else if (n == 0) {
-            /* peer cleanly closed */
             break;
         } else {
-            /* timeout or transient error — retry before giving up */
             recv_retries++;
             if (recv_retries > 30) {
                 udp_log("DoomPS: recv retries exhausted\n");
