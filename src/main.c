@@ -1,17 +1,13 @@
 /*
- * doom-ps/src/main.c — v37
+ * doom-ps/src/main.c — v38
  *
- * v37:
- *   - g_jmp_buf made non-static so the naked asm can reference it by
- *     symbol name (was: "undefined reference to `g_jmp_buf`").
- *   - ps_setjmp / ps_longjmp: basic asm (no clobbers, single %).
- *   - Clean exit via setjmp/longjmp.  When Doom calls exit() (Quit
- *     Game, I_Error) we longjmp back to _start's cleanup block, tear
- *     down video/audio/equeue, set ext->status=0 / ext->step=99, and
- *     return to Lua.  LuaC0re keeps running.
- *   - Touchpad mapped to 0x00100000 → TAB (automap).
- *   - Share unmapped per request.
- *   - mkdir(".savegame") so Doom can save files.
+ * v38:
+ *   - Quit Game fix: Circle press now sends 'y' (yes) in addition to
+ *     Enter (menu select), and Cross press sends 'n' (no) in addition
+ *     to Fire/RCTRL.  Doom's QuitDoom prompt only accepts key_menu_confirm
+ *     ('y') or key_menu_abort ('n') — neither Enter nor Fire confirmed
+ *     it before, so the dialog was a dead end.
+ *   - All other bindings unchanged.
  */
 
 #include "core.h"
@@ -103,6 +99,8 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RSHIFT     0xb6
 #define DOOM_KEY_F2         0xbc
 #define DOOM_KEY_F3         0xbd
+#define DOOM_KEY_Y          0x79    /* key_menu_confirm */
+#define DOOM_KEY_N          0x6e    /* key_menu_abort   */
 
 #define KEY_QUEUE_SIZE 32
 
@@ -138,9 +136,7 @@ static volatile int g_audio_thread_running = 0;
 
 /* ---- setjmp/longjmp ----
  * g_jmp_buf is intentionally NON-static so the naked asm can reference
- * it by name.  If it's static, GCC renames it and the assembler can't
- * resolve the symbol.
- * Naked functions use BASIC asm: no clobber lists, single % for regs. */
+ * it by name.  Naked functions use BASIC asm: no clobbers, single %. */
 void *g_jmp_buf[8];
 static int   g_exit_requested = 0;
 
@@ -377,6 +373,13 @@ static void translate_pad(u32 raw) {
     MAP(DS_SQUARE,   DOOM_KEY_USE);
     MAP(DS_TRIANGLE, DOOM_KEY_TAB);
     MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
+
+    /* Quit Game dialog accepts only key_menu_confirm ('y') and
+     * key_menu_abort ('n').  Circle = yes, Cross = no.  These extra
+     * keys are harmless during normal play — nothing in-game is bound
+     * to plain 'y' or 'n'. */
+    if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
+    if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
 
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
 
