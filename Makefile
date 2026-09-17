@@ -1,13 +1,12 @@
 # ============================================================
 # doom-ps/Makefile
 #
-# v24: -O2 (was -Os) for faster Doom rendering.
-#      Excludes doomgeneric/i_sound.c so our i_sound_ps.c is used.
+# v26: -O3 + render doomgeneric at native 320x200 (was 640x400).
+#      4x fewer pixels to render, no downsampling, big FPS boost.
 # ============================================================
 
 DOOM_ROOT := doomgeneric
 
-# Auto-detect the directory containing doomgeneric.c
 DOOM_DIR := $(shell \
     for d in "$(DOOM_ROOT)" "$(DOOM_ROOT)/$(DOOM_ROOT)" "." ; do \
         if [ -f "$$d/doomgeneric.c" ]; then echo "$$d"; exit 0; fi; \
@@ -19,10 +18,10 @@ CC      := gcc
 OBJCOPY := objcopy
 
 # ------------------------------------------------------------------
-# C flags — -O2 for speed (was -Os)
+# C flags — -O3 for speed.  Native 320x200 render resolution.
 # ------------------------------------------------------------------
 CFLAGS := \
-    -O2 \
+    -O3 \
     -ffreestanding \
     -fno-stack-protector \
     -fno-builtin \
@@ -34,8 +33,12 @@ CFLAGS := \
     -fno-unwind-tables \
     -fno-asynchronous-unwind-tables \
     -U_FORTIFY_SOURCE -D_FORTIFY_SOURCE=0 \
+    -DDOOMGENERIC_RESX=320 \
+    -DDOOMGENERIC_RESY=200 \
     -Wall -Wno-unused-function -Wno-unused-variable \
     -Wno-unused-but-set-variable \
+    -Wno-stringop-overflow \
+    -Wno-array-bounds \
     -Isrc \
     -I$(DOOM_DIR)
 
@@ -47,17 +50,11 @@ LDFLAGS := \
     -Wl,-z,norelro \
     -pie
 
-# ------------------------------------------------------------------
-# Our sources — i_sound_ps.c replaces doomgeneric's i_sound.c
-# ------------------------------------------------------------------
 OUR_SRCS := \
     src/main.c \
     src/ps_libc.c \
     src/i_sound_ps.c
 
-# ------------------------------------------------------------------
-# Doomgeneric sources — EXCLUDES i_sound.c
-# ------------------------------------------------------------------
 DOOM_SRCS := $(shell \
     ls $(DOOM_DIR)/*.c 2>/dev/null | \
     grep -v -E '(doomgeneric_|i_allegro|i_sdl|i_soso|i_xlib|i_oal|i_main|i_psp|i_videohr|i_sound\.c$$)' \
@@ -66,7 +63,6 @@ DOOM_SRCS := $(shell \
 SRCS := $(OUR_SRCS) $(DOOM_SRCS)
 OBJS := $(SRCS:.c=.o)
 
-# ------------------------------------------------------------------
 .PHONY: all clean hex size check-doom debug-src relocs sections
 
 all: doom_ps.bin doom_ps.elf
@@ -74,7 +70,6 @@ all: doom_ps.bin doom_ps.elf
 check-doom:
 	@if [ ! -f "$(DOOM_DIR)/doomgeneric.c" ]; then \
 	    echo "[!] doomgeneric.c not found in $(DOOM_DIR)/"; \
-	    echo "    Run: bash build.sh"; \
 	    exit 1; \
 	fi
 	@echo "[OK] DOOM_DIR       = $(DOOM_DIR)"
@@ -108,7 +103,6 @@ relocs: doom_ps.elf
 debug-src:
 	@echo "OUR_SRCS  ="; for f in $(OUR_SRCS); do echo "  $$f"; done
 	@echo "DOOM_SRCS = $(words $(DOOM_SRCS)) files"
-	@echo "SRCS count = $(words $(SRCS))"
 
 clean:
 	rm -f $(OBJS) doom_ps.elf doom_ps.bin doom_ps.hex
