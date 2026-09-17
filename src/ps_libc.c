@@ -12,6 +12,8 @@
 #include <stddef.h>
 #include <stdarg.h>
 
+typedef struct _ps_file FILE;
+
 /* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
