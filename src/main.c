@@ -1,20 +1,14 @@
 /*
- * doom-ps/src/main.c — v25
+ * doom-ps/src/main.c — v26
  *
- * v25: correct Doom 1.9 key codes + clean controller layout.
- *      - Cross    = Fire
- *      - Square   = Use / Open door
- *      - Triangle = Run (RSHIFT = 0xb6)
- *      - Circle   = Enter / Confirm
- *      - Options  = Escape / Menu
- *      - D-Pad    = Movement (arrow keys)
- *      - R1       = Save menu (F2 = 0xbc)
- *      - L1       = Load menu (F3 = 0xbd)
- *      - R2       = Next weapon (']' = 0x5d)
- *      - L2       = Prev weapon ('[' = 0x5b)
- *      Share button is NOT used.
+ * v26: added back O_WR_CREAT_TRUNC (was accidentally dropped in v25).
+ *      Framebuffer is now 320x200 natively (matches doomgeneric's
+ *      internal resolution) instead of 640x400 upscaled — 4x fewer
+ *      pixels for blit_doom_frame to read, and no downsampling.
+ *      Display is still scaled up to 1920x1000 (SCALE_X=6, SCALE_Y=5)
+ *      so the on-screen result is identical.
  *
- * UI LOCKED to v17 spec — do not change.
+ * UI LOCKED to v17 spec.
  */
 
 #include "core.h"
@@ -27,12 +21,16 @@ extern char __bss_end[];
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
+extern void  I_SubmitSound(void);
 
-/* i_sound_ps.c provides this — mixes channels into dg_audio_callback. */
-extern void I_SubmitSound(void);
-
-#define DOOMFB_W  640
-#define DOOMFB_H  400
+/* ============================================================
+ * File open flags (FreeBSD/PS4/PS5)
+ * ============================================================ */
+#define O_WRONLY_  0x0001
+#define O_RDWR_    0x0002
+#define O_CREAT_   0x0200
+#define O_TRUNC_   0x0400
+#define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
 
 /* ============================================================
  * ELF64 relocation
@@ -81,7 +79,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 /* ============================================================
  * DualShock button bits (matches PS4/PS5 ScePadData.buttons)
  * ============================================================ */
-#define DS_SHARE    0x0001   /* NOT USED */
+#define DS_SHARE    0x0001
 #define DS_L3       0x0002
 #define DS_R3       0x0004
 #define DS_OPTIONS  0x0008
@@ -100,11 +98,10 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_PAD_MASK 0x0000FFFF
 
 /* ============================================================
- * Doom 1.9 key codes (from original i_video.h)
+ * Doom 1.9 key codes
  * ============================================================ */
 #define DOOM_KEY_ESCAPE     0x1b
 #define DOOM_KEY_ENTER      0x0d
-#define DOOM_KEY_TAB        0x09
 #define DOOM_KEY_SPACE      0x20
 
 #define DOOM_KEY_LEFT       0xac
@@ -112,15 +109,13 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DOOM_KEY_RIGHT      0xae
 #define DOOM_KEY_DOWN       0xaf
 
-#define DOOM_KEY_COMMA      0x2c   /* Strafe left  */
-#define DOOM_KEY_PERIOD     0x2e   /* Strafe right */
-#define DOOM_KEY_LBRACKET   0x5b   /* Prev weapon  */
-#define DOOM_KEY_RBRACKET   0x5d   /* Next weapon  */
+#define DOOM_KEY_LBRACKET   0x5b
+#define DOOM_KEY_RBRACKET   0x5d
 
 #define DOOM_KEY_FIRE       0xa0
-#define DOOM_KEY_RSHIFT     0xb6   /* Run */
-#define DOOM_KEY_F2         0xbc   /* Save menu */
-#define DOOM_KEY_F3         0xbd   /* Load menu */
+#define DOOM_KEY_RSHIFT     0xb6
+#define DOOM_KEY_F2         0xbc
+#define DOOM_KEY_F3         0xbd
 
 /* ============================================================
  * Context
@@ -171,10 +166,7 @@ static void udp_log(const char *msg) {
        0, (u64)c->log_sa, 16);
 }
 
-/* Called by i_sound_ps.c to log via the same UDP channel. */
-void ps_sound_log(const char *msg) {
-    udp_log(msg);
-}
+void ps_sound_log(const char *msg) { udp_log(msg); }
 
 static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     int p = 0;
@@ -299,15 +291,17 @@ static void ps_error_display(const char *msg) {
     }
 }
 
+/* ====================================================================
+ * blit_doom_frame — v26: source is now native 320x200
+ * ==================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
 
     for (int dy = 0; dy < DOOM_H; dy++) {
-        const u32 *row = doom + (dy * 2) * DOOMFB_W;
+        const u32 *row = doom + dy * DOOM_W;   /* stride 320, no scale */
         for (int dx = 0; dx < DOOM_W; dx++) {
-            u32 rgba = row[dx * 2];
-            u32 out = rgba | 0xFF000000;
+            u32 out = row[dx] | 0xFF000000;
             int fy = OFF_Y + dy * SCALE_Y;
             int fx = OFF_X + dx * SCALE_X;
             for (int sy = 0; sy < SCALE_Y; sy++) {
@@ -327,15 +321,11 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
-/* ====================================================================
- * Controller mapping — v25 layout
- * ==================================================================== */
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 ch = raw ^ c->pad_prev;
     c->pad_prev = raw;
 
-    /* Debug: log first few button presses so user can see raw values */
     static int pad_log_count = 0;
     if (ch != 0 && pad_log_count < 12) {
         pad_log_count++;
@@ -352,30 +342,19 @@ static void translate_pad(u32 raw) {
     }
 
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
-
-    /* D-Pad = movement */
     MAP(DS_UP,       DOOM_KEY_UP);
     MAP(DS_DOWN,     DOOM_KEY_DOWN);
     MAP(DS_LEFT,     DOOM_KEY_LEFT);
     MAP(DS_RIGHT,    DOOM_KEY_RIGHT);
-
-    /* Face buttons */
-    MAP(DS_CROSS,    DOOM_KEY_FIRE);      /* ✕ = Shoot */
-    MAP(DS_SQUARE,   DOOM_KEY_SPACE);     /* □ = Use / Open door */
-    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);    /* △ = Run */
-    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);     /* ○ = Confirm */
-
-    /* Menu */
-    MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);    /* Options = Main menu */
-
-    /* Shoulder buttons */
-    MAP(DS_R1,       DOOM_KEY_F2);        /* R1 = Save menu */
-    MAP(DS_L1,       DOOM_KEY_F3);        /* L1 = Load menu */
-    MAP(DS_R2,       DOOM_KEY_RBRACKET);  /* R2 = Next weapon */
-    MAP(DS_L2,       DOOM_KEY_LBRACKET);  /* L2 = Prev weapon */
-
-    /* Share (0x0001) intentionally NOT mapped. */
-
+    MAP(DS_CROSS,    DOOM_KEY_FIRE);
+    MAP(DS_SQUARE,   DOOM_KEY_SPACE);
+    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);
+    MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
+    MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
+    MAP(DS_R1,       DOOM_KEY_F2);
+    MAP(DS_L1,       DOOM_KEY_F3);
+    MAP(DS_R2,       DOOM_KEY_RBRACKET);
+    MAP(DS_L2,       DOOM_KEY_LBRACKET);
 #undef MAP
 }
 
@@ -510,16 +489,10 @@ extern void doomgeneric_Tick(void);
 
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
-    if (!DG_ScreenBuffer) {
-        udp_log("DoomPS: WARN DG_ScreenBuffer is NULL\n");
-    } else {
-        udp_log("DoomPS: DG_ScreenBuffer preserved\n");
-    }
+    if (!DG_ScreenBuffer) udp_log("DoomPS: WARN DG_ScreenBuffer is NULL\n");
+    else                  udp_log("DoomPS: DG_ScreenBuffer preserved\n");
 }
 
-/* ====================================================================
- * DG_DrawFrame — blit + present + pump audio
- * ==================================================================== */
 void DG_DrawFrame(void) {
     static int draw_count = 0;
     draw_count++;
@@ -548,7 +521,7 @@ void DG_DrawFrame(void) {
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
 
-    /* Pump the audio mixer — 8 slots per frame ≈ 85 ms of audio. */
+    /* Pump audio */
     for (int i = 0; i < 8; i++) {
         I_SubmitSound();
         audio_drain();
