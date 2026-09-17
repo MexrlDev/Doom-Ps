@@ -1,8 +1,8 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v3: DMEM pool with size cascade + diagnostic logging.
- *     Every pool attempt and the first malloc/fopen are logged to UDP.
+ * v4: printf/fprintf/puts/exit log their args to UDP so we can see
+ *     doom's own error messages in the iPhone log.
  */
 
 #include "core.h"
@@ -11,11 +11,10 @@
 /* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
-static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
+static void *fn_kopen, *fn_kread, __attribute__((unused)) *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
 static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
 static void *fn_sendto;
 
-/* UDP log plumbing */
 static s32 __log_fd = -1;
 static u8  __log_sa[16];
 static int __log_ready = 0;
@@ -24,6 +23,7 @@ static void ps_libc_log(const char *msg) {
     if (!__log_ready || __log_fd < 0 || !fn_sendto) return;
     u64 n = 0;
     while (msg[n]) n++;
+    if (n == 0) return;
     NC(__G, fn_sendto, (u64)__log_fd, (u64)msg, n, 0, (u64)__log_sa, 16);
 }
 
@@ -70,17 +70,10 @@ static void *try_dmem_pool(u64 size) {
     u64 phys = 0;
     s32 ret = (s32)NC(__G, fn_alloc_dm,
                       0, total, size, 0x200000, 3, (u64)&phys);
-    if (ret != 0) {
-        log_hex("ps_libc: DMEM alloc ret=", (u64)(u32)ret);
-        return 0;
-    }
+    if (ret != 0) { log_hex("ps_libc: DMEM alloc ret=", (u64)(u32)ret); return 0; }
     void *vmem = 0;
-    ret = (s32)NC(__G, fn_map_dm,
-                  (u64)&vmem, size, 3, 0, phys, 0x200000);
-    if (ret != 0) {
-        log_hex("ps_libc: DMEM map ret=", (u64)(u32)ret);
-        return 0;
-    }
+    ret = (s32)NC(__G, fn_map_dm, (u64)&vmem, size, 3, 0, phys, 0x200000);
+    if (ret != 0) { log_hex("ps_libc: DMEM map ret=", (u64)(u32)ret); return 0; }
     if (!vmem || (u64)vmem >= 0x8000000000000000ULL) {
         log_hex("ps_libc: DMEM vmem=", (u64)vmem);
         return 0;
@@ -102,12 +95,8 @@ static void *try_mmap_pool(u64 size) {
 
 static void pool_init(void) {
     static const u64 sizes[] = {
-        64ULL*1024*1024,
-        48ULL*1024*1024,
-        32ULL*1024*1024,
-        24ULL*1024*1024,
-        16ULL*1024*1024,
-        0
+        64ULL*1024*1024, 48ULL*1024*1024, 32ULL*1024*1024,
+        24ULL*1024*1024, 16ULL*1024*1024, 0
     };
     ps_libc_log("ps_libc: pool_init start\n");
     for (int i = 0; sizes[i]; i++) {
@@ -220,6 +209,19 @@ char *strncpy(char *d, const char *s, size_t n) {
     while (n--) *d++ = 0;
     return r;
 }
+char *strcat(char *d, const char *s) {
+    char *r = d;
+    while (*d) d++;
+    while ((*d++ = *s++));
+    return r;
+}
+char *strncat(char *d, const char *s, size_t n) {
+    char *r = d;
+    while (*d) d++;
+    while (n-- && (*d = *s++)) d++;
+    *d = 0;
+    return r;
+}
 char *strchr(const char *s, int c) {
     while (*s) { if (*s == (char)c) return (char *)s; s++; }
     return (char)c == 0 ? (char *)s : 0;
@@ -244,6 +246,18 @@ char *strdup(const char *s) {
     char *p = (char *)malloc(len);
     if (p) strcpy(p, s);
     return p;
+}
+char *strtok(char *s, const char *delim) {
+    static char *last = 0;
+    if (s) last = s;
+    if (!last) return 0;
+    while (*last && strchr(delim, *last)) last++;
+    if (!*last) { last = 0; return 0; }
+    char *start = last;
+    while (*last && !strchr(delim, *last)) last++;
+    if (*last) { *last++ = 0; }
+    else last = 0;
+    return start;
 }
 
 /* ===== ctype ===== */
@@ -286,6 +300,63 @@ int atoi(const char *s) {
 double atof(const char *s) { return (double)atoi(s); }
 double fabs(double x) { return x < 0 ? -x : x; }
 
+long strtol(const char *s, char **endptr, int base) {
+    long v = 0; int neg = 0;
+    while (*s == ' ' || *s == '\t') s++;
+    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
+    if (base == 0 || base == 16) {
+        if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) { s += 2; base = 16; }
+        else if (base == 0) base = 10;
+    }
+    while (*s) {
+        int d;
+        if (*s >= '0' && *s <= '9') d = *s - '0';
+        else if (*s >= 'a' && *s <= 'z') d = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'Z') d = *s - 'A' + 10;
+        else break;
+        if (d >= base) break;
+        v = v * base + d;
+        s++;
+    }
+    if (endptr) *endptr = (char *)s;
+    return neg ? -v : v;
+}
+unsigned long strtoul(const char *s, char **endptr, int base) {
+    return (unsigned long)strtol(s, endptr, base);
+}
+long long atoll(const char *s) { return (long long)atoi(s); }
+long strtol_ll(const char *s, char **e, int b) { return strtol(s, e, b); }
+
+/* qsort — insertion sort, small enough for our needs */
+void qsort(void *base, size_t n, size_t sz,
+           int (*cmp)(const void *, const void *)) {
+    unsigned char *b = (unsigned char *)base;
+    for (size_t i = 1; i < n; i++) {
+        unsigned char tmp[64];
+        if (sz > 64) return;
+        for (size_t k = 0; k < sz; k++) tmp[k] = b[i*sz + k];
+        size_t j = i;
+        while (j > 0 && cmp(b + (j-1)*sz, tmp) > 0) {
+            for (size_t k = 0; k < sz; k++) b[j*sz + k] = b[(j-1)*sz + k];
+            j--;
+        }
+        for (size_t k = 0; k < sz; k++) b[j*sz + k] = tmp[k];
+    }
+}
+void *bsearch(const void *key, const void *base, size_t n, size_t sz,
+              int (*cmp)(const void *, const void *)) {
+    const unsigned char *b = (const unsigned char *)base;
+    size_t lo = 0, hi = n;
+    while (lo < hi) {
+        size_t mid = (lo + hi) / 2;
+        int r = cmp(key, b + mid * sz);
+        if (r == 0) return (void *)(b + mid * sz);
+        if (r < 0) hi = mid;
+        else lo = mid + 1;
+    }
+    return 0;
+}
+
 /* ===== errno ===== */
 static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
@@ -325,7 +396,7 @@ FILE *fopen(const char *path, const char *mode) {
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
 
-    if (__fopen_count < 12) {
+    if (__fopen_count < 24) {
         __fopen_count++;
         char b[200]; int p = 0;
         const char *pre = "ps_libc: fopen ";
@@ -421,6 +492,9 @@ int fseek(FILE *f, long off, int whence) {
 long ftell(FILE *f)  { return f ? f->pos : -1; }
 int  fflush(FILE *f) { (void)f; return 0; }
 int  feof(FILE *f)   { return f ? (f->pos >= f->size) : 1; }
+int  ferror(FILE *f) { (void)f; return 0; }
+void clearerr(FILE *f) { (void)f; }
+int  fileno(FILE *f) { return f ? f->fd : -1; }
 
 int remove(const char *path) { (void)path; return 0; }
 int rename(const char *a, const char *b) { (void)a; (void)b; return 0; }
@@ -430,13 +504,69 @@ int mkdir(const char *path, unsigned int mode) {
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
-int printf(const char *fmt, ...)                           { (void)fmt; return 0; }
-int fprintf(FILE *f, const char *fmt, ...)                 { (void)f; (void)fmt; return 0; }
-int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) { (void)f; (void)fmt; (void)a; return 0; }
-int sprintf(char *b, const char *fmt, ...)                 { if (b) b[0]=0; (void)fmt; return 0; }
-int snprintf(char *b, size_t n, const char *fmt, ...)      { if (b && n) b[0]=0; (void)fmt; return 0; }
-int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a)
-                                                           { if (b && n) b[0]=0; (void)fmt; (void)a; return 0; }
+/* ============================================================
+ * printf family — DO log the format string (without args).
+ * This is how we will see doom's own error messages.
+ * ============================================================ */
+int printf(const char *fmt, ...) {
+    if (fmt) {
+        ps_libc_log("[stdout] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+
+int fprintf(FILE *f, const char *fmt, ...) {
+    (void)f;
+    if (fmt) {
+        ps_libc_log("[fprintf] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+
+int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) {
+    (void)f; (void)a;
+    if (fmt) {
+        ps_libc_log("[vfprintf] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+
+int sprintf(char *b, const char *fmt, ...) {
+    if (b) b[0] = 0;
+    if (fmt) {
+        ps_libc_log("[sprintf] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+
+int snprintf(char *b, size_t n, const char *fmt, ...) {
+    if (b && n) b[0] = 0;
+    if (fmt) {
+        ps_libc_log("[snprintf] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+
+int vsnprintf(char *b, size_t n, const char *fmt, __builtin_va_list a) {
+    if (b && n) b[0] = 0;
+    (void)a;
+    if (fmt) {
+        ps_libc_log("[vsnprintf] ");
+        ps_libc_log(fmt);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
 
 int sscanf(const char *s, const char *fmt, ...) { (void)s; (void)fmt; return 0; }
 
@@ -453,14 +583,57 @@ int __isoc99_vsscanf(const char *s, const char *fmt, __builtin_va_list a) {
     return 0;
 }
 
-int puts(const char *s)          { (void)s; return 0; }
-int putchar(int c)               { return c; }
-int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
-int fputc(int c, FILE *f)        { (void)f; return c; }
+int puts(const char *s) {
+    if (s) {
+        ps_libc_log("[puts] ");
+        ps_libc_log(s);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+int putchar(int c) {
+    char b[3]; b[0] = (char)c; b[1] = '\n'; b[2] = 0;
+    ps_libc_log("[putchar] ");
+    ps_libc_log(b);
+    return c;
+}
+int fputs(const char *s, FILE *f) {
+    (void)f;
+    if (s) {
+        ps_libc_log("[fputs] ");
+        ps_libc_log(s);
+        ps_libc_log("\n");
+    }
+    return 0;
+}
+int fputc(int c, FILE *f)        { (void)f; (void)c; return c; }
 int fgetc(FILE *f)               { (void)f; return -1; }
 int getc(FILE *f)                { (void)f; return -1; }
 int ungetc(int c, FILE *f)       { (void)f; return c; }
 char *fgets(char *b, int n, FILE *f) { if (b && n) b[0]=0; (void)f; return 0; }
 
-void exit(int code) { (void)code; for (;;) {} }
+/* ===== process ===== */
+int atexit(void (*fn)(void)) { (void)fn; return 0; }
+
+char *getenv(const char *name) {
+    (void)name;
+    return 0;
+}
+
+void _exit(int code) { (void)code; for (;;) {} }
+
+void exit(int code) {
+    char b[60]; int p = 0;
+    const char *pre = "ps_libc: *** exit(";
+    while (*pre) b[p++] = *pre++;
+    b[p++] = '0'; b[p++] = 'x';
+    const char h[] = "0123456789ABCDEF";
+    u32 v = (u32)code;
+    for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
+    b[p++] = ')'; b[p++] = ' '; b[p++] = '*'; b[p++] = '*'; b[p++] = '*';
+    b[p++] = '\n'; b[p] = 0;
+    ps_libc_log(b);
+    for (;;) {}
+}
+
 int  system(const char *cmd) { (void)cmd; return -1; }
