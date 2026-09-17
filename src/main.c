@@ -1,14 +1,8 @@
 /*
- * doom-ps/src/main.c — v19
+ * doom-ps/src/main.c — v20
  *
- * v19 fixes:
- *   - Apply ELF .rela.dyn relocations at startup (Luac0re's loader
- *     doesn't relocate, so absolute pointers in .data were pointing
- *     to low unmapped addresses and Doom crashed inside M_LoadDefaults).
- *   - Declare malloc/free explicitly (we're -ffreestanding, no stdlib.h,
- *     so GCC treats malloc as implicit int → pointer truncation).
- *
- * UI LOCKED to v17 spec — do not change.
+ * v20: on-screen error display when Doom calls exit()/I_Error.
+ *      UI LOCKED to v17 spec.
  */
 
 #include "core.h"
@@ -18,11 +12,10 @@
 extern char __bss_start[];
 extern char __bss_end[];
 
-/* ps_libc.c provides these; declare them so GCC knows the return type.
- * Without stdlib.h, malloc defaults to int, which truncates the pointer
- * on x86-64 and produces the "int-to-pointer-cast" warning. */
+/* ps_libc.c provides these. */
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
+extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 
 /* ============================================================
  * ELF64 relocation record + type constants
@@ -252,6 +245,33 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
         ps_draw_str_center(fb, 900, "Reboot game to recover",
                            0xFF808080, 3);
 
+        present(c);
+        if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+    }
+}
+
+/* --------------------------------------------------------------------
+ * Called by ps_libc.c's exit() when Doom hits I_Error.
+ * Shows the message on the TV.  Never returns.
+ * -------------------------------------------------------------------- */
+static void ps_error_display(const char *msg) {
+    struct ps_ctx *c = &g_ctx;
+    if (c->video_h < 0) return;
+
+    for (;;) {
+        u32 *fb = (u32 *)c->fbs[c->active_fb];
+        for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
+
+        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR",
+                           0xFFFF4040, 6);
+        if (msg && msg[0]) {
+            ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
+        } else {
+            ps_draw_str_center(fb, 400, "(no message)",
+                               0xFFA0A0A0, 3);
+        }
+        ps_draw_str_center(fb, 900, "Reboot game to recover",
+                           0xFF808080, 3);
         present(c);
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
     }
@@ -490,15 +510,11 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
-    /* ============================================================
-     * 1) Apply ELF relocations.  _start is at offset 0 of the file,
-     *    so its runtime address == load base.
-     * ============================================================ */
+    /* 1) Apply ELF relocations. */
     u64 load_base = (u64)&_start;
     int n_reloc = do_relocations(load_base);
 
-    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file,
-     *    but kept for safety). */
+    /* 2) Zero BSS (harmless — BSS bytes are already 0 in the file). */
     {
         volatile char *p = __bss_start;
         while (p < __bss_end) *p++ = 0;
@@ -523,7 +539,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     udp_log("DoomPS: [3] sendto resolved\n");
     ext->step = 3;
 
-    /* Log relocation count now that UDP is up. */
     {
         int p = 0; const char *m = "DoomPS: reloc count=";
         while (*m) g_diag[p++] = *m++;
@@ -693,6 +708,12 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     show_loading(c, 0, "Doom-PS starting up");
     udp_log("DoomPS: [32] first frame shown\n"); ext->step = 32;
 
+    /* Install the error display callback so future I_Error / exit()
+     * shows the message on TV. */
+    ps_libc_set_error_cb(ps_error_display);
+    udp_log("DoomPS: error callback installed\n");
+    ext->step = 33;
+
     if (c->aud_close)
         for (int h = 0; h < 8; h++)
             NC(c->G, c->aud_close, (u64)h,0,0,0,0,0);
@@ -705,18 +726,18 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                            (u64)-1, 0);
         if ((s64)c->ring == -1) c->ring = 0;
     }
-    udp_log(c->audio_h >= 0 ? "DoomPS: [33] audio up\n"
-                            : "DoomPS: [33] audio N/A\n");
-    ext->step = 33;
+    udp_log(c->audio_h >= 0 ? "DoomPS: [34] audio up\n"
+                            : "DoomPS: [34] audio N/A\n");
+    ext->step = 34;
 
     if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
-    udp_log("DoomPS: [34] pad query done\n"); ext->step = 34;
+    udp_log("DoomPS: [35] pad query done\n"); ext->step = 35;
 
     s32 tcp_listen_fd = (s32)ext->dbg[0];
-    udp_log("DoomPS: [35] entering recv_wad\n"); ext->step = 35;
+    udp_log("DoomPS: [36] entering recv_wad\n"); ext->step = 36;
 
     int wad_ok = (recv_wad(tcp_listen_fd) == 0);
     if (!wad_ok) {
@@ -734,7 +755,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         }
         NC(c->G, c->kclose, (u64)check, 0,0,0,0,0);
     }
-    udp_log("DoomPS: [36] WAD phase complete\n"); ext->step = 36;
+    udp_log("DoomPS: [37] WAD phase complete\n"); ext->step = 37;
 
     *(volatile u32 **)&DG_ScreenBuffer = (u32 *)0;
 
@@ -746,10 +767,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     argv[2] = c->wad_path;
     argv[3] = (char *)0;
 
-    udp_log("DoomPS: [37] doomgeneric_Create\n"); ext->step = 37;
+    udp_log("DoomPS: [38] doomgeneric_Create\n"); ext->step = 38;
     doomgeneric_Create(3, (char **)argv);
 
-    udp_log("DoomPS: [38] doomgeneric_Create returned\n"); ext->step = 38;
+    udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
     while (1) {
         doomgeneric_Tick();
         c->ext->frame_count = c->total_frames;
