@@ -1,7 +1,11 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v11: added putc (silent, same as fputc) and strtod (parse double).
+ * v12: exit() now calls ps_doom_exit_now() (setjmp/longjmp back to
+ *      _start cleanup) instead of for(;;) {}.  When Doom's Quit Game
+ *      or an I_Error fires exit(), we tear down video/audio/equeue
+ *      and return to LuaC0re so the user can launch another payload
+ *      without rebooting the game.
  */
 
 #include "core.h"
@@ -9,6 +13,8 @@
 #include <stdarg.h>
 
 typedef struct _ps_file FILE;
+
+extern void ps_doom_exit_now(void);
 
 /* ============================================================
  * Error capture
@@ -649,7 +655,6 @@ int atoi(const char *s) {
 double atof(const char *s) { return (double)atoi(s); }
 double fabs(double x) { return x < 0 ? -x : x; }
 
-/* --- v11 addition: strtod parses a double from a string --- */
 double strtod(const char *s, char **endptr) {
     while (*s == ' ' || *s == '\t') s++;
     int neg = 0;
@@ -1006,7 +1011,7 @@ int puts(const char *s) {
     return 0;
 }
 int putchar(int c)               { return c; }
-int putc(int c, FILE *f)         { (void)f; return c; }   /* v11 addition */
+int putc(int c, FILE *f)         { (void)f; return c; }
 int fputc(int c, FILE *f)        { (void)f; return c; }
 int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
 
@@ -1019,6 +1024,12 @@ int atexit(void (*fn)(void)) { (void)fn; return 0; }
 char *getenv(const char *name) { (void)name; return 0; }
 void _exit(int code) { (void)code; for (;;) {} }
 
+/*
+ * exit() — reached from Doom's "Quit Game", I_Error, or any Doom path
+ * that terminates the process.  We jump back to _start's cleanup
+ * block via longjmp so video/audio/equeue are torn down and control
+ * returns to LuaC0re.  ps_doom_exit_now() never returns.
+ */
 void exit(int code) {
     char b[60]; int p = 0;
     const char *pre = "ps_libc: *** exit(";
@@ -1034,6 +1045,7 @@ void exit(int code) {
     if (__error_cb && __last_err_len > 0) {
         __error_cb(__last_err);
     }
+    ps_doom_exit_now();   /* longjmp back to _start cleanup */
     for (;;) {}
 }
 
