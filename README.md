@@ -130,7 +130,26 @@ different game, update these three constants in `src/core.h`:
 | Linker errors in CI | Clone layout changed — the Makefile auto-detects both flat (`doomgeneric/*.c`) and nested (`doomgeneric/doomgeneric/*.c`) layouts |
 
 ---
+# Doom-PS: Supported WAD List
 
+| WAD File | Game Title | Type | Notes |
+|---|---|---|---|
+| `DOOM1.WAD` | Doom Shareware | Shareware | Free to distribute. Contains Episode 1 only. |
+| `doom.wad` | Doom (Registered/Retail) | Retail | The original 3-episode release. |
+| `doom2.wad` | Doom II: Hell on Earth | Commercial | 32 levels, new weapons & enemies. |
+| `plutonia.wad` | Final Doom: Plutonia Experiment | Commercial | Known for high difficulty. |
+| `tnt.wad` | Final Doom: TNT: Evilution | Commercial | Another official Final Doom episode. |
+| `freedoom1.wad` | Freedoom: Phase 1 | Free | Free alternative to Doom 1. |
+| `freedoom2.wad` | Freedoom: Phase 2 | Free | Free alternative to Doom II. |
+| `freedm.wad` | FreeDM | Free | A free deathmatch-focused IWAD. |
+| `chex.wad` | Chex Quest | Shareware | A Doom-based game using the same engine. |
+| `hacx.wad` | Hacx | Commercial | A total conversion using Doom II engine. |
+| `heretic.wad` | Heretic | Retail | Fantasy-themed Doom engine game. |
+| `heretic1.wad` | Heretic Shareware | Shareware | Shareware version of Heretic. |
+| `hexen.wad` | Hexen | Commercial | Uses a modified Doom engine. |
+| `strife1.wad` | Strife | Commercial | RPG-flavored Doom engine game. |
+
+---
 ## Credits
 
 * **MexrlDev** — Project Development
