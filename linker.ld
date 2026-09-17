@@ -21,7 +21,15 @@ SECTIONS
         *(.data.*)
     } :text
 
-    .bss : {
+    /* ------------------------------------------------------------------
+     * .bss marked (NOLOAD) so it occupies memory at runtime but does NOT
+     * bloat the on-disk file.  Luac0re's loader memcpy's the file bytes
+     * into mmap'd memory, then our _start prologue zeroes __bss_start ..
+     * __bss_end (see main.c).  Without (NOLOAD) the linker writes ~600 KB
+     * of zeros to the file, blowing past the 1 MB mmap and causing the
+     * "Broken pipe" + stuck LOADING screen.
+     * ------------------------------------------------------------------ */
+    .bss (NOLOAD) : {
         __bss_start = .;
         *(.bss)
         *(.bss.*)
@@ -30,24 +38,18 @@ SECTIONS
     } :text
 
     /* ------------------------------------------------------------------
-     * Pad the output to a fixed 640 KB (0xA0000).
+     * Pad the output file to exactly 640 KB (0xA0000).
      *
-     * Why: the Lua launcher on the console checks the received shellcode
-     * size against an expected minimum (~623 KB) and rejects anything
-     * smaller with "short receive: got N bytes, expected ~623 KB".
+     * Why: the Lua launcher on the console rejects anything smaller than
+     * ~623 KB ("short receive: got N bytes, expected ~623 KB").  640 KB
+     * is safely above that and well under the 1 MB mmap.
      *
-     * Our actual code + rodata + data + bss is only ~354 KB, so we pad
-     * the file with zeros up to 0xA0000.  The padding bytes sit AFTER
-     * .bss in memory, so they don't affect execution — the entry point
-     * still runs from offset 0 of the mmap, and BSS is still zeroed by
-     * our _start handler (see main.c).
-     *
-     * If the launcher ever complains again about size, just change the
-     * 0xA0000 below to whatever it wants — this is a pure file-size
-     * knob, it has no effect on the running code.
+     * If the launcher's required size ever changes, edit the 0xA0000
+     * below.  This is a pure file-size knob; it has zero effect on the
+     * running code.
      * ------------------------------------------------------------------ */
     .pad : {
-        BYTE(0);
+        FILL(0);
         . = 0xA0000;
     } :text
 
