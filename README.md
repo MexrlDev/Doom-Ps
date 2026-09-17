@@ -135,6 +135,7 @@ different game, update these three constants in `src/core.h`:
 | WAD File | Game Title | Type | Notes |
 |---|---|---|---|
 | `DOOM1.WAD` | Doom Shareware | Shareware | Free to distribute. Contains Episode 1 only. |
+| `DOOM.WAD` | The Ultimate Doom | IWAD | Includes the original three episodes plus the fourth episode (Thy Flesh Consumed). |
 | `doom.wad` | Doom (Registered/Retail) | Retail | The original 3-episode release. |
 | `doom2.wad` | Doom II: Hell on Earth | Commercial | 32 levels, new weapons & enemies. |
 | `plutonia.wad` | Final Doom: Plutonia Experiment | Commercial | Known for high difficulty. |
