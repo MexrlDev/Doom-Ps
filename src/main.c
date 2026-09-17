@@ -1,14 +1,14 @@
 /*
- * doom-ps/src/main.c — v33
+ * doom-ps/src/main.c — v34
  *
- * v33:
- *   - mkdir(".savegame"), mkdir("/av_contents/content_tmp/.savegame"),
- *     mkdir("/savedata0/.savegame") at startup. Doom tries to save to
- *     ./.savegame/doomsavN.dsg, which failed with ENOENT because the
- *     directory never existed. Now it does.
- *   - Touchpad left unmapped (awaiting confirmed bit value).
- *   - Share unmapped per user request.
- *   - Triangle = automap.
+ * v34:
+ *   - Clean exit via setjmp/longjmp. When Doom calls exit() (Quit Game,
+ *     I_Error), we jump back to _start's cleanup block, tear down
+ *     video/audio/equeue, set ext->status=0 / ext->step=99, and
+ *     return to Lua. LuaC0re keeps running, user can send another
+ *     payload without rebooting.
+ *   - Touchpad mapped to 0x00100000 → TAB (automap).
+ *   - Share unmapped per request.
  */
 
 #include "core.h"
@@ -79,7 +79,7 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DS_CIRCLE    0x00002000
 #define DS_CROSS     0x00004000
 #define DS_SQUARE    0x00008000
-#define DS_TOUCHPAD  0x00010000
+#define DS_TOUCHPAD  0x00100000    /* confirmed via log */
 #define DS_PAD_MASK  0x001FFFFF
 
 #define DOOM_KEY_ESCAPE     0x1b
@@ -132,6 +132,49 @@ static struct ps_ctx {
 
 static char g_diag[256];
 static volatile int g_audio_thread_running = 0;
+
+/* ---- setjmp/longjmp for clean Doom exit ---- */
+static void *g_jmp_buf[8];
+static int   g_exit_requested = 0;
+
+__attribute__((naked)) static int ps_setjmp(void) {
+    __asm__ volatile (
+        "leaq g_jmp_buf(%%rip), %%rax\n\t"
+        "movq %%rbx, 0(%%rax)\n\t"
+        "movq %%rbp, 8(%%rax)\n\t"
+        "movq %%rsp, 16(%%rax)\n\t"
+        "movq %%r12, 24(%%rax)\n\t"
+        "movq %%r13, 32(%%rax)\n\t"
+        "movq %%r14, 40(%%rax)\n\t"
+        "movq %%r15, 48(%%rax)\n\t"
+        "movq (%%rsp), %%rcx\n\t"
+        "movq %%rcx, 56(%%rax)\n\t"
+        "xorl %%eax, %%eax\n\t"
+        "retq"
+    );
+}
+
+__attribute__((naked)) static void ps_longjmp(void) {
+    __asm__ volatile (
+        "leaq g_jmp_buf(%%rip), %%rax\n\t"
+        "movq 0(%%rax), %%rbx\n\t"
+        "movq 8(%%rax), %%rbp\n\t"
+        "movq 16(%%rax), %%rsp\n\t"
+        "movq 24(%%rax), %%r12\n\t"
+        "movq 32(%%rax), %%r13\n\t"
+        "movq 40(%%rax), %%r14\n\t"
+        "movq 48(%%rax), %%r15\n\t"
+        "movq 56(%%rax), %%rcx\n\t"
+        "movl $1, %%eax\n\t"
+        "jmpq *%%rcx\n\t"
+    );
+}
+
+void ps_doom_exit_now(void) {
+    g_exit_requested = 1;
+    ps_longjmp();
+    for (;;) {}
+}
 
 static void udp_log(const char *msg) {
     struct ps_ctx *c = &g_ctx;
@@ -325,7 +368,7 @@ static void translate_pad(u32 raw) {
 
     MAP(DS_CROSS,    DOOM_KEY_FIRE);
     MAP(DS_SQUARE,   DOOM_KEY_USE);
-    MAP(DS_TRIANGLE, DOOM_KEY_TAB);
+    MAP(DS_TRIANGLE, DOOM_KEY_TAB);    /* automap */
     MAP(DS_CIRCLE,   DOOM_KEY_ENTER);
 
     MAP(DS_OPTIONS,  DOOM_KEY_ESCAPE);
@@ -337,6 +380,8 @@ static void translate_pad(u32 raw) {
 
     MAP(DS_L3,       DOOM_KEY_COMMA);
     MAP(DS_R3,       DOOM_KEY_PERIOD);
+
+    MAP(DS_TOUCHPAD, DOOM_KEY_TAB);    /* automap */
 
 #undef MAP
 }
@@ -598,7 +643,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     udp_log("DoomPS: [10] sockets\n");
     ext->step = 10;
 
-    /* Make sure .savegame directory exists for Doom. */
     mkdir("./.savegame", 0777);
     mkdir("/av_contents/content_tmp/.savegame", 0777);
     mkdir("/savedata0/.savegame", 0777);
@@ -787,16 +831,24 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     argv[3] = (char *)0;
 
     udp_log("DoomPS: [38] doomgeneric_Create\n"); ext->step = 38;
-    doomgeneric_Create(3, (char **)argv);
 
-    udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
-    udp_log("DoomPS: entering tick loop\n");
-    while (1) {
-        doomgeneric_Tick();
-        c->ext->frame_count = c->total_frames;
+    if (ps_setjmp() == 0) {
+        doomgeneric_Create(3, (char **)argv);
+        udp_log("DoomPS: [39] doomgeneric_Create returned\n"); ext->step = 39;
+        udp_log("DoomPS: entering tick loop\n");
+        while (1) {
+            doomgeneric_Tick();
+            c->ext->frame_count = c->total_frames;
+            if (g_exit_requested) break;
+        }
+        udp_log("DoomPS: tick loop exited via flag\n");
+    } else {
+        udp_log("DoomPS: exit via longjmp\n");
     }
 
     g_audio_thread_running = 0;
+    if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
     if (c->vid_close && c->video_h >= 0)
@@ -805,4 +857,5 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
     ext->status = 0;
     ext->step   = 99;
+    udp_log("DoomPS: cleanup done, returning to Lua\n");
 }
