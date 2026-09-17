@@ -1,21 +1,33 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v2: malloc pool uses sceKernelAllocateDirectMemory + sceKernelMapDirectMemory
- *     (proven to work for the framebuffer), 32 MB pool.
- *     fopen reads via read() loop instead of mmap().
+ * v3: DMEM pool with size cascade + diagnostic logging.
+ *     Every pool attempt and the first malloc/fopen are logged to UDP.
  */
 
 #include "core.h"
 #include <stddef.h>
 
-/* ===== one-time init, called from _start ===== */
+/* ===== one-time init ===== */
 static void *__G, *__D;
 static void *fn_mmap, *fn_munmap;
 static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
 static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
+static void *fn_sendto;
 
-void ps_libc_init(void *G, void *D) {
+/* UDP log plumbing */
+static s32 __log_fd = -1;
+static u8  __log_sa[16];
+static int __log_ready = 0;
+
+static void ps_libc_log(const char *msg) {
+    if (!__log_ready || __log_fd < 0 || !fn_sendto) return;
+    u64 n = 0;
+    while (msg[n]) n++;
+    NC(__G, fn_sendto, (u64)__log_fd, (u64)msg, n, 0, (u64)__log_sa, 16);
+}
+
+void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa) {
     __G = G; __D = D;
     fn_mmap     = SYM(G, D, LIBKERNEL_HANDLE, "mmap");
     fn_munmap   = SYM(G, D, LIBKERNEL_HANDLE, "munmap");
@@ -28,60 +40,107 @@ void ps_libc_init(void *G, void *D) {
     fn_alloc_dm = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelAllocateDirectMemory");
     fn_map_dm   = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelMapDirectMemory");
     fn_dm_size  = SYM(G, D, LIBKERNEL_HANDLE, "sceKernelGetDirectMemorySize");
+    fn_sendto   = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
+
+    __log_fd = log_fd;
+    for (int i = 0; i < 16; i++) __log_sa[i] = log_sa[i];
+    __log_ready = 1;
 }
 
-/* ===== memory (bump allocator, 32 MB pool via direct memory) ===== */
-#define POOL_SIZE (32u * 1024u * 1024u)
+/* ===== memory pool ===== */
 static unsigned char *__pool = 0;
+static size_t __pool_size = 0;
 static size_t __pool_used = 0;
 
-static void *pool_alloc(void) {
-    /* Preferred: DMEM — proven to work for framebuffer */
-    if (fn_alloc_dm && fn_map_dm) {
-        u64 total = fn_dm_size ? NC(__G, fn_dm_size, 0,0,0,0,0,0)
-                              : 0x300000000ULL;
-        u64 phys = 0;
-        s32 ret = (s32)NC(__G, fn_alloc_dm,
-                          0,                  /* searchStart */
-                          total,              /* searchEnd */
-                          POOL_SIZE,          /* len */
-                          0x200000,           /* alignment 2MB */
-                          3,                  /* memoryType */
-                          (u64)&phys);
-        if (ret == 0) {
-            void *vmem = 0;
-            ret = (s32)NC(__G, fn_map_dm,
-                          (u64)&vmem,
-                          (u64)POOL_SIZE,
-                          3,              /* PROT_READ|WRITE */
-                          0,              /* flags */
-                          phys,
-                          0x200000);
-            if (ret == 0 && vmem &&
-                (u64)vmem < 0x8000000000000000ULL) {
-                return vmem;
-            }
-        }
-    }
-    /* Fallback: mmap */
-    if (fn_mmap) {
-        void *p = (void *)NC(__G, fn_mmap,
-                             0, POOL_SIZE, 3, 0x1002, (u64)-1, 0);
-        if (p && (u64)p != (u64)-1 &&
-            (u64)p < 0x8000000000000000ULL) {
-            return p;
-        }
-    }
-    return 0;
+static void log_hex(const char *prefix, u64 v) {
+    char b[80]; int p = 0;
+    while (*prefix && p < 60) b[p++] = *prefix++;
+    b[p++] = '0'; b[p++] = 'x';
+    const char h[] = "0123456789ABCDEF";
+    for (int k = 0; k < 16; k++)
+        b[p++] = h[(v >> ((15 - k) * 4)) & 0xF];
+    b[p++] = '\n'; b[p] = 0;
+    ps_libc_log(b);
 }
+
+static void *try_dmem_pool(u64 size) {
+    if (!fn_alloc_dm || !fn_map_dm) return 0;
+    u64 total = fn_dm_size ? NC(__G, fn_dm_size, 0,0,0,0,0,0)
+                          : 0x300000000ULL;
+    u64 phys = 0;
+    s32 ret = (s32)NC(__G, fn_alloc_dm,
+                      0, total, size, 0x200000, 3, (u64)&phys);
+    if (ret != 0) {
+        log_hex("ps_libc: DMEM alloc ret=", (u64)(u32)ret);
+        return 0;
+    }
+    void *vmem = 0;
+    ret = (s32)NC(__G, fn_map_dm,
+                  (u64)&vmem, size, 3, 0, phys, 0x200000);
+    if (ret != 0) {
+        log_hex("ps_libc: DMEM map ret=", (u64)(u32)ret);
+        return 0;
+    }
+    if (!vmem || (u64)vmem >= 0x8000000000000000ULL) {
+        log_hex("ps_libc: DMEM vmem=", (u64)vmem);
+        return 0;
+    }
+    log_hex("ps_libc: DMEM pool at ", (u64)vmem);
+    return vmem;
+}
+
+static void *try_mmap_pool(u64 size) {
+    if (!fn_mmap) return 0;
+    void *p = (void *)NC(__G, fn_mmap, 0, size, 3, 0x1002, (u64)-1, 0);
+    if (!p || (u64)p == (u64)-1 || (u64)p >= 0x8000000000000000ULL) {
+        log_hex("ps_libc: mmap fail p=", (u64)p);
+        return 0;
+    }
+    log_hex("ps_libc: mmap pool at ", (u64)p);
+    return p;
+}
+
+static void pool_init(void) {
+    static const u64 sizes[] = {
+        64ULL*1024*1024,
+        48ULL*1024*1024,
+        32ULL*1024*1024,
+        24ULL*1024*1024,
+        16ULL*1024*1024,
+        0
+    };
+    ps_libc_log("ps_libc: pool_init start\n");
+    for (int i = 0; sizes[i]; i++) {
+        log_hex("ps_libc: trying DMEM size ", sizes[i]);
+        __pool = (unsigned char *)try_dmem_pool(sizes[i]);
+        if (__pool) { __pool_size = sizes[i]; return; }
+    }
+    for (int i = 0; sizes[i]; i++) {
+        log_hex("ps_libc: trying mmap size ", sizes[i]);
+        __pool = (unsigned char *)try_mmap_pool(sizes[i]);
+        if (__pool) { __pool_size = sizes[i]; return; }
+    }
+    ps_libc_log("ps_libc: POOL_INIT FAILED - no memory\n");
+}
+
+static int __first_malloc_logged = 0;
 
 void *malloc(size_t size) {
     if (!__pool) {
-        __pool = (unsigned char *)pool_alloc();
+        pool_init();
         if (!__pool) return 0;
     }
+    if (!__first_malloc_logged) {
+        __first_malloc_logged = 1;
+        log_hex("ps_libc: first malloc size=", (u64)size);
+        log_hex("ps_libc: pool size=", (u64)__pool_size);
+    }
     size = (size + 15) & ~(size_t)15;
-    if (__pool_used + size > POOL_SIZE) return 0;
+    if (__pool_used + size > __pool_size) {
+        log_hex("ps_libc: OOM req=", (u64)size);
+        log_hex("ps_libc: OOM used=", (u64)__pool_used);
+        return 0;
+    }
     void *p = __pool + __pool_used;
     __pool_used += size;
     return p;
@@ -257,12 +316,32 @@ static FILE *alloc_slot(void) {
     return 0;
 }
 
+static int __fopen_count = 0;
+
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
     int writable = (mode[0] == 'w' || mode[0] == 'a');
     int flags = writable ? 0x601 : 0x0000;
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
+
+    if (__fopen_count < 12) {
+        __fopen_count++;
+        char b[200]; int p = 0;
+        const char *pre = "ps_libc: fopen ";
+        while (*pre && p < 40) b[p++] = *pre++;
+        int i = 0;
+        while (path[i] && p < 130) b[p++] = path[i++];
+        b[p++] = ' '; b[p++] = 'm'; b[p++] = '='; b[p++] = mode[0];
+        b[p++] = ' '; b[p++] = 'f'; b[p++] = 'd'; b[p++] = '=';
+        b[p++] = '0'; b[p++] = 'x';
+        const char h[] = "0123456789ABCDEF";
+        u32 v = (u32)fd;
+        for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
+        b[p++] = '\n'; b[p] = 0;
+        ps_libc_log(b);
+    }
+
     if (fd < 0) return 0;
 
     FILE *f = alloc_slot();
@@ -279,9 +358,6 @@ FILE *fopen(const char *path, const char *mode) {
         NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
         if (sz < 0) sz = 0;
         if (sz > 0) {
-            /* Allocate from our pool, then read via read() loop.
-             * No mmap — avoids kernel VA pressure and error-return
-             * weirdness from within the shellcode. */
             unsigned char *b = (unsigned char *)malloc((size_t)sz);
             if (b) {
                 long total = 0;
@@ -294,6 +370,8 @@ FILE *fopen(const char *path, const char *mode) {
                 }
                 f->buf = b;
                 f->size = total;
+            } else {
+                ps_libc_log("ps_libc: fopen READ malloc FAILED\n");
             }
         }
         NC(__G, fn_kclose, (u64)fd, 0,0,0,0,0);
@@ -304,7 +382,6 @@ FILE *fopen(const char *path, const char *mode) {
 
 int fclose(FILE *f) {
     if (!f || f == &__null_file) return 0;
-    /* pool is bump allocator — free is a no-op */
     if (f->fd >= 0 && fn_kclose)
         NC(__G, fn_kclose, (u64)f->fd, 0,0,0,0,0);
     f->fd = 0; f->buf = 0; f->pos = 0; f->size = 0;
@@ -353,7 +430,6 @@ int mkdir(const char *path, unsigned int mode) {
     return (s32)NC(__G, fn_kmkdir, (u64)path, (u64)mode, 0,0,0,0);
 }
 
-/* printf family — silent. */
 int printf(const char *fmt, ...)                           { (void)fmt; return 0; }
 int fprintf(FILE *f, const char *fmt, ...)                 { (void)f; (void)fmt; return 0; }
 int vfprintf(FILE *f, const char *fmt, __builtin_va_list a) { (void)f; (void)fmt; (void)a; return 0; }
@@ -386,6 +462,5 @@ int getc(FILE *f)                { (void)f; return -1; }
 int ungetc(int c, FILE *f)       { (void)f; return c; }
 char *fgets(char *b, int n, FILE *f) { if (b && n) b[0]=0; (void)f; return 0; }
 
-/* ===== process ===== */
 void exit(int code) { (void)code; for (;;) {} }
 int  system(const char *cmd) { (void)cmd; return -1; }
