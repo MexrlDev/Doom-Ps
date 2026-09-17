@@ -1,17 +1,17 @@
 /*
- * doom-ps/src/main.c — v15
+ * doom-ps/src/main.c — v16
  *
- * Fix over v14: WAD open flags corrected from 0x1101 to 0x0601.
- * FreeBSD/PS4/PS5 O_CREAT = 0x200, O_TRUNC = 0x400, not 0x100/0x1000.
+ * Changes:
+ *   - ps_libc_init now takes log_fd + log_sa so ps_libc can log
+ *   - DG_Init logs before and after malloc
+ *   - DG_DrawFrame logs first hit
+ *   - Extra log after doomgeneric_Create returns (never reached)
  */
 
 #include "core.h"
 #include "doomgeneric_ps.h"
 #include "font.h"
 
-/* ========================================================================
- * Minimal helpers
- * ======================================================================== */
 static void ps_memset(void *dst, u8 val, u64 len) {
     u8 *d = (u8 *)dst;
     while (len--) *d++ = val;
@@ -23,9 +23,6 @@ static void ps_memcpy(void *dst, const void *src, u64 len) {
 }
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 
-/* ========================================================================
- * DualShock bits
- * ======================================================================== */
 #define DS_UP 0x10
 #define DS_RIGHT 0x20
 #define DS_DOWN 0x40
@@ -63,20 +60,13 @@ static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
 #define DG_KEY_6 '6'
 #define DG_KEY_7 '7'
 
-/* ========================================================================
- * FreeBSD / PS4 / PS5 file open flags — THE REAL VALUES
- * ======================================================================== */
 #define O_WRONLY_  0x0001
 #define O_RDWR_    0x0002
-#define O_CREAT_   0x0200   /* correct: FreeBSD standard */
-#define O_TRUNC_   0x0400   /* correct: FreeBSD standard */
-#define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)   /* 0x0601 */
-#define O_RW_CREAT_TRUNC  (O_RDWR_   | O_CREAT_ | O_TRUNC_)   /* 0x0602 */
-#define O_WR_CREAT        (O_WRONLY_ | O_CREAT_)              /* 0x0201 */
+#define O_CREAT_   0x0200
+#define O_TRUNC_   0x0400
+#define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
+#define O_RW_CREAT_TRUNC  (O_RDWR_   | O_CREAT_ | O_TRUNC_)
 
-/* ========================================================================
- * Global context
- * ======================================================================== */
 #define KEY_QUEUE_SIZE 32
 
 static struct ps_ctx {
@@ -115,9 +105,6 @@ static struct ps_ctx {
 
 static char g_diag[256];
 
-/* ========================================================================
- * UDP log
- * ======================================================================== */
 static void udp_log(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->log_fd < 0 || !c->sendto_fn) return;
@@ -144,9 +131,6 @@ static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     udp_log(g_diag);
 }
 
-/* ========================================================================
- * Shared present helper
- * ======================================================================== */
 static void present(struct ps_ctx *c) {
     if (c->video_h < 0 || !c->vid_flip) return;
     NC(c->G, c->vid_flip, (u64)c->video_h, (u64)c->active_fb, 1,
@@ -159,9 +143,6 @@ static void present(struct ps_ctx *c) {
     c->total_frames++;
 }
 
-/* ========================================================================
- * LOADING / progress / error
- * ======================================================================== */
 static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
@@ -233,9 +214,6 @@ static void show_error_and_hang(struct ps_ctx *c, const char *line1,
     }
 }
 
-/* ========================================================================
- * Blit / key / audio
- * ======================================================================== */
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF000000;
     if (!doom) return;
@@ -296,9 +274,6 @@ static void audio_drain(void) {
     }
 }
 
-/* ========================================================================
- * WAD receive — CORRECTED FLAGS 0x0601
- * ======================================================================== */
 #define WAD_CHUNK 4096
 static int recv_wad(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
@@ -306,17 +281,13 @@ static int recv_wad(s32 listen_fd) {
         udp_log("DoomPS: listen_fd < 0\n");
         return -1;
     }
-
     udp_log("DoomPS: waiting for WAD on TCP...\n");
 
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 8) = 500000;
-        s32 so_ret = (s32)NC(c->G, c->setsockopt_fn,
-                             (u64)listen_fd, 0xFFFF, 0x1006,
-                             (u64)tv, 16, 0);
-        if (so_ret != 0)
-            udp_log("DoomPS: WARN SO_RCVTIMEO failed\n");
+        (void)NC(c->G, c->setsockopt_fn,
+                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
     }
 
     int dots = 0;
@@ -333,7 +304,6 @@ static int recv_wad(s32 listen_fd) {
         udp_log("DoomPS: accept failed\n");
         return -1;
     }
-
     show_loading(c, 0, "WAD connected, receiving...");
     udp_log("DoomPS: receiving WAD...\n");
 
@@ -352,80 +322,18 @@ static int recv_wad(s32 listen_fd) {
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
 
-    {
-        int p = 0;
-        const char *m = "DoomPS: WAD size = ";
-        while (*m) g_diag[p++] = *m++;
-        u64 v = wad_size;
-        char tmp[24]; int t = 0;
-        if (v == 0) tmp[t++] = '0';
-        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-        while (t) g_diag[p++] = tmp[--t];
-        g_diag[p++] = '\n'; g_diag[p] = 0;
-        udp_log(g_diag);
-    }
-
-    /* ================================================================
-     * Correct flags: 0x0601 = O_WRONLY | O_CREAT | O_TRUNC
-     * This is exactly what EmuC0re's FTP uses.
-     * ================================================================ */
-    const char *wad_out = (const char *)0;
-    s32 fd = -1;
-
-    udp_log("DoomPS: [W1] kopen /av_contents/content_tmp/doom.wad 0x0601\n");
-    fd = (s32)NC(c->G, c->kopen,
-                 (u64)"/av_contents/content_tmp/doom.wad",
-                 (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
-    diag_kopen("DoomPS: [W1r] ", "/av_contents/content_tmp/doom.wad", fd);
-    if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
+    const char *wad_out = "/av_contents/content_tmp/doom.wad";
+    s32 fd = (s32)NC(c->G, c->kopen,
+                     (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
+    diag_kopen("DoomPS: [W1r] ", wad_out, fd);
 
     if (fd < 0) {
-        udp_log("DoomPS: [W2] kopen /data/doom.wad 0x0601\n");
+        wad_out = "/savedata0/doom.wad";
         fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/data/doom.wad",
-                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W2r] ", "/data/doom.wad", fd);
-        if (fd >= 0) wad_out = "/data/doom.wad";
+                     (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
+        diag_kopen("DoomPS: [W2r] ", wad_out, fd);
     }
-
     if (fd < 0) {
-        udp_log("DoomPS: [W3] kopen /savedata0/doom.wad 0x0601\n");
-        fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/savedata0/doom.wad",
-                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W3r] ", "/savedata0/doom.wad", fd);
-        if (fd >= 0) wad_out = "/savedata0/doom.wad";
-    }
-
-    if (fd < 0) {
-        udp_log("DoomPS: [W4] kopen /temp0/doom.wad 0x0601\n");
-        fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/temp0/doom.wad",
-                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W4r] ", "/temp0/doom.wad", fd);
-        if (fd >= 0) wad_out = "/temp0/doom.wad";
-    }
-
-    if (fd < 0) {
-        udp_log("DoomPS: [W5] kopen /tmp/doom.wad 0x0601\n");
-        fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/tmp/doom.wad",
-                     (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W5r] ", "/tmp/doom.wad", fd);
-        if (fd >= 0) wad_out = "/tmp/doom.wad";
-    }
-
-    /* Fallback: /av_contents with RDWR */
-    if (fd < 0) {
-        udp_log("DoomPS: [W6] kopen /av_contents/content_tmp/doom.wad 0x0602\n");
-        fd = (s32)NC(c->G, c->kopen,
-                     (u64)"/av_contents/content_tmp/doom.wad",
-                     (u64)O_RW_CREAT_TRUNC, 0x1FF, 0,0,0);
-        diag_kopen("DoomPS: [W6r] ", "/av_contents/content_tmp/doom.wad", fd);
-        if (fd >= 0) wad_out = "/av_contents/content_tmp/doom.wad";
-    }
-
-    if (fd < 0 || !wad_out) {
         udp_log("DoomPS: all WAD open attempts failed\n");
         NC(c->G, c->close_fn, (u64)client, 0,0,0,0,0);
         return -1;
@@ -435,15 +343,6 @@ static int recv_wad(s32 listen_fd) {
         int i = 0;
         while (wad_out[i] && i < 127) { c->wad_path[i] = wad_out[i]; i++; }
         c->wad_path[i] = 0;
-    }
-    {
-        int p = 0;
-        const char *m = "DoomPS: using ";
-        while (*m) g_diag[p++] = *m++;
-        int i = 0;
-        while (c->wad_path[i] && p < 250) g_diag[p++] = c->wad_path[i++];
-        g_diag[p++] = '\n'; g_diag[p] = 0;
-        udp_log(g_diag);
     }
 
     u8 chunk[WAD_CHUNK];
@@ -471,29 +370,33 @@ static int recv_wad(s32 listen_fd) {
         udp_log("DoomPS: WAD truncated\n");
         return -1;
     }
-
     udp_log("DoomPS: WAD written OK\n");
     show_loading(c, 3, "WAD ready, launching Doom...");
     return 0;
 }
 
-/* ========================================================================
- * doomgeneric callbacks
- * ======================================================================== */
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
 
 void DG_Init(void) {
+    udp_log("DoomPS: DG_Init entered\n");
     if (!DG_ScreenBuffer) {
+        udp_log("DoomPS: DG_Init malloc 256KB\n");
         DG_ScreenBuffer = (u32 *)malloc(DOOM_W * DOOM_H * 4);
-        if (!DG_ScreenBuffer)
+        if (!DG_ScreenBuffer) {
             udp_log("DoomPS: DG_ScreenBuffer alloc FAILED\n");
+        } else {
+            udp_log("DoomPS: DG_ScreenBuffer alloc OK\n");
+        }
+    } else {
+        udp_log("DoomPS: DG_ScreenBuffer already set\n");
     }
 }
 
 void DG_DrawFrame(void) {
     struct ps_ctx *c = &g_ctx;
+    if (c->total_frames == 0) udp_log("DoomPS: DG_DrawFrame first call\n");
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
@@ -546,9 +449,6 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     }
 }
 
-/* ========================================================================
- * _start
- * ======================================================================== */
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 1;
@@ -568,8 +468,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     udp_log("DoomPS: [3] sendto resolved\n");
     ext->step = 3;
 
-    extern void ps_libc_init(void *G, void *D);
-    ps_libc_init(G, D);
+    extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
+    ps_libc_init(G, D, c->log_fd, c->log_sa);
     udp_log("DoomPS: [4] ps_libc_init OK\n");
     ext->step = 4;
 
@@ -772,22 +672,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
-    {
-        char b[80]; int p = 0;
-        const char *m = "DoomPS: [34] pad_h="; while (*m) b[p++]=*m++;
-        int v = c->pad_h;
-        if (v < 0) { b[p++]='-'; v=-v; }
-        if (v>=100) b[p++]='0'+(v/100)%10;
-        if (v>=10)  b[p++]='0'+(v/10)%10;
-        b[p++]='0'+v%10;
-        b[p++]=' '; b[p++]='u'; b[p++]='i'; b[p++]='d'; b[p++]='=';
-        v = c->user_id;
-        if (v>=100) b[p++]='0'+(v/100)%10;
-        if (v>=10)  b[p++]='0'+(v/10)%10;
-        b[p++]='0'+v%10;
-        b[p++]='\n'; b[p]=0;
-        udp_log(b);
-    }
+    udp_log("DoomPS: [34] pad query done\n");
     ext->step = 34;
 
     s32 tcp_listen_fd = (s32)ext->dbg[0];
@@ -828,7 +713,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 37;
     doomgeneric_Create(3, (char **)argv);
 
-    udp_log("DoomPS: [38] main loop\n");
+    /* doomgeneric_Create never returns normally, but if it does... */
+    udp_log("DoomPS: [38] doomgeneric_Create returned\n");
     ext->step = 38;
     while (1) {
         doomgeneric_Tick();
