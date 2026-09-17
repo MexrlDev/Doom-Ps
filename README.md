@@ -55,8 +55,6 @@ ready to paste into doom_launcher.lua).~~
 
 ## Deploy
 
-## Deploy
-
 ### 1. Edit `doom_launcher.lua`
 
 ```lua
