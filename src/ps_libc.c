@@ -6,12 +6,13 @@
  *     fread calls sceKernelRead on demand.  fseek calls sceKernelLseek.
  *     Previously fopen malloc'd the ENTIRE file, so a 12.4 MB WAD cost
  *     24.8 MB of pool per session (Doom opens each WAD twice).  Session
- *     2 was OOM'ing the pool and I_RegisterSong failed → no music.
+ *     2 was OOM'ing the pool and I_RegisterSong failed, killing music.
  *   - Added ps_libc_close_all_files() to close any lingering fd before
  *     reset_doom_globals() wipes __files[].
  *
- * v15: marked __G/__D/fn_*/pool/stdio as PS_PERSIST so they survive
- *      the BSS wipe between Doom sessions.
+ * v15: marked libc internal state (G pointer, D pointer, fn pointers,
+ *      memory pool, stdio objects) as PS_PERSIST so it survives the
+ *      BSS wipe between Doom sessions.
  */
 
 #include "core.h"
@@ -456,7 +457,7 @@ void *realloc(void *p, size_t size) {
 void free(void *p) { (void)p; }
 
 /* ============================================================
- * mem*
+ * mem* — fast rep movsb / rep stosb
  * ============================================================ */
 void *memcpy(void *d, const void *s, size_t n) {
     void *ret = d;
@@ -710,11 +711,10 @@ int *__errno_location(void) { return &__errno_val; }
 /* ============================================================
  * stdio — v16 LAZY fopen.
  *
- * fopen opens the file and stores its size.  No file data is
- * loaded into the pool.  fread calls sceKernelRead on demand.
- * fseek calls sceKernelLseek.  This eliminates the 24.8 MB /
- * session pool consumption that was OOM'ing session 2's
- * I_RegisterSong and killing music.
+ * fopen opens the file and stores its size.  No file data is loaded
+ * into the pool.  fread calls sceKernelRead on demand.  fseek calls
+ * sceKernelLseek.  This eliminates the 24.8 MB per-session pool
+ * consumption that was OOM'ing session 2's I_RegisterSong.
  * ============================================================ */
 struct _ps_file {
     int fd;
