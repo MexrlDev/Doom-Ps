@@ -872,3 +872,103 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->pad_init_fn = SYM(c->G, c->D, pad_mod, "scePadInit");
     c->pad_geth    = SYM(c->G, c->D, pad_mod, "scePadGetHandle");
     c->pad_read    = SYM(c->G, c->D, pad_mod, "scePadRead");
+    ext->step = 19;
+
+    if (c->cancel) {
+        u64 gs = *(u64 *)(eboot_base + EBOOT_GS_THREAD);
+        if (gs) NC(c->G, c->cancel, gs, 0,0,0,0,0);
+    }
+    NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
+    ext->step = 20;
+
+    s32 emu_vid = *(s32 *)(eboot_base + EBOOT_VIDOUT);
+    if (c->vid_close && emu_vid >= 0)
+        NC(c->G, c->vid_close, (u64)emu_vid, 0,0,0,0,0);
+    NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+    ext->step = 21;
+
+    c->video_h = (s32)NC(c->G, c->vid_open, 0xFF, 0, 0, 0, 0, 0);
+    if (c->video_h < 0) { ext->status = -10; ext->step = 22; return; }
+    ext->step = 23;
+
+    if (c->create_eq) NC(c->G, c->create_eq, (u64)&c->eq, (u64)"doomq",0,0,0,0);
+    if (c->vid_evt && c->eq)
+        NC(c->G, c->vid_evt, c->eq, (u64)c->video_h,0,0,0,0);
+    ext->step = 24;
+
+    u64 mem_total = c->dm_size ? NC(c->G, c->dm_size,0,0,0,0,0,0) : 0x300000000ULL;
+    u64 phys = 0;
+    NC(c->G, c->alloc_dm, 0, mem_total, FB_TOTAL, 0x200000, 3, (u64)&phys);
+    ext->step = 25;
+    c->vmem = 0;
+    NC(c->G, c->map_dm, (u64)&c->vmem, FB_TOTAL, 0x33, 0, phys, 0x200000);
+    if (!c->vmem) { ext->status = -21; ext->step = 26; return; }
+    ext->step = 27;
+
+    c->fbs[0] = c->vmem;
+    c->fbs[1] = (u8 *)c->vmem + FB_ALIGNED;
+    for (int i = 0; i < SCR_W * SCR_H; i++) {
+        ((u32 *)c->fbs[0])[i] = 0xFF000000;
+        ((u32 *)c->fbs[1])[i] = 0xFF000000;
+    }
+    ext->step = 28;
+
+    u8 attr[64]; ps_memset(attr, 0, 64);
+    *(u32*)(attr+0) = 0x80000000; *(u32*)(attr+4) = 1;
+    *(u32*)(attr+12) = SCR_W; *(u32*)(attr+16) = SCR_H; *(u32*)(attr+20) = SCR_W;
+    if (NC(c->G, c->vid_reg, (u64)c->video_h, 0, (u64)c->fbs, 2, (u64)attr, 0) != 0) {
+        ext->status = -30; ext->step = 30; return;
+    }
+    ext->step = 31;
+    if (c->vid_rate) NC(c->G, c->vid_rate, (u64)c->video_h, 0,0,0,0,0);
+
+    show_loading(c, 0, "Doom-PS starting up");
+    ps_libc_set_error_cb(ps_error_display);
+    ext->step = 33;
+
+    if (c->aud_close)
+        for (int h = 0; h < 8; h++)
+            NC(c->G, c->aud_close, (u64)h,0,0,0,0,0);
+    if (c->aud_open)
+        c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
+                             SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
+    ext->step = 34;
+    if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
+    if (c->pad_geth)
+        c->pad_h = (s32)NC(c->G, c->pad_geth, (u64)c->user_id, 0,0,0,0,0);
+    ext->step = 35;
+
+    s32 tcp_listen_fd = (s32)ext->dbg[0];
+    ext->step = 36;
+
+    recv_wads(tcp_listen_fd);
+    ext->step = 37;
+
+    if (g_wad_count == 0) {
+        show_error_and_hang(c, "No WAD files received",
+                            "Send .wad files from the PC launcher");
+    }
+
+    /* Audio thread is now (re)started at the beginning of each Doom
+     * session by run_doom(), so it doesn't spin during the menu. */
+    ext->step = 38;
+
+    while (1) {
+        int sel = show_wad_menu(c);
+        if (sel < 0) break;
+        run_doom(c, sel);
+    }
+
+    delete_all_wads();
+
+    if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+    if (c->aud_close && c->audio_h >= 0)
+        NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
+    if (c->vid_close && c->video_h >= 0)
+        NC(c->G, c->vid_close, (u64)c->video_h, 0,0,0,0,0);
+    if (c->delete_eq && c->eq)
+        NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
+    ext->status = 0;
+    ext->step = 99;
+    udp_log("DoomPS: cleanup done, returning to Lua\n");
+}
