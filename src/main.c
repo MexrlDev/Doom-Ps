@@ -1,13 +1,14 @@
 /*
- * doom-ps/src/main.c — v39
+ * doom-ps/src/main.c — v40
  *
- * v39:
- *   - FIXED Quit Game crash: ps_longjmp now does addq $8, %rsp after
- *     restoring rsp, because the saved rsp pointed at the return
- *     address (which a normal ret would have popped).  Without this,
- *     every local variable in _start was 8 bytes off and the final
- *     ret popped garbage.
- *   - Everything else identical to v38.
+ * v40:
+ *   - recv_wad now closes any stale handle to /av_contents/content_tmp/doom.wad
+ *     before opening it for writing.  This fixes the intermittent
+ *     "won't take the wad on relaunch" issue where the previous run's
+ *     WAD file descriptor wasn't released yet when Lua re-bound the
+ *     sockets.
+ *   - Everything else identical to v39 (clean exit via setjmp/longjmp,
+ *     full controller mapping, mkdir .savegame, etc.).
  */
 
 #include "core.h"
@@ -459,6 +460,18 @@ static int recv_wad(s32 listen_fd) {
     }
     u64 wad_size = 0;
     for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
+
+    /* v40: Close any stale handle to the WAD before overwriting.
+     * Without this, a previous run that didn't fully tear down its
+     * WAD fd can leave the file locked and the next launch's open
+     * with O_TRUNC silently fails or returns EBUSY. */
+    {
+        const char *p1 = "/av_contents/content_tmp/doom.wad";
+        s32 stale = (s32)NC(c->G, c->kopen, (u64)p1,
+                            (u64)0x0000, 0, 0, 0, 0);
+        if (stale >= 0) NC(c->G, c->kclose, (u64)stale, 0,0,0,0,0);
+    }
+
     const char *wad_out = "/av_contents/content_tmp/doom.wad";
     s32 fd = (s32)NC(c->G, c->kopen,
                      (u64)wad_out, (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
