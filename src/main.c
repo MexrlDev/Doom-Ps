@@ -1,14 +1,14 @@
 /*
- * doom-ps/src/main.c — v41
+ * doom-ps/src/main.c — v42
  *
- * v41:
- *   - Multi-WAD receive on port 5000. Each WAD uses a new protocol:
- *     [u64 size][u16 namelen][name bytes][data].
- *   - WAD picker menu with 3-visible scrolling list, up/down navigation
- *     with wrap-around, Cross to select, Circle to quit to Lua.
- *   - In-game Quit Game returns to the menu.
- *   - On Circle-from-menu, all WADs are deleted from av_contents.
- *   - Clean exit via setjmp/longjmp (addq $8, %rsp fix from v39).
+ * v42:
+ *   - Restored all six DG_* callbacks (DG_Init, DG_DrawFrame,
+ *     DG_SleepMs, DG_GetTicksMs, DG_GetKey, DG_SetWindowTitle).
+ *     They were accidentally removed during the v41 multi-WAD rewrite,
+ *     so the linker couldn't find them from doomgeneric.
+ *   - Added extern declarations for doomgeneric_Create / _Tick.
+ *   - Everything else identical to v41 (multi-WAD menu, clean exit,
+ *     full controller mapping).
  */
 
 #include "core.h"
@@ -23,6 +23,11 @@ extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
+
+/* doomgeneric API */
+extern u32 *DG_ScreenBuffer;
+extern void doomgeneric_Create(int argc, char **argv);
+extern void doomgeneric_Tick(void);
 
 #define DOOMFB_W  320
 #define DOOMFB_H  200
@@ -350,6 +355,81 @@ static void *audio_thread_fn(void *arg) {
     return 0;
 }
 
+/* ============================================================
+ * doomgeneric callbacks — restored in v42
+ * ============================================================ */
+
+void DG_Init(void) {
+    udp_log("DoomPS: DG_Init entered\n");
+    if (!DG_ScreenBuffer) udp_log("DoomPS: WARN DG_ScreenBuffer is NULL\n");
+    else                  udp_log("DoomPS: DG_ScreenBuffer preserved\n");
+}
+
+void DG_DrawFrame(void) {
+    static int draw_count = 0;
+    draw_count++;
+    struct ps_ctx *c = &g_ctx;
+    if (draw_count == 1 || draw_count == 2 || draw_count == 3) {
+        char b[64]; int p = 0;
+        const char *m = "DoomPS: DG_DrawFrame #";
+        while (*m) b[p++] = *m++;
+        b[p++] = '0' + draw_count;
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    } else if ((draw_count % 60) == 0) {
+        char b[64]; int p = 0;
+        const char *m = "DoomPS: DG_DrawFrame #";
+        while (*m) b[p++] = *m++;
+        int v = draw_count;
+        char tmp[16]; int t = 0;
+        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+        while (t) b[p++] = tmp[--t];
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    }
+    blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
+    present(c);
+    if (c->ext) c->ext->frame_count = c->total_frames;
+    if (c->pad_h >= 0 && c->pad_read) {
+        u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
+        s32 n = (s32)NC(c->G, c->pad_read,
+                        (u64)c->pad_h, (u64)pad_buf, 1, 0, 0, 0);
+        if (n > 0 && (u32)n < 0x80000000) {
+            u32 raw = *(u32 *)pad_buf;
+            if (!(raw & 0x80000000)) translate_pad(raw & DS_PAD_MASK);
+        }
+    }
+}
+
+void DG_SleepMs(unsigned int ms) {
+    struct ps_ctx *c = &g_ctx;
+    if (c->usleep_fn) NC(c->G, c->usleep_fn, (u64)ms * 1000ULL, 0,0,0,0,0);
+}
+
+unsigned int DG_GetTicksMs(void) {
+    struct ps_ctx *c = &g_ctx;
+    if (!c->clock_gettime) return c->total_frames * 16;
+    u64 ts[2] = {0,0};
+    s32 rc = (s32)NC(c->G, c->clock_gettime, 4, (u64)ts, 0,0,0,0);
+    if (rc != 0) return c->total_frames * 16;
+    return (unsigned int)(ts[0] * 1000ULL + ts[1] / 1000000ULL);
+}
+
+int DG_GetKey(int *pressed, unsigned char *doomKey) {
+    struct ps_ctx *c = &g_ctx;
+    if (c->key_rp == c->key_wp) return 0;
+    *doomKey = c->key_queue[c->key_rp].key;
+    *pressed = c->key_queue[c->key_rp].pressed;
+    c->key_rp = (c->key_rp + 1) & (KEY_QUEUE_SIZE - 1);
+    return 1;
+}
+
+void DG_SetWindowTitle(const char *t) { (void)t; }
+
+/* ============================================================
+ * WAD management
+ * ============================================================ */
+
 static void delete_all_wads(void) {
     struct ps_ctx *c = &g_ctx;
     for (int i = 0; i < g_wad_count; i++) {
@@ -489,7 +569,6 @@ done:
 
 static int show_wad_menu(struct ps_ctx *c) {
     int prev_btn = 0;
-    static int blink = 0;
 
     for (;;) {
         u32 raw = 0;
@@ -554,7 +633,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         ps_draw_str_center(fb, SCR_H - 100, "X = SELECT   O = QUIT", 0xFF909090, 3);
 
         present(c);
-        blink++;
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 16000, 0,0,0,0,0);
     }
 }
