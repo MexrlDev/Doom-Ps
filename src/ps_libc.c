@@ -1,18 +1,17 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v16:
- *   - LAZY fopen/fread.  fopen now just opens the fd and stores size.
- *     fread calls sceKernelRead on demand.  fseek calls sceKernelLseek.
- *     Previously fopen malloc'd the ENTIRE file, so a 12.4 MB WAD cost
- *     24.8 MB of pool per session (Doom opens each WAD twice).  Session
- *     2 was OOM'ing the pool and I_RegisterSong failed, killing music.
- *   - Added ps_libc_close_all_files() to close any lingering fd before
- *     reset_doom_globals() wipes __files[].
+ * v15: Marked __G, __D, all fn_* pointers, __log_fd, __log_sa,
+ *      __log_ready, __error_cb, __pool, __pool_size, __pool_used,
+ *      stderr/stdout/stdin, and __null_file as PS_PERSIST so they
+ *      survive reset_doom_globals()'s BSS wipe.  No more save/restore
+ *      dance needed.
  *
- * v15: marked libc internal state (G pointer, D pointer, fn pointers,
- *      memory pool, stdio objects) as PS_PERSIST so it survives the
- *      BSS wipe between Doom sessions.
+ * v14: Added ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
+ *      (Kept for compatibility — not used by main.c anymore.)
+ *
+ * v13: exit() only fires the error dialog when code != 0.
+ * v12: exit() longjmps back to _start cleanup.
  */
 
 #include "core.h"
@@ -708,20 +707,13 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
 static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
 
-/* ============================================================
- * stdio — v16 LAZY fopen.
- *
- * fopen opens the file and stores its size.  No file data is loaded
- * into the pool.  fread calls sceKernelRead on demand.  fseek calls
- * sceKernelLseek.  This eliminates the 24.8 MB per-session pool
- * consumption that was OOM'ing session 2's I_RegisterSong.
- * ============================================================ */
+/* ===== stdio ===== */
 struct _ps_file {
     int fd;
     int writable;
     long pos;
     long size;
-    unsigned char *buf;   /* unused in lazy mode; kept for ABI */
+    unsigned char *buf;
 };
 
 PS_PERSIST static struct _ps_file __null_file = { -1, 0, 0, 0, 0 };
@@ -745,15 +737,17 @@ static int __fopen_count = 0;
 FILE *fopen(const char *path, const char *mode) {
     if (!fn_kopen) return 0;
 
-    if (__fopen_count < 64) {
+    if (__fopen_count < 32) {
         __fopen_count++;
         char b[240]; int p = 0;
         const char *pre = "ps_libc: fopen ENTRY path=\"";
         while (*pre && p < 40) b[p++] = *pre++;
         int i = 0;
         while (i < 150 && path && path[i] && p < 220) b[p++] = path[i++];
-        b[p++] = '"'; b[p++] = ' ';
-        b[p++] = 'm'; b[p++] = '=';
+        b[p++] = '"';
+        b[p++] = ' ';
+        b[p++] = 'm';
+        b[p++] = '=';
         b[p++] = (mode && mode[0]) ? mode[0] : '?';
         b[p++] = '\n'; b[p] = 0;
         ps_libc_log(b);
@@ -763,6 +757,18 @@ FILE *fopen(const char *path, const char *mode) {
     int flags = writable ? 0x601 : 0x0000;
 
     s32 fd = (s32)NC(__G, fn_kopen, (u64)path, flags, 0x1FF, 0, 0, 0);
+
+    if (__fopen_count <= 32) {
+        char b[80]; int p = 0;
+        const char *pre = "ps_libc: fopen fd=0x";
+        while (*pre && p < 24) b[p++] = *pre++;
+        const char h[] = "0123456789ABCDEF";
+        u32 v = (u32)fd;
+        for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
+        b[p++] = '\n'; b[p] = 0;
+        ps_libc_log(b);
+    }
+
     if (fd < 0) return 0;
 
     FILE *f = alloc_slot();
@@ -778,8 +784,24 @@ FILE *fopen(const char *path, const char *mode) {
         long sz = (long)NC(__G, fn_klseek, (u64)fd, 0, 2, 0,0,0);
         NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
         if (sz < 0) sz = 0;
-        f->size = sz;
-        /* fd stays open; fread reads on demand. */
+        if (sz > 0) {
+            unsigned char *b = (unsigned char *)malloc((size_t)sz);
+            if (b) {
+                long total = 0;
+                while (total < sz) {
+                    s32 n = (s32)NC(__G, fn_kread, (u64)fd,
+                                    (u64)(b + total), (u64)(sz - total), 0,0,0);
+                    if (n <= 0) break;
+                    total += n;
+                }
+                f->buf = b;
+                f->size = total;
+            } else {
+                ps_libc_log("ps_libc: fopen READ malloc FAILED\n");
+            }
+        }
+        NC(__G, fn_kclose, (u64)fd, 0,0,0,0,0);
+        f->fd = -1;
     }
     return f;
 }
@@ -792,34 +814,17 @@ int fclose(FILE *f) {
     return 0;
 }
 
-void ps_libc_close_all_files(void) {
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (__files[i].fd > 0 && fn_kclose)
-            NC(__G, fn_kclose, (u64)__files[i].fd, 0,0,0,0,0);
-        __files[i].fd = 0;
-        __files[i].buf = 0;
-        __files[i].pos = 0;
-        __files[i].size = 0;
-    }
-}
-
 size_t fread(void *ptr, size_t sz, size_t n, FILE *f) {
-    if (!f || f->fd < 0 || sz == 0) return 0;
+    if (!f || !f->buf || sz == 0) return 0;
     size_t want = sz * n;
     long avail = f->size - f->pos;
     if (avail <= 0) return 0;
     if ((long)want > avail) want = (size_t)avail;
-
-    s32 total = 0;
-    while (total < (s32)want) {
-        s32 got = (s32)NC(__G, fn_kread, (u64)f->fd,
-                          (u64)((u8 *)ptr + total),
-                          (u64)(want - total), 0, 0, 0);
-        if (got <= 0) break;
-        total += got;
-    }
-    f->pos += total;
-    return (size_t)total / sz;
+    unsigned char *d = (unsigned char *)ptr;
+    unsigned char *s = f->buf + f->pos;
+    for (size_t i = 0; i < want; i++) d[i] = s[i];
+    f->pos += (long)want;
+    return want / sz;
 }
 
 size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
@@ -833,20 +838,9 @@ size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
 
 int fseek(FILE *f, long off, int whence) {
     if (!f) return -1;
-    if (f->fd < 0) {
-        if (whence == 0)      f->pos = off;
-        else if (whence == 1) f->pos += off;
-        else if (whence == 2) f->pos = f->size + off;
-        return 0;
-    }
-    int w;
-    if      (whence == 0) w = 0;
-    else if (whence == 1) w = 1;
-    else if (whence == 2) w = 2;
-    else return -1;
-    s64 new_pos = (s64)NC(__G, fn_klseek, (u64)f->fd, (u64)off, (u64)w, 0, 0, 0);
-    if (new_pos < 0) return -1;
-    f->pos = (long)new_pos;
+    if (whence == 0)      f->pos = off;
+    else if (whence == 1) f->pos += off;
+    else if (whence == 2) f->pos = f->size + off;
     return 0;
 }
 long ftell(FILE *f)  { return f ? f->pos : -1; }
@@ -1011,8 +1005,71 @@ void exit(int code) {
 
 int  system(const char *cmd) { (void)cmd; return -1; }
 
-/* ===== pool reset (called between sessions) ===== */
+/* ============================================================
+ * Legacy save/restore API.  No longer used by main.c (state is
+ * now marked PS_PERSIST directly), but kept for compatibility in
+ * case any external code links against it.
+ * ============================================================ */
+#define PS_LIBC_SAVE_MAGIC 0x50C1B0B0C0DEULL
+
+void ps_libc_save(void *buf) {
+    u8 *b = (u8 *)buf;
+    u64 p = 0;
+    *(u64 *)(b + p) = PS_LIBC_SAVE_MAGIC; p += 8;
+    *(void **)(b + p) = __G;              p += 8;
+    *(void **)(b + p) = __D;              p += 8;
+    *(void **)(b + p) = fn_mmap;          p += 8;
+    *(void **)(b + p) = fn_munmap;        p += 8;
+    *(void **)(b + p) = fn_kopen;         p += 8;
+    *(void **)(b + p) = fn_kread;         p += 8;
+    *(void **)(b + p) = fn_kwrite;        p += 8;
+    *(void **)(b + p) = fn_kclose;        p += 8;
+    *(void **)(b + p) = fn_klseek;        p += 8;
+    *(void **)(b + p) = fn_kmkdir;        p += 8;
+    *(void **)(b + p) = fn_alloc_dm;      p += 8;
+    *(void **)(b + p) = fn_map_dm;        p += 8;
+    *(void **)(b + p) = fn_dm_size;       p += 8;
+    *(void **)(b + p) = fn_sendto;        p += 8;
+    *(s32 *)(b + p) = __log_fd;           p += 4;
+    for (int i = 0; i < 16; i++) b[p + i] = __log_sa[i];
+    p += 16;
+    *(int *)(b + p) = __log_ready;        p += 4;
+    p += 4;
+    *(unsigned char **)(b + p) = __pool;  p += 8;
+    *(size_t *)(b + p) = __pool_size;     p += 8;
+    *(size_t *)(b + p) = __pool_used;     p += 8;
+    *(void (**)(const char *))(b + p) = __error_cb; p += 8;
+}
+
+void ps_libc_restore(const void *buf) {
+    const u8 *b = (const u8 *)buf;
+    if (*(const u64 *)(b + 0) != PS_LIBC_SAVE_MAGIC) return;
+    u64 p = 8;
+    __G = *(void **)(b + p);        p += 8;
+    __D = *(void **)(b + p);        p += 8;
+    fn_mmap     = *(void **)(b + p); p += 8;
+    fn_munmap   = *(void **)(b + p); p += 8;
+    fn_kopen    = *(void **)(b + p); p += 8;
+    fn_kread    = *(void **)(b + p); p += 8;
+    fn_kwrite   = *(void **)(b + p); p += 8;
+    fn_kclose   = *(void **)(b + p); p += 8;
+    fn_klseek   = *(void **)(b + p); p += 8;
+    fn_kmkdir   = *(void **)(b + p); p += 8;
+    fn_alloc_dm = *(void **)(b + p); p += 8;
+    fn_map_dm   = *(void **)(b + p); p += 8;
+    fn_dm_size  = *(void **)(b + p); p += 8;
+    fn_sendto   = *(void **)(b + p); p += 8;
+    __log_fd = *(s32 *)(b + p);      p += 4;
+    for (int i = 0; i < 16; i++) __log_sa[i] = b[p + i];
+    p += 16;
+    __log_ready = *(int *)(b + p);   p += 4;
+    p += 4;
+    __pool      = *(unsigned char **)(b + p); p += 8;
+    __pool_size = *(size_t *)(b + p);         p += 8;
+    __pool_used = *(size_t *)(b + p);         p += 8;
+    __error_cb  = *(void (**)(const char *))(b + p); p += 8;
+}
+
 void ps_libc_reset_pool(void) {
     __pool_used = 0;
-    __malloc_count = 0;
 }
