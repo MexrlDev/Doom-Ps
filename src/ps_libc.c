@@ -1,15 +1,17 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v14: added ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
- *      main.c calls these around the BSS wipe that runs between Doom
- *      sessions, so our function pointers and 64 MB memory pool
- *      survive the wipe.
+ * v15: Marked __G, __D, all fn_* pointers, __log_fd, __log_sa,
+ *      __log_ready, __error_cb, __pool, __pool_size, __pool_used,
+ *      stderr/stdout/stdin, and __null_file as PS_PERSIST so they
+ *      survive reset_doom_globals()'s BSS wipe.  No more save/restore
+ *      dance needed.
+ *
+ * v14: Added ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
+ *      (Kept for compatibility — not used by main.c anymore.)
  *
  * v13: exit() only fires the error dialog when code != 0.
- *
- * v12: exit() calls ps_doom_exit_now() (setjmp/longjmp back to _start
- *      cleanup) instead of for(;;) {}.
+ * v12: exit() longjmps back to _start cleanup.
  */
 
 #include "core.h"
@@ -17,13 +19,12 @@
 #include <stdarg.h>
 
 typedef struct _ps_file FILE;
-
 extern void ps_doom_exit_now(void);
 
 /* ============================================================
  * Error capture
  * ============================================================ */
-static void (*__error_cb)(const char *msg) = 0;
+PS_PERSIST static void (*__error_cb)(const char *msg) = 0;
 static char __last_err[256];
 static int  __last_err_len = 0;
 
@@ -41,15 +42,15 @@ static void __capture_err(const char *s, int len) {
 }
 
 /* ===== one-time init ===== */
-static void *__G, *__D;
-static void *fn_mmap, *fn_munmap;
-static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
-static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
-static void *fn_sendto;
+PS_PERSIST static void *__G, *__D;
+PS_PERSIST static void *fn_mmap, *fn_munmap;
+PS_PERSIST static void *fn_kopen, *fn_kread, *fn_kwrite, *fn_kclose, *fn_klseek, *fn_kmkdir;
+PS_PERSIST static void *fn_alloc_dm, *fn_map_dm, *fn_dm_size;
+PS_PERSIST static void *fn_sendto;
 
-static s32 __log_fd = -1;
-static u8  __log_sa[16];
-static int __log_ready = 0;
+PS_PERSIST static s32 __log_fd = -1;
+PS_PERSIST static u8  __log_sa[16];
+PS_PERSIST static int __log_ready = 0;
 
 static void ps_libc_log(const char *msg) {
     if (!__log_ready || __log_fd < 0 || !fn_sendto) return;
@@ -90,11 +91,8 @@ typedef struct {
 } _out;
 
 static void _putc(_out *o, char c) {
-    if (o->pos + 1 < o->cap) {
-        o->buf[o->pos] = c;
-    } else {
-        o->ovf = 1;
-    }
+    if (o->pos + 1 < o->cap) o->buf[o->pos] = c;
+    else o->ovf = 1;
     o->pos++;
 }
 
@@ -139,22 +137,12 @@ static void _putf(_out *o, double d) {
 
 int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
     _out o = { buf, n, 0, 0 };
-    if (!buf || n == 0) {
-        o.buf = (char *)0;
-        o.cap = 0;
-    }
-    if (!fmt) {
-        if (n) buf[0] = 0;
-        return 0;
-    }
+    if (!buf || n == 0) { o.buf = (char *)0; o.cap = 0; }
+    if (!fmt) { if (n) buf[0] = 0; return 0; }
 
     while (*fmt) {
-        if (*fmt != '%') {
-            _putc(&o, *fmt++);
-            continue;
-        }
+        if (*fmt != '%') { _putc(&o, *fmt++); continue; }
         fmt++;
-
         if (*fmt == '%') { _putc(&o, '%'); fmt++; continue; }
 
         int zero_pad = 0, left = 0;
@@ -179,19 +167,13 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
                 precision = precision * 10 + (*fmt - '0');
                 fmt++;
             }
-            if (precision > width) {
-                width = precision;
-                zero_pad = 1;
-            }
+            if (precision > width) { width = precision; zero_pad = 1; }
         }
 
         int is_long = 0, is_ll = 0, is_short = 0;
         for (;;) {
-            if (*fmt == 'l') {
-                if (is_long) is_ll = 1;
-                is_long = 1;
-                fmt++;
-            } else if (*fmt == 'h') { is_short = 1; fmt++; }
+            if (*fmt == 'l') { if (is_long) is_ll = 1; is_long = 1; fmt++; }
+            else if (*fmt == 'h') { is_short = 1; fmt++; }
             else if (*fmt == 'z' || *fmt == 'j' || *fmt == 't') { is_long = 1; fmt++; }
             else break;
         }
@@ -264,8 +246,7 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
             if (p) *p = (int)o.pos;
             break;
         }
-        case 0:
-            goto done;
+        case 0: goto done;
         default:
             _putc(&o, '%');
             _putc(&o, *fmt);
@@ -310,7 +291,6 @@ static int __printf_count = 0;
 static void log_printf_output(const char *tag, const char *buf, int len) {
     if (__printf_count >= 200) return;
     __printf_count++;
-
     char out[560]; int p = 0;
     while (tag && *tag && p < 20) out[p++] = *tag++;
     out[p++] = ' ';
@@ -358,9 +338,9 @@ int fprintf(FILE *f, const char *fmt, ...) {
 }
 
 /* ===== memory pool ===== */
-static unsigned char *__pool = 0;
-static size_t __pool_size = 0;
-static size_t __pool_used = 0;
+PS_PERSIST static unsigned char *__pool = 0;
+PS_PERSIST static size_t __pool_size = 0;
+PS_PERSIST static size_t __pool_used = 0;
 
 static void log_hex(const char *prefix, u64 v) {
     char b[80]; int p = 0;
@@ -375,11 +355,9 @@ static void log_hex(const char *prefix, u64 v) {
 
 static void *try_dmem_pool(u64 size) {
     if (!fn_alloc_dm || !fn_map_dm) return 0;
-    u64 total = fn_dm_size ? NC(__G, fn_dm_size, 0,0,0,0,0,0)
-                          : 0x300000000ULL;
+    u64 total = fn_dm_size ? NC(__G, fn_dm_size, 0,0,0,0,0,0) : 0x300000000ULL;
     u64 phys = 0;
-    s32 ret = (s32)NC(__G, fn_alloc_dm,
-                      0, total, size, 0x200000, 3, (u64)&phys);
+    s32 ret = (s32)NC(__G, fn_alloc_dm, 0, total, size, 0x200000, 3, (u64)&phys);
     if (ret != 0) { log_hex("ps_libc: DMEM alloc ret=", (u64)(u32)ret); return 0; }
     void *vmem = 0;
     ret = (s32)NC(__G, fn_map_dm, (u64)&vmem, size, 3, 0, phys, 0x200000);
@@ -437,8 +415,7 @@ void *malloc(size_t size) {
         if (n >= 10) b[p++] = '0' + (n / 10) % 10;
         b[p++] = '0' + n % 10;
         b[p++] = ' '; b[p++] = 's'; b[p++] = 'i'; b[p++] = 'z'; b[p++] = 'e';
-        b[p++] = '=';
-        b[p++] = '0'; b[p++] = 'x';
+        b[p++] = '='; b[p++] = '0'; b[p++] = 'x';
         const char h[] = "0123456789ABCDEF";
         u32 v = (u32)size;
         for (int k = 0; k < 8; k++) b[p++] = h[(v >> (28 - k*4)) & 0xF];
@@ -484,12 +461,7 @@ void free(void *p) { (void)p; }
 void *memcpy(void *d, const void *s, size_t n) {
     void *ret = d;
     if (n == 0) return ret;
-    __asm__ volatile (
-        "rep movsb"
-        : "+D"(d), "+S"(s), "+c"(n)
-        :
-        : "memory"
-    );
+    __asm__ volatile ("rep movsb" : "+D"(d), "+S"(s), "+c"(n) : : "memory");
     return ret;
 }
 
@@ -504,12 +476,7 @@ void *memmove(void *d, const void *s, size_t n) {
 void *memset(void *d, int c, size_t n) {
     void *ret = d;
     if (n == 0) return ret;
-    __asm__ volatile (
-        "rep stosb"
-        : "+D"(d), "+c"(n)
-        : "a"((unsigned char)c)
-        : "memory"
-    );
+    __asm__ volatile ("rep stosb" : "+D"(d), "+c"(n) : "a"((unsigned char)c) : "memory");
     return ret;
 }
 
@@ -662,30 +629,21 @@ double fabs(double x) { return x < 0 ? -x : x; }
 double strtod(const char *s, char **endptr) {
     while (*s == ' ' || *s == '\t') s++;
     int neg = 0;
-    if (*s == '-') { neg = 1; s++; }
-    else if (*s == '+') s++;
+    if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
     double v = 0.0;
     while (*s >= '0' && *s <= '9') { v = v * 10.0 + (*s - '0'); s++; }
     if (*s == '.') {
         s++;
         double frac = 0.1;
-        while (*s >= '0' && *s <= '9') {
-            v += (*s - '0') * frac;
-            frac *= 0.1;
-            s++;
-        }
+        while (*s >= '0' && *s <= '9') { v += (*s - '0') * frac; frac *= 0.1; s++; }
     }
     if (*s == 'e' || *s == 'E') {
         s++;
         int eneg = 0;
-        if (*s == '-') { eneg = 1; s++; }
-        else if (*s == '+') s++;
+        if (*s == '-') { eneg = 1; s++; } else if (*s == '+') s++;
         int exp = 0;
         while (*s >= '0' && *s <= '9') { exp = exp * 10 + (*s - '0'); s++; }
-        while (exp-- > 0) {
-            if (eneg) v /= 10.0;
-            else      v *= 10.0;
-        }
+        while (exp-- > 0) { if (eneg) v /= 10.0; else v *= 10.0; }
     }
     if (endptr) *endptr = (char *)s;
     return neg ? -v : v;
@@ -758,10 +716,10 @@ struct _ps_file {
     unsigned char *buf;
 };
 
-static struct _ps_file __null_file = { -1, 0, 0, 0, 0 };
-FILE *stderr = &__null_file;
-FILE *stdout = &__null_file;
-FILE *stdin  = &__null_file;
+PS_PERSIST static struct _ps_file __null_file = { -1, 0, 0, 0, 0 };
+PS_PERSIST FILE *stderr = &__null_file;
+PS_PERSIST FILE *stdout = &__null_file;
+PS_PERSIST FILE *stdin  = &__null_file;
 
 #define MAX_FILES 64
 static struct _ps_file __files[MAX_FILES];
@@ -832,8 +790,7 @@ FILE *fopen(const char *path, const char *mode) {
                 long total = 0;
                 while (total < sz) {
                     s32 n = (s32)NC(__G, fn_kread, (u64)fd,
-                                    (u64)(b + total),
-                                    (u64)(sz - total), 0,0,0);
+                                    (u64)(b + total), (u64)(sz - total), 0,0,0);
                     if (n <= 0) break;
                     total += n;
                 }
@@ -902,7 +859,7 @@ int mkdir(const char *path, unsigned int mode) {
 }
 
 /* ============================================================
- * sscanf — minimal parser
+ * sscanf
  * ============================================================ */
 int vsscanf(const char *s, const char *fmt, va_list ap) {
     int matched = 0;
@@ -921,8 +878,7 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
         case 'd': case 'i': {
             while (*s == ' ' || *s == '\t') s++;
             int neg = 0;
-            if (*s == '-') { neg = 1; s++; }
-            else if (*s == '+') s++;
+            if (*s == '-') { neg = 1; s++; } else if (*s == '+') s++;
             long v = 0; int any = 0;
             while (*s >= '0' && *s <= '9') { v = v*10 + (*s-'0'); s++; any = 1; }
             if (!any) return matched;
@@ -1050,43 +1006,38 @@ void exit(int code) {
 int  system(const char *cmd) { (void)cmd; return -1; }
 
 /* ============================================================
- * v14: State save / restore for main.c's inter-session BSS wipe.
- *
- * The shellcode's BSS is shared with Doom's own globals (both live
- * in the same binary).  Between Doom sessions main.c zeroes the
- * whole BSS to wipe Doom's state — but that also wipes our fn
- * pointers and the 64 MB memory pool.  These helpers snapshot and
- * restore the essential bits.
+ * Legacy save/restore API.  No longer used by main.c (state is
+ * now marked PS_PERSIST directly), but kept for compatibility in
+ * case any external code links against it.
  * ============================================================ */
 #define PS_LIBC_SAVE_MAGIC 0x50C1B0B0C0DEULL
-/* 256 bytes is plenty; callers should use PS_LIBC_SAVE_SIZE. */
 
 void ps_libc_save(void *buf) {
     u8 *b = (u8 *)buf;
     u64 p = 0;
-    *(u64 *)(b + p) = PS_LIBC_SAVE_MAGIC;    p += 8;
-    *(void **)(b + p) = __G;                 p += 8;
-    *(void **)(b + p) = __D;                 p += 8;
-    *(void **)(b + p) = fn_mmap;             p += 8;
-    *(void **)(b + p) = fn_munmap;           p += 8;
-    *(void **)(b + p) = fn_kopen;            p += 8;
-    *(void **)(b + p) = fn_kread;            p += 8;
-    *(void **)(b + p) = fn_kwrite;           p += 8;
-    *(void **)(b + p) = fn_kclose;           p += 8;
-    *(void **)(b + p) = fn_klseek;           p += 8;
-    *(void **)(b + p) = fn_kmkdir;           p += 8;
-    *(void **)(b + p) = fn_alloc_dm;         p += 8;
-    *(void **)(b + p) = fn_map_dm;           p += 8;
-    *(void **)(b + p) = fn_dm_size;          p += 8;
-    *(void **)(b + p) = fn_sendto;           p += 8;
-    *(s32 *)(b + p) = __log_fd;              p += 4;
+    *(u64 *)(b + p) = PS_LIBC_SAVE_MAGIC; p += 8;
+    *(void **)(b + p) = __G;              p += 8;
+    *(void **)(b + p) = __D;              p += 8;
+    *(void **)(b + p) = fn_mmap;          p += 8;
+    *(void **)(b + p) = fn_munmap;        p += 8;
+    *(void **)(b + p) = fn_kopen;         p += 8;
+    *(void **)(b + p) = fn_kread;         p += 8;
+    *(void **)(b + p) = fn_kwrite;        p += 8;
+    *(void **)(b + p) = fn_kclose;        p += 8;
+    *(void **)(b + p) = fn_klseek;        p += 8;
+    *(void **)(b + p) = fn_kmkdir;        p += 8;
+    *(void **)(b + p) = fn_alloc_dm;      p += 8;
+    *(void **)(b + p) = fn_map_dm;        p += 8;
+    *(void **)(b + p) = fn_dm_size;       p += 8;
+    *(void **)(b + p) = fn_sendto;        p += 8;
+    *(s32 *)(b + p) = __log_fd;           p += 4;
     for (int i = 0; i < 16; i++) b[p + i] = __log_sa[i];
     p += 16;
-    *(int *)(b + p) = __log_ready;           p += 4;
-    p += 4;  /* padding */
-    *(unsigned char **)(b + p) = __pool;     p += 8;
-    *(size_t *)(b + p) = __pool_size;        p += 8;
-    *(size_t *)(b + p) = __pool_used;        p += 8;
+    *(int *)(b + p) = __log_ready;        p += 4;
+    p += 4;
+    *(unsigned char **)(b + p) = __pool;  p += 8;
+    *(size_t *)(b + p) = __pool_size;     p += 8;
+    *(size_t *)(b + p) = __pool_used;     p += 8;
     *(void (**)(const char *))(b + p) = __error_cb; p += 8;
 }
 
@@ -1119,9 +1070,6 @@ void ps_libc_restore(const void *buf) {
     __error_cb  = *(void (**)(const char *))(b + p); p += 8;
 }
 
-/* Reset just the "used" pointer so the same 64 MB pool is reused for
- * the next Doom session.  Doom's Z_Init reallocates its zone from the
- * start of the pool, overwriting the previous session's data. */
 void ps_libc_reset_pool(void) {
     __pool_used = 0;
 }
