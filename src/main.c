@@ -1,16 +1,14 @@
 /*
- * doom-ps/src/main.c — v54
+ * doom-ps/src/main.c — v55
  *
- * v54:
- *   - Call ps_libc_reset_pool() at session reset so session 2's Doom
- *     starts from offset 0 in the 64 MB pool.  Without this, session
- *     2's allocations continue from wherever session 1 left off; if
- *     session 1 used most of the pool, session 2 fails on lump cache.
- *   - Unlink .default.cfg from the two likely CWDs between sessions.
- *     Session 1 saves musicvol=64 (a scaled value) into the config,
- *     which session 2 then reloads; that broke I_SetMusicVolume.
- *   - Music/SFX louder is in i_sound_ps.c (v25).  No changes here.
+ * v55:
+ *   - MENU: Circle (O) = confirm, Cross (X) = back.  Was the other
+ *     way around.  Matches the PlayStation convention and the user
+ *     request.
+ *   - RESET: call ps_libc_close_all_files() before the BSS wipe, so
+ *     any fd Doom left open doesn't leak across sessions.
  *
+ * v54: pool reset between sessions; delete .default.cfg on reset.
  * v53: .ps_persist section holds g_ctx, g_wads, exit flags.
  * v52: mixer divisions → multiplies; audio sleep removed.
  * v51: rising-edge menu input; SO_LINGER 0 on listener close.
@@ -39,7 +37,8 @@ extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 extern void  ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
-extern void  ps_libc_reset_pool(void);   /* v54 */
+extern void  ps_libc_reset_pool(void);
+extern void  ps_libc_close_all_files(void);    /* v55 */
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -614,6 +613,8 @@ done:
 
 /* ============================================================
  * WAD menu — 7 visible rows, no wrap-around.
+ *
+ * v55: Circle (O) = confirm, Cross (X) = back.
  * ============================================================ */
 
 #define MENU_VISIBLE 7
@@ -679,8 +680,9 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
-        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
+        /* v55: Circle = confirm, Cross = back. */
+        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return g_wad_cursor;
+        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return -1;
 
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -726,7 +728,8 @@ static int show_wad_menu(struct ps_ctx *c) {
         counter[cp] = 0;
         ps_draw_str_center(fb, SCR_H - 110, counter, 0xFF808080, 3);
 
-        ps_draw_str_center(fb, SCR_H - 50, "X = SELECT   O = QUIT",
+        /* v55: updated hint. */
+        ps_draw_str_center(fb, SCR_H - 50, "O = SELECT   X = BACK",
                            0xFF909090, 3);
 
         present(c);
@@ -737,22 +740,20 @@ static int show_wad_menu(struct ps_ctx *c) {
 /* ============================================================
  * reset_doom_globals
  *
+ * v55:
+ *   - ps_libc_close_all_files() before the wipe.
  * v54:
- *   - Also call ps_libc_reset_pool() so session 2's Doom allocations
- *     start at pool offset 0.  Without this, session 2's Z_Init /
- *     W_Init allocations continue from wherever session 1 left off;
- *     if session 1 used most of the pool, session 2 fails on lump
- *     cache and music.
- *   - Unlink .default.cfg from the two likely CWDs so session 2 starts
- *     with Doom's default snd_musicvolume (8), not the scaled value
- *     session 1 wrote (64).
+ *   - ps_libc_reset_pool() so session 2 allocates from offset 0.
+ *   - delete .default.cfg so volume isn't inherited.
  * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
 
-    /* Delete the stale config so Doom's volume doesn't get inherited
-     * across sessions.  Try both likely CWDs. */
+    /* v55: release any fds Doom left open. */
+    ps_libc_close_all_files();
+
+    /* Delete stale config so volume isn't inherited across sessions. */
     {
         struct ps_ctx *c = &g_ctx;
         if (c->unlink_fn) {
@@ -768,11 +769,9 @@ static void reset_doom_globals(void) {
 
     log_wad_count("DoomPS: post-wipe wads=");
 
-    /* v54: reset the memory pool so Doom starts clean. */
     ps_libc_reset_pool();
     udp_log("DoomPS: pool reset\n");
 
-    /* Clear framebuffers. */
     if (g_ctx.fbs[0]) {
         u32 *fb = (u32 *)g_ctx.fbs[0];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
