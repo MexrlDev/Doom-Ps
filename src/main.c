@@ -1,16 +1,19 @@
 /*
- * doom-ps/src/main.c — v55
+ * doom-ps/src/main.c — v55b
+ *
+ * v55b:
+ *   - Post-WAD accept timeout raised from 300 ms to 3000 ms.  The
+ *     previous 300 ms window was occasionally exceeded by Python's
+ *     close→sleep→reconnect sequence on the phone, so the console
+ *     would give up after receiving only WAD 1 of 2.  3000 ms gives
+ *     plenty of slack while still feeling instant to the user.
  *
  * v55:
- *   - WAD STALL DETECTION: SO_RCVTIMEO on the accepted client reduced
- *     from 30 s → 5 s, and the per-transfer retry counter reduced from
- *     30 → 3.  A stalled sender now triggers the error screen after
- *     ~20 seconds instead of ~15 minutes.
- *   - WAD TRUNCATION ERROR: if a transfer is cut short (stall OR
- *     graceful close with bytes remaining), we now delete the partial
- *     file, delete every WAD received so far this session, clear the
- *     WAD list, and show a "WAD TRANSFER INCOMPLETE" error screen.
- *     User presses O to return to Lua.
+ *   - WAD stall detection: SO_RCVTIMEO 30 s → 5 s, retries 30 → 3.
+ *     A stalled sender now triggers the error screen after ~20 s.
+ *   - WAD truncation error: any incomplete WAD deletes the partial
+ *     file AND every WAD received so far this session, then shows
+ *     "WAD TRANSFER INCOMPLETE" and exits to Lua on Circle.
  *
  * v54: Cross→Escape in Doom menus; error screens exit to Lua on Circle.
  * v53: PS_PERSIST linker section; SAMPLES_PER_BUF 2048.
@@ -348,8 +351,7 @@ static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
                     if (*sp == 0 || *sp == '\n' || lp >= 63) {
                         line[lp] = 0;
                         if (lp > 0) {
-                            ps_draw_str_center(fb, 520 + (lp > 0 ? 0 : 0),
-                                               line, 0xFFA0A0A0, 3);
+                            ps_draw_str_center(fb, 520, line, 0xFFA0A0A0, 3);
                         }
                         if (*sp == 0) break;
                         sp++;
@@ -645,7 +647,12 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        int wait_ms = (g_wad_count == 0) ? 30000 : 300;
+        /* v55b: first client gets 30 s (Python sleeps wad_delay after
+         * shellcode).  Subsequent clients get 3000 ms — was 300 ms,
+         * which was occasionally exceeded by Python's close→sleep→
+         * reconnect sequence, causing us to give up after WAD 1. */
+        int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
+
         int ready = wait_readable(c, listen_fd, wait_ms);
         if (ready <= 0) {
             if (ready < 0) {
@@ -661,7 +668,7 @@ static int recv_wads(s32 listen_fd) {
                              (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client < 0) break;
 
-        /* v55: reduced from 30 s → 5 s so stalls are detected quickly. */
+        /* v55: 5 s recv timeout so stalls are detected quickly. */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
             *(u64 *)(tv + 0) = WAD_RECV_TIMEOUT_SEC;
@@ -741,8 +748,6 @@ static int recv_wads(s32 listen_fd) {
         int last_pct = -1;
         show_wad_progress(c, name, 0, wad_size);
 
-        /* v55: stall detection.  Any successful recv resets the counter.
-         * WAD_RECV_MAX_RETRIES consecutive timeouts = sender stalled. */
         int retries = 0;
         int stalled = 0;
         while (remaining > 0) {
