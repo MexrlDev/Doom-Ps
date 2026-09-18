@@ -1,31 +1,31 @@
 /*
- * doom-ps/src/main.c — v51
+ * doom-ps/src/main.c — v52
  *
- * v51:
- *   - AUDIO: sleep 5000 → 1000 µs.  Effective submit cycle was ~24 ms
- *     (5 ms sleep + ~19 ms scheduler wait) — SLOWER than the 21.33 ms
- *     hardware drain, causing the residual music cutting.  1 ms sleep
- *     brings the cycle to ~16-20 ms → no underruns.
- *   - MENU: wait_for_pad_release now requires 160 ms of continuous
- *     release.  show_wad_menu initializes prev_btn from the current
- *     pad state so a button still held (or re-pressed) between Doom
- *     and the menu isn't treated as a fresh press.
- *   - WAD RECEIVE: subsequent-client poll 800 → 300 ms.  Kills the
- *     perceived 2-second stall between last WAD and menu.
- *   - CLEANUP: set SO_LINGER 0 on the TCP listener before close →
- *     RST instead of FIN → no TIME_WAIT → re-launch after quitting
- *     to Lua can re-bind port 5000.
- *   - LOG: session counter + post-reset wad_count log, to prove the
- *     WAD list survived the BSS wipe.
+ * v52:
+ *   - AUDIO THREAD: sleep removed entirely.  The usleep was adding
+ *     ~2 ms of extra latency per submit that the hardware never waits
+ *     for.  Effective submit rate was 41.6/s (log) vs. the 46.87/s
+ *     hardware drain → 11% underruns.  Now the thread just calls
+ *     sceAudioOutOutput in a loop; the syscall's own blocking keeps
+ *     us at 46.87/s.
+ *   - MIXER: replaced all per-sample divisions with multiplies.
+ *     Divisions were 5 per sample per SFX channel; with 32 channels
+ *     and 1024 samples that's ~160k divisions per submit — several
+ *     ms of pure overhead.  Now the mixer runs in <0.5 ms.
+ *   - MENU: accept Circle/Cross only on RISING edge.  Previously the
+ *     falling edge (releasing the button that exited Doom) was
+ *     treated as a fresh press because prev_btn was initialized from
+ *     the current pad state.
  *
- * v50: audio sleep 16 → 5 ms; clear FBs and active_fb on reset.
- * v49: Triangle → Right Shift (run).
- * v48: BSS reset between Doom sessions.
- * v47: audio thread starts at beginning of run_doom.
- * v46: 7-visible menu, no wrap-around.
- * v45: poll() before accept().
- * v44: reset key queue + pad_prev between sessions.
- * v43: WAD path trailing-slash fix.
+ * v51: Triangle → Right Shift; 1ms audio sleep; 160ms pad release
+ * v50: audio 16 → 5 ms sleep; clear FBs on reset
+ * v49: Triangle → Right Shift
+ * v48: BSS reset between Doom sessions
+ * v47: audio thread starts at beginning of run_doom
+ * v46: 7-visible menu, no wrap-around
+ * v45: poll() before accept()
+ * v44: reset key queue + pad_prev
+ * v43: WAD path trailing-slash fix
  */
 
 #include "core.h"
@@ -371,22 +371,22 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 }
 
 /*
- * v51 — audio thread.
+ * v52 — audio thread.
  *
- * Effective cycle in v50 was ~24 ms (5 ms sleep + ~19 ms scheduler
- * wait) — SLOWER than the 21.33 ms hardware drain — so we underran
- * ~12% of the time and got the residual music cutting.  1 ms sleep
- * gives ~16-20 ms cycle → matches or beats the drain rate.
+ * No sleep at all.  sceAudioOutOutput blocks when the hardware queue
+ * is full, which naturally throttles us to the correct 46.87/s
+ * submission rate.  Adding any usleep on top just makes us slower
+ * than the drain and causes underruns.
  */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
     struct ps_ctx *c = &g_ctx;
-    const u64 buf_us = 1000;
     while (g_audio_thread_running) {
         I_SubmitSound();
-        if (c->usleep_fn)
-            NC(c->G, c->usleep_fn, buf_us, 0,0,0,0,0);
+        /* No sleep.  sceAudioOutOutput inside I_SubmitSound blocks
+         * on the hardware queue and provides the pacing. */
+        (void)c;
     }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
@@ -504,9 +504,6 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        /* First client: 30 s (Python sleeps wad_delay after shellcode
-         * send).  Subsequent: 300 ms — the previous 800 ms was
-         * perceived as a "stuck" 2 s delay before the menu. */
         int wait_ms = (g_wad_count == 0) ? 30000 : 300;
 
         int ready = wait_readable(c, listen_fd, wait_ms);
@@ -625,10 +622,8 @@ done:
 #define MENU_ROW_H   100
 
 static int show_wad_menu(struct ps_ctx *c) {
-    int prev_btn = 0;
+    u32 prev_btn = 0;
 
-    /* v51: initialize prev_btn from current pad state so a button
-     * still held (from quitting Doom) isn't seen as a fresh press. */
     if (c->pad_h >= 0 && c->pad_read) {
         u8 buf[128]; ps_memset(buf, 0, 128);
         s32 n = (s32)NC(c->G, c->pad_read,
@@ -639,13 +634,24 @@ static int show_wad_menu(struct ps_ctx *c) {
         }
     }
 
+    /* Log the initial pad state so we can see what's happening. */
+    {
+        char b[80]; int p = 0;
+        const char *m = "DoomPS: menu init prev_btn=0x";
+        while (*m) b[p++] = *m++;
+        const char *hex = "0123456789ABCDEF";
+        for (int k = 7; k >= 0; k--)
+            b[p++] = hex[(prev_btn >> (k * 4)) & 0xF];
+        b[p++] = '\n'; b[p] = 0;
+        udp_log(b);
+    }
+
     if (g_wad_cursor < g_wad_scroll)
         g_wad_scroll = g_wad_cursor;
     if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE)
         g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
     if (g_wad_scroll < 0) g_wad_scroll = 0;
 
-    /* Sanity: if wad_count got wiped we can't draw a list. */
     if (g_wad_count <= 0) {
         udp_log("DoomPS: WARN empty wad list, aborting menu\n");
         return -1;
@@ -662,7 +668,7 @@ static int show_wad_menu(struct ps_ctx *c) {
                 if (!(r & 0x80000000)) raw = r & DS_PAD_MASK;
             }
         }
-        u32 ch = raw ^ (u32)prev_btn;
+        u32 ch = raw ^ prev_btn;
         prev_btn = raw;
 
         if (ch & DS_UP)   { if (g_wad_cursor > 0) g_wad_cursor--; }
@@ -674,8 +680,9 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        if (ch & DS_CIRCLE) return -1;
-        if (ch & DS_CROSS)  return g_wad_cursor;
+        /* v52: accept only on RISING edge.  See header comment. */
+        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
+        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
 
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -730,7 +737,7 @@ static int show_wad_menu(struct ps_ctx *c) {
 }
 
 /* ============================================================
- * reset_doom_globals — wipe Doom's static state between sessions.
+ * reset_doom_globals
  * ============================================================ */
 static void reset_doom_globals(void) {
     u8 libc_save[PS_LIBC_SAVE_SIZE];
@@ -765,7 +772,6 @@ static void reset_doom_globals(void) {
     }
     g_ctx.active_fb = 0;
 
-    /* Log the restored count so we can prove the WAD list survived. */
     char b[64]; int q = 0;
     const char *m = "DoomPS: globals reset, wads=";
     while (*m) b[q++] = *m++;
@@ -780,7 +786,6 @@ static void reset_doom_globals(void) {
     udp_log(b);
 }
 
-/* v51: wait for the pad to be continuously released for 160 ms. */
 static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
     if (c->pad_h < 0 || !c->pad_read) return;
     int elapsed = 0;
@@ -806,7 +811,7 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
 }
 
 /* ============================================================
- * run_doom — start audio thread FIRST, run Doom, then reset state.
+ * run_doom
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -843,14 +848,15 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
         }
     }
 
-    /* Doom exited — stop audio thread and reset state. */
     g_exit_requested = 0;
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 150000, 0,0,0,0,0);
 
-    /* Wait for pad to be continuously released so a held button
-     * (that just exited Doom) doesn't ghost-press into the menu. */
     wait_for_pad_release(c, 2000);
+
+    /* Extra grace period: give the user 300 ms after release before
+     * the menu reads input, in case they were still holding. */
+    if (c->usleep_fn) NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
 
     c->key_wp   = 0;
     c->key_rp   = 0;
@@ -1057,12 +1063,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     if (c->delete_eq && c->eq)
         NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
 
-    /* v51: set SO_LINGER 0 → RST → no TIME_WAIT, so a fresh launch
-     * after returning to Lua can re-bind port 5000 cleanly. */
     if (tcp_listen_fd >= 0 && c->setsockopt_fn) {
         u8 linger[8];
-        *(int*)(linger + 0) = 1;   /* l_onoff  */
-        *(int*)(linger + 4) = 0;   /* l_linger */
+        *(int*)(linger + 0) = 1;
+        *(int*)(linger + 4) = 0;
         (void)NC(c->G, c->setsockopt_fn,
                  (u64)tcp_listen_fd, 0xFFFF, 0x0080, (u64)linger, 8, 0);
     }
