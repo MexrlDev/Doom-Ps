@@ -1,27 +1,12 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v16b:
- *   - Fixed fseek: NC takes exactly 8 args (gadget, fn, a1..a6), the
- *     v16 draft had 9.  Build now compiles.
+ * v15: Marked __G, __D, all fn_* pointers, __log_fd, __log_sa,
+ *      __log_ready, __error_cb, __pool, __pool_size, __pool_used,
+ *      stderr/stdout/stdin, and __null_file as PS_PERSIST so they
+ *      survive reset_doom_globals()'s BSS wipe.
  *
- * v16:
- *   - fopen now reads the file in 1 MB chunks.  A single
- *     sceKernelRead of 12.4 MB was silently failing partway on PS5,
- *     leaving f->size < real file size.  Doom's fread past f->size
- *     returned 0, and Doom used the stale Z_Alloc buffer.
- *   - fopen now KEEPS THE FD OPEN (previously it closed after
- *     caching).  If Doom uses its own lseek+read on wad_file->handle,
- *     the fd is valid.
- *   - fopen logs total bytes read so a partial read is visible.
- *   - fread now falls back to reading from the fd if the cache is
- *     missing or the position is past the cached size.
- *   - ps_libc_close_all_files() added (called from main.c before the
- *     BSS wipe).
- *   - Pool 128 MB max (was 64 MB) for more headroom.
- *
- * v15: PS_PERSIST markers for state that survives the BSS wipe.
- * v14: ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
+ * v14: Added ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
  * v13: exit() only fires the error dialog when code != 0.
  * v12: exit() longjmps back to _start cleanup.
  */
@@ -125,7 +110,11 @@ static void _putu(_out *o, unsigned long long v, int base, int upper,
 }
 
 static void _putd(_out *o, long long v, int min_width, int zero_pad) {
-    if (v < 0) { _putc(o, '-'); v = -v; if (min_width > 0) min_width--; }
+    if (v < 0) {
+        _putc(o, '-');
+        v = -v;
+        if (min_width > 0) min_width--;
+    }
     _putu(o, (unsigned long long)v, 10, 0, min_width, zero_pad ? '0' : ' ');
 }
 
@@ -136,8 +125,10 @@ static void _putf(_out *o, double d) {
     _putc(o, '.');
     double frac = d - (double)ip;
     for (int i = 0; i < 6; i++) {
-        frac *= 10.0; int digit = (int)frac;
-        _putc(o, '0' + digit); frac -= digit;
+        frac *= 10.0;
+        int digit = (int)frac;
+        _putc(o, '0' + digit);
+        frac -= digit;
     }
 }
 
@@ -161,12 +152,18 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         (void)left;
 
         int width = 0;
-        while (*fmt >= '0' && *fmt <= '9') { width = width * 10 + (*fmt - '0'); fmt++; }
+        while (*fmt >= '0' && *fmt <= '9') {
+            width = width * 10 + (*fmt - '0');
+            fmt++;
+        }
 
         if (*fmt == '.') {
             fmt++;
             int precision = 0;
-            while (*fmt >= '0' && *fmt <= '9') { precision = precision * 10 + (*fmt - '0'); fmt++; }
+            while (*fmt >= '0' && *fmt <= '9') {
+                precision = precision * 10 + (*fmt - '0');
+                fmt++;
+            }
             if (precision > width) { width = precision; zero_pad = 1; }
         }
 
@@ -248,7 +245,8 @@ int vsnprintf(char *buf, size_t n, const char *fmt, va_list ap) {
         }
         case 0: goto done;
         default:
-            _putc(&o, '%'); _putc(&o, *fmt);
+            _putc(&o, '%');
+            _putc(&o, *fmt);
             break;
         }
         fmt++;
@@ -263,9 +261,11 @@ done:
 }
 
 int snprintf(char *buf, size_t n, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int r = vsnprintf(buf, n, fmt, ap);
-    va_end(ap); return r;
+    va_end(ap);
+    return r;
 }
 
 int vsprintf(char *buf, const char *fmt, va_list ap) {
@@ -273,9 +273,11 @@ int vsprintf(char *buf, const char *fmt, va_list ap) {
 }
 
 int sprintf(char *buf, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int r = vsnprintf(buf, (size_t)-1, fmt, ap);
-    va_end(ap); return r;
+    va_end(ap);
+    return r;
 }
 
 /* ============================================================
@@ -303,7 +305,8 @@ int vprintf(const char *fmt, va_list ap) {
 }
 
 int printf(const char *fmt, ...) {
-    char buf[512]; va_list ap;
+    char buf[512];
+    va_list ap;
     va_start(ap, fmt);
     int r = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
@@ -322,7 +325,8 @@ int vfprintf(FILE *f, const char *fmt, va_list ap) {
 
 int fprintf(FILE *f, const char *fmt, ...) {
     (void)f;
-    char buf[512]; va_list ap;
+    char buf[512];
+    va_list ap;
     va_start(ap, fmt);
     int r = vsnprintf(buf, sizeof(buf), fmt, ap);
     va_end(ap);
@@ -340,7 +344,8 @@ static void log_hex(const char *prefix, u64 v) {
     while (*prefix && p < 60) b[p++] = *prefix++;
     b[p++] = '0'; b[p++] = 'x';
     const char h[] = "0123456789ABCDEF";
-    for (int k = 0; k < 16; k++) b[p++] = h[(v >> ((15 - k) * 4)) & 0xF];
+    for (int k = 0; k < 16; k++)
+        b[p++] = h[(v >> ((15 - k) * 4)) & 0xF];
     b[p++] = '\n'; b[p] = 0;
     ps_libc_log(b);
 }
@@ -375,11 +380,8 @@ static void *try_mmap_pool(u64 size) {
 
 static void pool_init(void) {
     static const u64 sizes[] = {
-        128ULL*1024*1024,
-        64ULL*1024*1024,
-        48ULL*1024*1024,
-        32ULL*1024*1024,
-        0
+        64ULL*1024*1024, 48ULL*1024*1024, 32ULL*1024*1024,
+        24ULL*1024*1024, 16ULL*1024*1024, 0
     };
     ps_libc_log("ps_libc: pool_init start\n");
     for (int i = 0; sizes[i]; i++) {
@@ -450,7 +452,9 @@ void *realloc(void *p, size_t size) {
 
 void free(void *p) { (void)p; }
 
-/* ===== mem* ===== */
+/* ============================================================
+ * mem* — fast rep movsb / rep stosb
+ * ============================================================ */
 void *memcpy(void *d, const void *s, size_t n) {
     void *ret = d;
     if (n == 0) return ret;
@@ -700,9 +704,7 @@ void *bsearch(const void *key, const void *base, size_t n, size_t sz,
 static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
 
-/* ============================================================
- * stdio — v16b with chunked reads and persistent fd
- * ============================================================ */
+/* ===== stdio ===== */
 struct _ps_file {
     int fd;
     int writable;
@@ -725,21 +727,6 @@ static FILE *alloc_slot(void) {
             return &__files[i];
     }
     return 0;
-}
-
-/* v16: close all open files.  Called from main.c before the BSS wipe
- * so any fd Doom left open doesn't leak across sessions. */
-void ps_libc_close_all_files(void) {
-    if (!fn_kclose) return;
-    for (int i = 0; i < MAX_FILES; i++) {
-        if (__files[i].fd > 0) {
-            NC(__G, fn_kclose, (u64)__files[i].fd, 0,0,0,0,0);
-            __files[i].fd = 0;
-            __files[i].buf = 0;
-            __files[i].pos = 0;
-            __files[i].size = 0;
-        }
-    }
 }
 
 static int __fopen_count = 0;
@@ -792,99 +779,53 @@ FILE *fopen(const char *path, const char *mode) {
 
     if (!writable) {
         long sz = (long)NC(__G, fn_klseek, (u64)fd, 0, 2, 0,0,0);
-        if (sz < 0) sz = 0;
         NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
-
-        f->size = sz;
-
+        if (sz < 0) sz = 0;
         if (sz > 0) {
-            /* v16: zero the buffer first so any bytes we fail to read
-             * are 0, not stale pool bytes from a previous session. */
             unsigned char *b = (unsigned char *)malloc((size_t)sz);
             if (b) {
-                for (long i = 0; i < sz; i++) b[i] = 0;
-
                 long total = 0;
-                /* v16: read in 1 MB chunks.  A single sceKernelRead of
-                 * 12.4 MB was silently failing partway through on PS5,
-                 * leaving f->size < real file size. */
                 while (total < sz) {
-                    long chunk = sz - total;
-                    if (chunk > 0x100000) chunk = 0x100000;
                     s32 n = (s32)NC(__G, fn_kread, (u64)fd,
-                                    (u64)(b + total), (u64)chunk, 0,0,0);
+                                    (u64)(b + total), (u64)(sz - total), 0,0,0);
                     if (n <= 0) break;
                     total += n;
                 }
                 f->buf = b;
                 f->size = total;
-
-                /* v16: log total read so we can spot partial reads. */
-                if (__fopen_count <= 32) {
-                    char msg[96]; int p = 0;
-                    const char *pre = "ps_libc: WAD bytes read=";
-                    while (*pre) msg[p++] = *pre++;
-                    long v = total;
-                    char tmp[16]; int t = 0;
-                    if (v == 0) tmp[t++] = '0';
-                    while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-                    while (t) msg[p++] = tmp[--t];
-                    msg[p++] = '/';
-                    v = sz;
-                    t = 0;
-                    if (v == 0) tmp[t++] = '0';
-                    while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-                    while (t) msg[p++] = tmp[--t];
-                    msg[p++] = '\n'; msg[p] = 0;
-                    ps_libc_log(msg);
-                }
+            } else {
+                ps_libc_log("ps_libc: fopen READ malloc FAILED\n");
             }
         }
-
-        /* v16: SEEK THE FD BACK TO START and keep it open.  Doom may
-         * use its own lseek/read on wad_file->handle. */
-        NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
+        NC(__G, fn_kclose, (u64)fd, 0,0,0,0,0);
+        f->fd = -1;
     }
     return f;
 }
 
 int fclose(FILE *f) {
     if (!f || f == &__null_file) return 0;
-    if (f->fd > 0 && fn_kclose)
+    if (f->fd >= 0 && fn_kclose)
         NC(__G, fn_kclose, (u64)f->fd, 0,0,0,0,0);
     f->fd = 0; f->buf = 0; f->pos = 0; f->size = 0;
     return 0;
 }
 
-/* v16: fread uses cache if available; falls back to the fd. */
 size_t fread(void *ptr, size_t sz, size_t n, FILE *f) {
-    if (!f || sz == 0) return 0;
+    if (!f || !f->buf || sz == 0) return 0;
     size_t want = sz * n;
-
-    if (f->buf) {
-        long avail = f->size - f->pos;
-        if (avail > 0) {
-            if ((long)want > avail) want = (size_t)avail;
-            unsigned char *d = (unsigned char *)ptr;
-            unsigned char *s = f->buf + f->pos;
-            for (size_t i = 0; i < want; i++) d[i] = s[i];
-            f->pos += (long)want;
-            return want / sz;
-        }
-        /* Cache exhausted — fall through to fd read. */
-    }
-
-    if (f->fd > 0 && fn_kread) {
-        s32 got = (s32)NC(__G, fn_kread, (u64)f->fd, (u64)ptr, (u64)want, 0,0,0);
-        if (got <= 0) return 0;
-        f->pos += got;
-        return (size_t)got / sz;
-    }
-    return 0;
+    long avail = f->size - f->pos;
+    if (avail <= 0) return 0;
+    if ((long)want > avail) want = (size_t)avail;
+    unsigned char *d = (unsigned char *)ptr;
+    unsigned char *s = f->buf + f->pos;
+    for (size_t i = 0; i < want; i++) d[i] = s[i];
+    f->pos += (long)want;
+    return want / sz;
 }
 
 size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
-    if (!f || f->fd <= 0 || sz == 0) return 0;
+    if (!f || f->fd < 0 || sz == 0) return 0;
     size_t want = sz * n;
     s32 w = (s32)NC(__G, fn_kwrite, (u64)f->fd, (u64)ptr, (u64)want, 0,0,0);
     if (w <= 0) return 0;
@@ -897,12 +838,6 @@ int fseek(FILE *f, long off, int whence) {
     if (whence == 0)      f->pos = off;
     else if (whence == 1) f->pos += off;
     else if (whence == 2) f->pos = f->size + off;
-
-    /* v16b: also seek the fd.  NC takes exactly 8 args
-     * (gadget, fn, a1, a2, a3, a4, a5, a6). */
-    if (f->fd > 0 && fn_klseek) {
-        NC(__G, fn_klseek, (u64)f->fd, (u64)off, (u64)whence, 0, 0, 0);
-    }
     return 0;
 }
 long ftell(FILE *f)  { return f ? f->pos : -1; }
@@ -993,10 +928,12 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
             break;
         }
         case '%': {
-            if (*s == '%') { s++; } else return matched;
+            if (*s == '%') { s++; }
+            else return matched;
             break;
         }
-        default: return matched;
+        default:
+            return matched;
         }
         fmt++;
     }
@@ -1004,17 +941,23 @@ int vsscanf(const char *s, const char *fmt, va_list ap) {
 }
 
 int sscanf(const char *s, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int r = vsscanf(s, fmt, ap);
-    va_end(ap); return r;
+    va_end(ap);
+    return r;
 }
-int __isoc99_sscanf(const char *s, const char *fmt, ...) __asm__("__isoc99_sscanf");
+int __isoc99_sscanf(const char *s, const char *fmt, ...)
+    __asm__("__isoc99_sscanf");
 int __isoc99_sscanf(const char *s, const char *fmt, ...) {
-    va_list ap; va_start(ap, fmt);
+    va_list ap;
+    va_start(ap, fmt);
     int r = vsscanf(s, fmt, ap);
-    va_end(ap); return r;
+    va_end(ap);
+    return r;
 }
-int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap) __asm__("__isoc99_vsscanf");
+int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap)
+    __asm__("__isoc99_vsscanf");
 int __isoc99_vsscanf(const char *s, const char *fmt, va_list ap) {
     return vsscanf(s, fmt, ap);
 }
@@ -1028,6 +971,7 @@ int putchar(int c)               { return c; }
 int putc(int c, FILE *f)         { (void)f; return c; }
 int fputc(int c, FILE *f)        { (void)f; return c; }
 int fputs(const char *s, FILE *f){ (void)s; (void)f; return 0; }
+
 int fgetc(FILE *f)               { (void)f; return -1; }
 int getc(FILE *f)                { (void)f; return -1; }
 int ungetc(int c, FILE *f)       { (void)f; return c; }
@@ -1056,10 +1000,10 @@ void exit(int code) {
     for (;;) {}
 }
 
-int system(const char *cmd) { (void)cmd; return -1; }
+int  system(const char *cmd) { (void)cmd; return -1; }
 
 /* ============================================================
- * Legacy save/restore API + pool reset
+ * Legacy save/restore API (kept for compatibility)
  * ============================================================ */
 #define PS_LIBC_SAVE_MAGIC 0x50C1B0B0C0DEULL
 
@@ -1121,16 +1065,6 @@ void ps_libc_restore(const void *buf) {
     __error_cb  = *(void (**)(const char *))(b + p); p += 8;
 }
 
-/* v16: reset the pool for a fresh session.  We just zero the "used"
- * marker; the pool memory is overwritten by session 2's allocations.
- * But we also zero the first 32 KB so any leftover data from session 1
- * at the start of the pool can't be read as a stale lump. */
 void ps_libc_reset_pool(void) {
-    if (__pool && __pool_size > 0) {
-        size_t n = __pool_used;
-        if (n > __pool_size) n = __pool_size;
-        if (n > 32768) n = 32768;
-        for (size_t i = 0; i < n; i++) __pool[i] = 0;
-    }
     __pool_used = 0;
 }
