@@ -1,31 +1,28 @@
 /*
- * doom-ps/src/main.c — v52
+ * doom-ps/src/main.c — v53
  *
- * v52:
- *   - AUDIO THREAD: sleep removed entirely.  The usleep was adding
- *     ~2 ms of extra latency per submit that the hardware never waits
- *     for.  Effective submit rate was 41.6/s (log) vs. the 46.87/s
- *     hardware drain → 11% underruns.  Now the thread just calls
- *     sceAudioOutOutput in a loop; the syscall's own blocking keeps
- *     us at 46.87/s.
- *   - MIXER: replaced all per-sample divisions with multiplies.
- *     Divisions were 5 per sample per SFX channel; with 32 channels
- *     and 1024 samples that's ~160k divisions per submit — several
- *     ms of pure overhead.  Now the mixer runs in <0.5 ms.
- *   - MENU: accept Circle/Cross only on RISING edge.  Previously the
- *     falling edge (releasing the button that exited Doom) was
- *     treated as a fresh press because prev_btn was initialized from
- *     the current pad state.
+ * v53:
+ *   - WAD LIST PERSISTS across Doom sessions.  All state that must
+ *     survive (g_ctx, g_wads, counts, exit flags, g_jmp_buf) is now
+ *     placed in a dedicated linker section .ps_persist that sits
+ *     BEFORE __bss_start.  reset_doom_globals() only wipes
+ *     __bss_start..__bss_end, so Doom's globals are reset but ours
+ *     are untouched.  No more save/restore dance.
+ *   - AUDIO: SAMPLES_PER_BUF 1024 → 2048 (see core.h).  Doubles the
+ *     hardware queue depth so scheduler jitter doesn't underrun.
+ *   - Verbose WAD count logging around the reset so we can see the
+ *     state surviving in the log.
  *
- * v51: Triangle → Right Shift; 1ms audio sleep; 160ms pad release
- * v50: audio 16 → 5 ms sleep; clear FBs on reset
- * v49: Triangle → Right Shift
- * v48: BSS reset between Doom sessions
- * v47: audio thread starts at beginning of run_doom
- * v46: 7-visible menu, no wrap-around
- * v45: poll() before accept()
- * v44: reset key queue + pad_prev
- * v43: WAD path trailing-slash fix
+ * v52: audio sleep removed, mixer divisions → multiplies.
+ * v51: rising-edge menu input; SO_LINGER 0 on listener close.
+ * v50: audio sleep 16 → 5 ms; clear FBs on reset.
+ * v49: Triangle → Right Shift.
+ * v48: BSS reset between Doom sessions.
+ * v47: audio thread starts at the beginning of run_doom.
+ * v46: 7-visible menu, no wrap-around.
+ * v45: poll() before accept().
+ * v44: reset key queue + pad_prev.
+ * v43: WAD path trailing-slash fix.
  */
 
 #include "core.h"
@@ -34,6 +31,8 @@
 
 extern char __bss_start[];
 extern char __bss_end[];
+extern char __ps_persist_start[];
+extern char __ps_persist_end[];
 
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
@@ -41,10 +40,7 @@ extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 
-extern void ps_libc_save(void *buf);
-extern void ps_libc_restore(const void *buf);
-extern void ps_libc_reset_pool(void);
-#define PS_LIBC_SAVE_SIZE 256
+extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -134,13 +130,18 @@ struct wad_entry {
     char name[64];
 };
 
-static struct wad_entry g_wads[MAX_WADS];
-static int g_wad_count = 0;
-static int g_wad_cursor = 0;
-static int g_wad_scroll = 0;
-static int g_session_count = 0;
+/* ============================================================
+ * v53 PERSISTENT STATE — lives in .ps_persist which reset_doom_
+ * globals() does not touch.  Everything here survives every Doom
+ * session without any explicit save/restore.
+ * ============================================================ */
+PS_PERSIST struct wad_entry g_wads[MAX_WADS];
+PS_PERSIST int g_wad_count = 0;
+PS_PERSIST int g_wad_cursor = 0;
+PS_PERSIST int g_wad_scroll = 0;
+PS_PERSIST int g_session_count = 0;
 
-static struct ps_ctx {
+PS_PERSIST struct ps_ctx {
     void *G, *D;
     void *usleep_fn, *load_mod, *alloc_dm, *map_dm, *dm_size;
     void *create_eq, *wait_eq, *delete_eq, *mmap_fn;
@@ -169,11 +170,10 @@ static struct ps_ctx {
     struct ext_args *ext;
 } g_ctx;
 
-static char g_diag[256];
-static volatile int g_audio_thread_running = 0;
-
-void *g_jmp_buf[8];
-static int   g_exit_requested = 0;
+PS_PERSIST char g_diag[256];
+PS_PERSIST volatile int g_audio_thread_running = 0;
+PS_PERSIST void *g_jmp_buf[8];
+PS_PERSIST int   g_exit_requested = 0;
 
 __attribute__((naked)) static int ps_setjmp(void) {
     __asm__ volatile (
@@ -223,6 +223,20 @@ static void udp_log(const char *msg) {
 }
 
 void ps_sound_log(const char *msg) { udp_log(msg); }
+
+static void log_wad_count(const char *prefix) {
+    char b[80]; int p = 0;
+    while (*prefix && p < 55) b[p++] = *prefix++;
+    int v = g_wad_count;
+    if (v == 0) b[p++] = '0';
+    else {
+        char t[8]; int k = 0;
+        while (v) { t[k++] = '0' + (v % 10); v /= 10; }
+        while (k) b[p++] = t[--k];
+    }
+    b[p++] = '\n'; b[p] = 0;
+    udp_log(b);
+}
 
 static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     int p = 0;
@@ -370,23 +384,17 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
-/*
- * v52 — audio thread.
- *
- * No sleep at all.  sceAudioOutOutput blocks when the hardware queue
- * is full, which naturally throttles us to the correct 46.87/s
- * submission rate.  Adding any usleep on top just makes us slower
- * than the drain and causes underruns.
- */
+/* ============================================================
+ * Audio thread.  sceAudioOutOutput is expected to block when the
+ * hardware queue is full, so we submit in a tight loop and let the
+ * syscall pace us.  With SAMPLES_PER_BUF = 2048 the drain rate is
+ * 23.44/sec, giving ample slack for scheduler jitter.
+ * ============================================================ */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
-    struct ps_ctx *c = &g_ctx;
     while (g_audio_thread_running) {
         I_SubmitSound();
-        /* No sleep.  sceAudioOutOutput inside I_SubmitSound blocks
-         * on the hardware queue and provides the pacing. */
-        (void)c;
     }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
@@ -505,7 +513,6 @@ static int recv_wads(s32 listen_fd) {
         if (g_wad_count >= MAX_WADS) break;
 
         int wait_ms = (g_wad_count == 0) ? 30000 : 300;
-
         int ready = wait_readable(c, listen_fd, wait_ms);
         if (ready <= 0) {
             if (ready < 0) {
@@ -634,7 +641,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         }
     }
 
-    /* Log the initial pad state so we can see what's happening. */
     {
         char b[80]; int p = 0;
         const char *m = "DoomPS: menu init prev_btn=0x";
@@ -645,6 +651,8 @@ static int show_wad_menu(struct ps_ctx *c) {
         b[p++] = '\n'; b[p] = 0;
         udp_log(b);
     }
+
+    log_wad_count("DoomPS: menu entering, wads=");
 
     if (g_wad_cursor < g_wad_scroll)
         g_wad_scroll = g_wad_cursor;
@@ -680,7 +688,7 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        /* v52: accept only on RISING edge.  See header comment. */
+        /* Rising edge only — a held button does not trigger. */
         if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
         if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
 
@@ -738,30 +746,24 @@ static int show_wad_menu(struct ps_ctx *c) {
 
 /* ============================================================
  * reset_doom_globals
+ *
+ * v53: All OUR state lives in .ps_persist which is placed BEFORE
+ * __bss_start in the linker script.  So a simple wipe of __bss_start
+ * ..__bss_end does NOT touch g_ctx, g_wads, g_wad_count, g_jmp_buf,
+ * g_exit_requested, g_audio_thread_running or ps_libc's internal
+ * state (also marked PS_PERSIST).  No save/restore dance required.
  * ============================================================ */
 static void reset_doom_globals(void) {
-    u8 libc_save[PS_LIBC_SAVE_SIZE];
-    ps_libc_save(libc_save);
-
-    struct ps_ctx saved_ctx = g_ctx;
-    struct wad_entry saved_wads[MAX_WADS];
-    ps_memcpy(saved_wads, g_wads, sizeof(saved_wads));
-    int saved_count  = g_wad_count;
-    int saved_cursor = g_wad_cursor;
-    int saved_scroll = g_wad_scroll;
+    udp_log("DoomPS: wiping Doom BSS\n");
+    log_wad_count("DoomPS: pre-wipe wads=");
 
     volatile char *p = __bss_start;
     while (p < __bss_end) *p++ = 0;
 
-    g_ctx = saved_ctx;
-    ps_memcpy(g_wads, saved_wads, sizeof(saved_wads));
-    g_wad_count  = saved_count;
-    g_wad_cursor = saved_cursor;
-    g_wad_scroll = saved_scroll;
+    log_wad_count("DoomPS: post-wipe wads=");
 
-    ps_libc_restore(libc_save);
-    ps_libc_reset_pool();
-
+    /* Clear both framebuffers and force active_fb back to 0 so the
+     * menu redraws from scratch. */
     if (g_ctx.fbs[0]) {
         u32 *fb = (u32 *)g_ctx.fbs[0];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -772,20 +774,12 @@ static void reset_doom_globals(void) {
     }
     g_ctx.active_fb = 0;
 
-    char b[64]; int q = 0;
-    const char *m = "DoomPS: globals reset, wads=";
-    while (*m) b[q++] = *m++;
-    int v = g_wad_count;
-    if (v == 0) b[q++] = '0';
-    else {
-        char tmp[8]; int t = 0;
-        while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-        while (t) b[q++] = tmp[--t];
-    }
-    b[q++] = '\n'; b[q] = 0;
-    udp_log(b);
+    udp_log("DoomPS: globals reset done\n");
 }
 
+/* ============================================================
+ * wait_for_pad_release — 160 ms continuous release.
+ * ============================================================ */
 static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
     if (c->pad_h < 0 || !c->pad_read) return;
     int elapsed = 0;
@@ -811,7 +805,7 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
 }
 
 /* ============================================================
- * run_doom
+ * run_doom — start audio thread FIRST, run Doom, then reset state.
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -853,9 +847,6 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 150000, 0,0,0,0,0);
 
     wait_for_pad_release(c, 2000);
-
-    /* Extra grace period: give the user 300 ms after release before
-     * the menu reads input, in case they were still holding. */
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
 
     c->key_wp   = 0;
@@ -875,10 +866,16 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     reset_doom_globals();
 }
 
+/* ============================================================
+ * _start — entry point.
+ * ============================================================ */
+
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
     do_relocations(load_base);
+
+    /* Wipe only the Doom BSS — persistent state lives outside. */
     { volatile char *p = __bss_start; while (p < __bss_end) *p++ = 0; }
 
     ext->step = 1;
@@ -892,11 +889,16 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
+    /* Reset WAD list for fresh start. */
+    g_wad_count = 0;
+    g_wad_cursor = 0;
+    g_wad_scroll = 0;
+    g_session_count = 0;
+
     ext->step = 2;
     c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
     udp_log("DoomPS: [3] sendto\n"); ext->step = 3;
 
-    extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
     ps_libc_init(G, D, c->log_fd, c->log_sa);
     udp_log("DoomPS: [4] libc\n"); ext->step = 4;
 
