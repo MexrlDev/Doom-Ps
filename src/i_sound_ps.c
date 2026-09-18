@@ -1,15 +1,19 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v26:
- *   - MUSIC_AMPL 6 → 12  (music 2× louder)
- *   - SFX_HEADROOM 2 → 1 (SFX 2× louder)
- *     → both louder, same music-vs-SFX ratio as before
- *   - Exact-rational music timing retained from v25.
+ * v25:
+ *   - MUSIC_AMPL 6 → 12 and SFX_HEADROOM 2 → 1.  Both doubled,
+ *     ratio preserved.
+ *   - Music timing FIXED: the tick accumulator advanced by
+ *     1000000 / 48000 = 20 µs per sample, but the true interval is
+ *     20.833 µs.  Music played 4% slow, causing notes to drift and
+ *     the "wrong notes" the user noticed.  Now we accumulate the
+ *     fractional remainder (1000000 % 48000 = 40000) in a secondary
+ *     counter, adding 1 µs whenever it crosses 48000.
  *
- * v25: exact timing (ns × SAMPLE_RATE); reset music state on I_InitSound.
- * v24: divisions → multiplies.
+ * v24: mixer divisions → multiplies.
  * v23: MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
+ * v22: MIXBUF = SAMPLES_PER_BUF from core.h.
  */
 
 #include <stdio.h>
@@ -39,7 +43,7 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
-/* v26: both buses 2× louder. */
+/* v25: both doubled for louder output, ratio preserved. */
 #define SFX_HEADROOM   1
 #define MUSIC_AMPL     12
 
@@ -100,9 +104,9 @@ static int      mus_track_end      = 0;
 static int      mus_loop           = 0;
 static int      mus_playing        = 0;
 static int      mus_is_mus         = 0;
-
-static s64      mus_delay_units    = 0;
-static s64      mus_time_units     = 0;
+static int      mus_delay_us       = 0;
+static int      mus_tick_acc       = 0;
+static int      mus_tick_acc_frac  = 0;   /* v25 fractional accumulator */
 
 static unsigned int note_phase_inc_table[128];
 
@@ -133,7 +137,7 @@ static void music_note_on(int note, int vel, int chan) {
     if (vel <= 0) { music_note_off_chan(chan, note); return; }
     if (vel > 127)  vel = 127;
 
-    if (dbg_note < 50) {
+    if (dbg_note < 200) {
         dbg_note++;
         log_num("M: note N=", note, "");
         log_num("M: note V=", vel, "");
@@ -181,8 +185,7 @@ static void mus_process_event(void) {
             log_str("M: loop restart");
             mus_pos = mus_track_start;
             music_all_notes_off();
-            mus_delay_units = 0;
-            mus_time_units  = 0;
+            mus_delay_us = 0;
         } else {
             log_str("M: END");
             mus_playing = 0;
@@ -197,7 +200,7 @@ static void mus_process_event(void) {
     int has_delay = (ev & 0x80) != 0;
 
     dbg_event++;
-    if (dbg_event <= 20) {
+    if (dbg_event <= 100) {
         log_num("M: ev #", dbg_event, "");
         log_num("M: ev T=", type, "");
         log_num("M: ev C=", chan, "");
@@ -245,17 +248,18 @@ static void mus_process_event(void) {
             delay = (delay << 7) | (b & 0x7F);
             if (!(b & 0x80)) break;
         }
-        mus_delay_units = ((s64)delay * 1000000000LL * (s64)SAMPLE_RATE) / 140LL;
+        mus_delay_us = (delay * 1000000) / 140;
     } else {
-        mus_delay_units = 0;
+        mus_delay_us = 0;
     }
 }
 
 static void mus_parse_header(void) {
     mus_pos = mus_track_start;
     music_all_notes_off();
-    mus_delay_units = 0;
-    mus_time_units  = 0;
+    mus_delay_us = 0;
+    mus_tick_acc = 0;
+    mus_tick_acc_frac = 0;
 
     if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
@@ -275,28 +279,41 @@ static void mus_parse_header(void) {
     mus_track_start = score_start;
     mus_track_end   = mus_len;
     mus_pos         = score_start;
-    mus_delay_units = 0;
-    mus_time_units  = 0;
+    mus_delay_us    = 0;
     log_str("Music: MUS loaded");
 }
 
+/*
+ * v25: fixed timing.  1000000/48000 = 20.833 µs/sample, not 20.
+ * Advance by 20, and every 6 samples add an extra 1 µs (via the
+ * fractional accumulator) to make the average exactly right.
+ */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
+
+    int us_per_sample = 1000000 / SAMPLE_RATE;   /* = 20 */
+    int us_frac      = 1000000 % SAMPLE_RATE;    /* = 40000 */
 
     int vol = snd_musicvolume;
     if (vol < 0)   vol = 0;
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
+    /* Precompute music scale: MUSIC_AMPL * vol / 15 in 16.16 */
     int music_scale_fp = (MUSIC_AMPL * vol * 65536) / 15;
 
     for (int i = 0; i < frames; i++) {
-        mus_time_units += 1000000000LL;
+        mus_tick_acc += us_per_sample;
+        mus_tick_acc_frac += us_frac;
+        if (mus_tick_acc_frac >= SAMPLE_RATE) {
+            mus_tick_acc_frac -= SAMPLE_RATE;
+            mus_tick_acc += 1;
+        }
 
         int safety = 0;
-        while (mus_playing && mus_time_units >= mus_delay_units && safety < 200) {
+        while (mus_playing && mus_tick_acc >= mus_delay_us && safety < 200) {
             safety++;
-            mus_time_units -= mus_delay_units;
+            mus_tick_acc -= mus_delay_us;
             mus_process_event();
             if (!mus_playing) break;
         }
@@ -321,7 +338,8 @@ static void music_render_accum(s32 *accum, int frames) {
             n->phase += n->phase_inc;
         }
 
-        mix = (int)(((long long)mix * music_scale_fp) >> 16);
+        mix = ((long long)mix * music_scale_fp) >> 16;
+
         g_mus_lpf += (mix - g_mus_lpf) >> 1;
 
         accum[i * 2]     += g_mus_lpf;
@@ -349,19 +367,6 @@ void I_InitSound(boolean use_sfx_prefix) {
         channels[i].active = channels[i].releasing = channels[i].fade = 0;
     init_music_tables();
     g_mus_lpf = 0; g_out_lpf_l = 0; g_out_lpf_r = 0;
-
-    music_all_notes_off();
-    mus_playing = 0;
-    mus_data = 0;
-    mus_len = 0;
-    mus_pos = 0;
-    mus_track_start = 0;
-    mus_track_end = 0;
-    mus_loop = 0;
-    mus_is_mus = 0;
-    mus_delay_units = 0;
-    mus_time_units = 0;
-
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
@@ -420,7 +425,7 @@ void I_SubmitSound(void) {
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
             int sample = sample8 << 8;
             sample = (sample * fade) >> 10;
-            sample >>= SFX_HEADROOM;
+            sample >>= 1;   /* / SFX_HEADROOM (=1, still >>1 for headroom) */
 
             mix_accum[i * 2]     += (sample * lgain) >> 16;
             mix_accum[i * 2 + 1] += (sample * rgain) >> 16;
@@ -494,15 +499,13 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 void I_InitMusic(void) {
     init_music_tables();
     g_mus_lpf = 0;
+    mus_tick_acc_frac = 0;
     log_str("I_InitMusic done");
 }
 
 void I_ShutdownMusic(void) { music_all_notes_off(); mus_playing = 0; }
 
 void I_SetMusicVolume(int volume) {
-    if (volume < 0)   volume = 0;
-    if (volume > 15)  volume = (volume * 15) / 120;
-    if (volume > 15)  volume = 15;
     snd_musicvolume = volume;
     log_num("M:vol=", volume, "");
 }
@@ -516,9 +519,9 @@ void I_ResumeSong(void) {}
 
 void *I_RegisterSong(void *data, int len) {
     song_t *s = (song_t *)malloc(sizeof(song_t));
-    if (!s) return 0;
+    if (!s) { log_str("Music: song_t malloc FAILED"); return 0; }
     s->data = (unsigned char *)malloc((unsigned)len);
-    if (!s->data) return 0;
+    if (!s->data) { log_str("Music: song data malloc FAILED"); return 0; }
     memcpy(s->data, data, len);
     s->len = len;
 
@@ -528,19 +531,6 @@ void *I_RegisterSong(void *data, int len) {
         ps_sound_log("Music: registered MUS");
     } else {
         s->is_mus = -1;
-        {
-            char b[64]; int p = 0;
-            const char *m = "Music: bad header bytes=";
-            while (*m) b[p++] = *m++;
-            const char *h = "0123456789ABCDEF";
-            for (int i = 0; i < 4 && i < len; i++) {
-                b[p++] = h[(s->data[i] >> 4) & 0xF];
-                b[p++] = h[s->data[i] & 0xF];
-                b[p++] = ' ';
-            }
-            b[p++] = '\n'; b[p] = 0;
-            ps_sound_log(b);
-        }
         ps_sound_log("Music: unknown format");
     }
     return s;
