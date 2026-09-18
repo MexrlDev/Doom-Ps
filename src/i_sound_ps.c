@@ -1,17 +1,14 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v19:
- *   - FIXED glitchy sound: added output reconstruction filter
- *     (single-pole LPF at ~3.8 kHz) to smooth the stair-step
- *     artifacts from zero-order-hold upsampling of 11 kHz SFX.
- *   - Slower music envelopes: attack 10→2, release 6→1 per sample.
- *     The old envelopes clicked on every note because they
- *     finished in 0.3 ms.
- *   - Slight volume boost: MUSIC_AMPL 72→80, SFX_HEADROOM 4→3.
- *   - Lighter music LPF (0.5) so the output LPF handles most of
- *     the anti-aliasing (cascade = 2-pole rolloff).
- *   - Everything else identical to v18.
+ * v20:
+ *   - Music tempo fix: MUS_TICKS_PER_EVENT 2 → 6.  The notes were
+ *     firing every 14 ms (2 ticks @ 140 Hz).  Real Doom music uses
+ *     about 40 ms between events (6 ticks).  This was the "insane
+ *     fast" music.
+ *   - SFX_HEADROOM 3 → 5 to give more room for overlapping sounds.
+ *   - Softer output limiter (linear to 24000 instead of 20000).
+ *   - Everything else identical to v19.
  */
 
 #include <stdio.h>
@@ -41,7 +38,7 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              512
 #define MUSIC_MAX_NOTES     24
 
-#define SFX_HEADROOM   3
+#define SFX_HEADROOM   5
 #define MUSIC_AMPL     80
 
 #define DMX_SAMPLE_RATE 11025
@@ -50,7 +47,8 @@ int snd_sfxvolume   = 8;
 #define FADE_STEP_IN   6
 #define FADE_STEP_OUT  3
 
-#define MUS_TICKS_PER_EVENT 2
+/* 6 ticks @ 140 Hz = ~43 ms between events. */
+#define MUS_TICKS_PER_EVENT 6
 
 static int dbg_submit = 0;
 static int dbg_tick   = 0;
@@ -82,9 +80,7 @@ static channel_t channels[NCHANNELS];
 static s32   mix_accum[MIXBUF * 2];
 static short mix_final[MIXBUF * 2];
 
-/* Music path LPF (light). */
 static s32 g_mus_lpf = 0;
-/* Output reconstruction LPF (heavier). */
 static s32 g_out_lpf_l = 0;
 static s32 g_out_lpf_r = 0;
 
@@ -280,9 +276,6 @@ static void music_render_accum(s32 *accum, int frames) {
             music_note_t *n = &mus_notes[j];
             if (!n->active) continue;
 
-            /* Slower envelopes: attack over ~63 samples (~1.3 ms),
-             * release over ~127 samples (~2.6 ms).  Old values
-             * (10/6) finished in 0.3 ms and clicked on every note. */
             if (n->releasing) {
                 n->env -= 1;
                 if (n->env <= 0) { n->env = 0; n->active = 0; continue; }
@@ -298,8 +291,6 @@ static void music_render_accum(s32 *accum, int frames) {
         }
 
         mix = mix * MUSIC_AMPL * vol / 15;
-        /* Light LPF on the music path only (the heavy one is on
-         * the full output mix). */
         g_mus_lpf += (mix - g_mus_lpf) / 2;
 
         accum[i * 2]     += g_mus_lpf;
@@ -308,13 +299,11 @@ static void music_render_accum(s32 *accum, int frames) {
 }
 
 static inline s16 soft_clip(s32 v) {
-    if (v > 20000) v = 20000 + (v - 20000) / 4;
-    if (v > 26000) v = 26000 + (v - 26000) / 8;
-    if (v > 30000) v = 30000 + (v - 30000) / 32;
+    if (v > 24000) v = 24000 + (v - 24000) / 4;
+    if (v > 30000) v = 30000 + (v - 30000) / 16;
     if (v > 32767) v = 32767;
-    if (v < -20000) v = -20000 + (v + 20000) / 4;
-    if (v < -26000) v = -26000 + (v + 26000) / 8;
-    if (v < -30000) v = -30000 + (v + 30000) / 32;
+    if (v < -24000) v = -24000 + (v + 24000) / 4;
+    if (v < -30000) v = -30000 + (v + 30000) / 16;
     if (v < -32768) v = -32768;
     return (s16)v;
 }
@@ -380,8 +369,7 @@ void I_SubmitSound(void) {
                 if (fade > FADE_MAX) fade = FADE_MAX;
             }
 
-            /* Linear interpolation between source samples to reduce
-             * the stair-step artifacts of zero-order-hold upsampling. */
+            /* Linear interpolation to soften the stair-step of 11k→48k. */
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
@@ -401,10 +389,7 @@ void I_SubmitSound(void) {
 
     music_render_accum(mix_accum, MIXBUF);
 
-    /* Output reconstruction filter: single-pole LPF at ~5.5 kHz
-     * (alpha = 0.6).  This smooths the residual stair-step artifacts
-     * from the SFX upsampler and takes the harsh edge off the square
-     * waves coming from the music synth. */
+    /* Output reconstruction LPF: smooths residual stair-step artifacts. */
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
