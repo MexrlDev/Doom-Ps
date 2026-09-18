@@ -1,24 +1,14 @@
 /*
- * doom-ps/src/main.c — v49
+ * doom-ps/src/main.c — v49b
  *
- * v49:
- *   - Triangle now sends Right Shift (hold to run) instead of TAB,
- *     so it no longer duplicates Touchpad's map toggle.  Matches the
- *     controls table in the README ("Triangle: Run (hold)").
- *
- * v48:
- *   - Audio thread sleeps 3/4 of a buffer duration (16 ms) for
- *     ~33% headroom against the 46.87 Hz hardware drain, eliminating
- *     buffer underruns (music/SFX cut-outs).
- *   - reset_doom_globals() zeroes BSS between Doom sessions so
- *     D_DoomMain can run a second time without stale lumps/textures
- *     (W_CacheLumpNum: N >= numlumps).
- *
- * v47: audio thread starts at the beginning of run_doom().
- * v46: 7-visible menu, no wrap-around.
- * v45: poll() before accept() in recv_wads.
- * v44: reset key queue + pad_prev between Doom sessions.
- * v43: WAD path trailing-slash fix (pi 24 → 25).
+ * v49b: typo fix — do_relocations() had r->addend instead of r->r_addend.
+ * v49:  Triangle → Right Shift (run).  Touchpad keeps TAB (map).
+ * v48:  audio thread sleeps 3/4 buffer; BSS reset between Doom sessions.
+ * v47:  audio thread starts at the beginning of run_doom().
+ * v46:  7-visible menu, no wrap-around.
+ * v45:  poll() before accept().
+ * v44:  reset key queue + pad_prev between sessions.
+ * v43:  WAD path trailing-slash fix.
  */
 
 #include "core.h"
@@ -68,7 +58,7 @@ static int do_relocations(u64 load_base) {
     Elf64_Rela *e = (Elf64_Rela *)re;
     while (r < e) {
         if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
-            *(u64 *)(load_base + r->r_offset) = load_base + r->addend;
+            *(u64 *)(load_base + r->r_offset) = load_base + r->r_addend;
             count++;
         }
         r++;
@@ -705,12 +695,6 @@ static int show_wad_menu(struct ps_ctx *c) {
 
 /* ============================================================
  * v48: reset all Doom globals between sessions.
- *
- * Doom's code is linked into our binary, so its globals live in the
- * same BSS range as ours.  Zeroing BSS wipes Doom's state (lumps,
- * textures, caches) which is exactly what we need for the second
- * D_DoomMain call.  But it also wipes our own state and ps_libc's
- * state, so we snapshot those to the stack first and restore after.
  * ============================================================ */
 static void reset_doom_globals(void) {
     u8 libc_save[PS_LIBC_SAVE_SIZE];
@@ -737,8 +721,7 @@ static void reset_doom_globals(void) {
     /* Restore ps_libc's state (fn pointers, pool, log config). */
     ps_libc_restore(libc_save);
 
-    /* Reuse the same 64 MB pool for the next Doom session — otherwise
-     * every restart leaks a fresh one. */
+    /* Reuse the same 64 MB pool for the next Doom session. */
     ps_libc_reset_pool();
 
     udp_log("DoomPS: doom globals reset\n");
@@ -981,8 +964,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int sel = show_wad_menu(c);
         if (sel < 0) break;
         run_doom(c, sel);
-        /* run_doom calls reset_doom_globals() on exit, so Doom's
-         * state is clean and the loop can safely pick another WAD. */
     }
 
     delete_all_wads();
