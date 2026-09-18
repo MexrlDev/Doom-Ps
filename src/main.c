@@ -1,14 +1,14 @@
 /*
- * doom-ps/src/main.c — v42
+ * doom-ps/src/main.c — v43
  *
- * v42:
- *   - Restored all six DG_* callbacks (DG_Init, DG_DrawFrame,
- *     DG_SleepMs, DG_GetTicksMs, DG_GetKey, DG_SetWindowTitle).
- *     They were accidentally removed during the v41 multi-WAD rewrite,
- *     so the linker couldn't find them from doomgeneric.
- *   - Added extern declarations for doomgeneric_Create / _Tick.
- *   - Everything else identical to v41 (multi-WAD menu, clean exit,
- *     full controller mapping).
+ * v43:
+ *   - FIXED: WAD path was missing the trailing slash. "/av_contents/
+ *     content_tmp/" is 25 characters (indices 0..24), but the code
+ *     started writing the filename at index 24, overwriting the slash.
+ *     The resulting path /av_contents/content_tmpDOOM.WAD failed to
+ *     open with EACCES, so the launcher appeared "stuck at loading".
+ *     Changed pi = 24 → pi = 25.
+ *   - Everything else identical to v42.
  */
 
 #include "core.h"
@@ -24,7 +24,6 @@ extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 
-/* doomgeneric API */
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
 extern void doomgeneric_Tick(void);
@@ -356,7 +355,7 @@ static void *audio_thread_fn(void *arg) {
 }
 
 /* ============================================================
- * doomgeneric callbacks — restored in v42
+ * doomgeneric callbacks
  * ============================================================ */
 
 void DG_Init(void) {
@@ -503,9 +502,12 @@ static int recv_wads(s32 listen_fd) {
         name[namelen] = 0;
         if (name[0] == 0) ps_strcpy(name, "UNKNOWN.WAD");
 
+        /* Build "/av_contents/content_tmp/" + name.
+         * The prefix is 25 characters (indices 0..24), the trailing
+         * slash is at index 24, so the name starts at index 25. */
         char path[128];
         ps_strcpy(path, "/av_contents/content_tmp/");
-        int pi = 24;
+        int pi = 25;
         for (int i = 0; name[i] && pi < 126; i++) path[pi++] = name[i];
         path[pi] = 0;
 
