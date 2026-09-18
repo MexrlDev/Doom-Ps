@@ -32,30 +32,29 @@ typedef signed char    s8;
 #define OFF_X   0
 #define OFF_Y   ((SCR_H - DOOM_H * SCALE_Y) / 2)
 
-/* ---- Audio ---- */
+/* ---- Audio ----
+ *
+ * SAMPLES_PER_BUF must match MIXBUF in i_sound_ps.c.  If they differ,
+ * sceAudioOutOpen configures the hardware for one size but the mixer
+ * submits buffers of a different size — the hardware plays only the
+ * first half, so everything runs at 2× real time.  This was the cause
+ * of the "insanely fast" music bug.
+ */
 #define SAMPLE_RATE      48000
-#define SAMPLES_PER_BUF  512
+#define SAMPLES_PER_BUF  1024
 #define AUDIO_S16_STEREO 1
 #define RING_SLOTS       8
-#define RING_BYTES       (SAMPLES_PER_BUF * 4)   /* stereo S16 */
+#define RING_BYTES       (SAMPLES_PER_BUF * 4)
 
 /* ---- ext_args — matches nes.lua / Luac0re layout exactly ---- */
 struct ext_args {
     s64 status;       /* 0x00 */
     s64 step;         /* 0x08 */
     u32 frame_count;  /* 0x10 */
-    s32 log_fd;       /* 0x14  (NES emu uses +0x18; nes.lua sets log_fd at
-                                 +0x18 but frame_count is u32 so pad is gone.
-                                 Mirror exactly as nes.lua writes it.) */
+    s32 log_fd;       /* 0x14 */
     u8  log_addr[16]; /* 0x18 */
     u64 dbg[8];       /* 0x28 .. 0x68 */
 };
-/*
- * dbg[] usage for doom-ps (matches doom_launcher.lua):
- *   dbg[0]  TCP WAD-upload listen fd (bound by Lua, passed in)
- *   dbg[1]  WAD TCP port  (informational)
- *   dbg[2]  userId
- */
 
 /* ---- native_call / resolve_sym (identical to EmuC0re) ---- */
 __attribute__((naked))
