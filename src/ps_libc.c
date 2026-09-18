@@ -1,18 +1,15 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
- * v13: exit() only fires the error dialog when code != 0.  Doom writes
- *      to stderr during normal operation (W_Init, S_Init, Z_Init, ...),
- *      so __last_err is always populated by the time Quit Game runs.
- *      The old code called __error_cb() on every exit, trapping the
- *      user on the red "DOOM INTERNAL ERROR" screen forever.  I_Error
- *      exits with -1, normal quit with 0 — gate on that.
+ * v14: added ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
+ *      main.c calls these around the BSS wipe that runs between Doom
+ *      sessions, so our function pointers and 64 MB memory pool
+ *      survive the wipe.
  *
- * v12: exit() now calls ps_doom_exit_now() (setjmp/longjmp back to
- *      _start cleanup) instead of for(;;) {}.  When Doom's Quit Game
- *      or an I_Error fires exit(), we tear down video/audio/equeue
- *      and return to LuaC0re so the user can launch another payload
- *      without rebooting the game.
+ * v13: exit() only fires the error dialog when code != 0.
+ *
+ * v12: exit() calls ps_doom_exit_now() (setjmp/longjmp back to _start
+ *      cleanup) instead of for(;;) {}.
  */
 
 #include "core.h"
@@ -1031,17 +1028,6 @@ int atexit(void (*fn)(void)) { (void)fn; return 0; }
 char *getenv(const char *name) { (void)name; return 0; }
 void _exit(int code) { (void)code; for (;;) {} }
 
-/*
- * exit() — reached from Doom's "Quit Game", I_Error, or any Doom path
- * that terminates the process.  We jump back to _start's cleanup
- * block via longjmp so video/audio/equeue are torn down and control
- * returns to LuaC0re.  ps_doom_exit_now() never returns.
- *
- * v13 fix: Doom writes to stderr during normal operation (W_Init,
- * S_Init, Z_Init, ...), so __capture_err() is always populated by
- * the time exit(0) runs from the main menu's Quit Game.  Only fire
- * the error dialog for a real error (I_Error exits with -1).
- */
 void exit(int code) {
     char b[60]; int p = 0;
     const char *pre = "ps_libc: *** exit(";
@@ -1057,8 +1043,85 @@ void exit(int code) {
     if (code != 0 && __error_cb && __last_err_len > 0) {
         __error_cb(__last_err);
     }
-    ps_doom_exit_now();   /* longjmp back to _start cleanup */
+    ps_doom_exit_now();
     for (;;) {}
 }
 
 int  system(const char *cmd) { (void)cmd; return -1; }
+
+/* ============================================================
+ * v14: State save / restore for main.c's inter-session BSS wipe.
+ *
+ * The shellcode's BSS is shared with Doom's own globals (both live
+ * in the same binary).  Between Doom sessions main.c zeroes the
+ * whole BSS to wipe Doom's state — but that also wipes our fn
+ * pointers and the 64 MB memory pool.  These helpers snapshot and
+ * restore the essential bits.
+ * ============================================================ */
+#define PS_LIBC_SAVE_MAGIC 0x50C1B0B0C0DEULL
+/* 256 bytes is plenty; callers should use PS_LIBC_SAVE_SIZE. */
+
+void ps_libc_save(void *buf) {
+    u8 *b = (u8 *)buf;
+    u64 p = 0;
+    *(u64 *)(b + p) = PS_LIBC_SAVE_MAGIC;    p += 8;
+    *(void **)(b + p) = __G;                 p += 8;
+    *(void **)(b + p) = __D;                 p += 8;
+    *(void **)(b + p) = fn_mmap;             p += 8;
+    *(void **)(b + p) = fn_munmap;           p += 8;
+    *(void **)(b + p) = fn_kopen;            p += 8;
+    *(void **)(b + p) = fn_kread;            p += 8;
+    *(void **)(b + p) = fn_kwrite;           p += 8;
+    *(void **)(b + p) = fn_kclose;           p += 8;
+    *(void **)(b + p) = fn_klseek;           p += 8;
+    *(void **)(b + p) = fn_kmkdir;           p += 8;
+    *(void **)(b + p) = fn_alloc_dm;         p += 8;
+    *(void **)(b + p) = fn_map_dm;           p += 8;
+    *(void **)(b + p) = fn_dm_size;          p += 8;
+    *(void **)(b + p) = fn_sendto;           p += 8;
+    *(s32 *)(b + p) = __log_fd;              p += 4;
+    for (int i = 0; i < 16; i++) b[p + i] = __log_sa[i];
+    p += 16;
+    *(int *)(b + p) = __log_ready;           p += 4;
+    p += 4;  /* padding */
+    *(unsigned char **)(b + p) = __pool;     p += 8;
+    *(size_t *)(b + p) = __pool_size;        p += 8;
+    *(size_t *)(b + p) = __pool_used;        p += 8;
+    *(void (**)(const char *))(b + p) = __error_cb; p += 8;
+}
+
+void ps_libc_restore(const void *buf) {
+    const u8 *b = (const u8 *)buf;
+    if (*(const u64 *)(b + 0) != PS_LIBC_SAVE_MAGIC) return;
+    u64 p = 8;
+    __G = *(void **)(b + p);        p += 8;
+    __D = *(void **)(b + p);        p += 8;
+    fn_mmap     = *(void **)(b + p); p += 8;
+    fn_munmap   = *(void **)(b + p); p += 8;
+    fn_kopen    = *(void **)(b + p); p += 8;
+    fn_kread    = *(void **)(b + p); p += 8;
+    fn_kwrite   = *(void **)(b + p); p += 8;
+    fn_kclose   = *(void **)(b + p); p += 8;
+    fn_klseek   = *(void **)(b + p); p += 8;
+    fn_kmkdir   = *(void **)(b + p); p += 8;
+    fn_alloc_dm = *(void **)(b + p); p += 8;
+    fn_map_dm   = *(void **)(b + p); p += 8;
+    fn_dm_size  = *(void **)(b + p); p += 8;
+    fn_sendto   = *(void **)(b + p); p += 8;
+    __log_fd = *(s32 *)(b + p);      p += 4;
+    for (int i = 0; i < 16; i++) __log_sa[i] = b[p + i];
+    p += 16;
+    __log_ready = *(int *)(b + p);   p += 4;
+    p += 4;
+    __pool      = *(unsigned char **)(b + p); p += 8;
+    __pool_size = *(size_t *)(b + p);         p += 8;
+    __pool_used = *(size_t *)(b + p);         p += 8;
+    __error_cb  = *(void (**)(const char *))(b + p); p += 8;
+}
+
+/* Reset just the "used" pointer so the same 64 MB pool is reused for
+ * the next Doom session.  Doom's Z_Init reallocates its zone from the
+ * start of the pool, overwriting the previous session's data. */
+void ps_libc_reset_pool(void) {
+    __pool_used = 0;
+}
