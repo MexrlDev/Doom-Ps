@@ -1,13 +1,19 @@
 /*
- * doom-ps/src/main.c — v55
+ * doom-ps/src/main.c — v56
  *
- * v55:
- *   - MENU: Circle (O) = confirm, Cross (X) = back.  Was the other
- *     way around.  Matches the PlayStation convention and the user
- *     request.
- *   - RESET: call ps_libc_close_all_files() before the BSS wipe, so
- *     any fd Doom left open doesn't leak across sessions.
+ * v56:
+ *   - REVERTED the WAD launcher X/O swap from v55.  X = SELECT and
+ *     O = QUIT again, matching the muscle memory from previous builds.
+ *     (v55's swap made X quit, which is why pressing X on the WAD list
+ *     exited to Lua — the emulator appeared "broken".)
+ *   - In Doom's IN-GAME menus, X now sends ESCAPE (back) and O sends
+ *     ENTER (confirm).  Detected via Doom's own `menuactive` global
+ *     from m_menu.c.  In-game (menu closed), X still sends FIRE.
+ *   - menuactive is declared extern; if the symbol is missing from the
+ *     link, the extern resolves to 0 and we fall back to the game
+ *     mapping (X = fire) which is the safe default.
  *
+ * v55: ps_libc_close_all_files() before the BSS wipe.
  * v54: pool reset between sessions; delete .default.cfg on reset.
  * v53: .ps_persist section holds g_ctx, g_wads, exit flags.
  * v52: mixer divisions → multiplies; audio sleep removed.
@@ -38,7 +44,13 @@ extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 extern void  ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
 extern void  ps_libc_reset_pool(void);
-extern void  ps_libc_close_all_files(void);    /* v55 */
+extern void  ps_libc_close_all_files(void);
+
+/* v56: Doom's menu-active flag from m_menu.c.  Non-zero when the
+ * in-game menu (Options, Save, Load, etc.) is open.  Declared extern
+ * so the linker binds it; if m_menu.c doesn't export it, the link
+ * fails loudly and we know immediately. */
+extern int menuactive;
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -351,22 +363,51 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
+/*
+ * v56 — translate_pad.
+ *
+ * Doom's menus use ESCAPE (back) and ENTER (confirm).  In-game, Cross
+ * is FIRE and Circle is inert.  When Doom's menu is open (menuactive
+ * != 0) we remap Cross to ESCAPE so X behaves as "back" in the
+ * Options / Save / Load submenus, exactly as the user requested.
+ *
+ * If menuactive can't be linked for some reason, this file will fail
+ * to build, which is better than silently misbehaving.
+ */
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 ch = raw ^ c->pad_prev;
     c->pad_prev = raw;
+
+    int in_menu = (menuactive != 0);
+
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
+
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
-    MAP(DS_CROSS, DOOM_KEY_FIRE); MAP(DS_SQUARE, DOOM_KEY_USE);
-    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT); MAP(DS_CIRCLE, DOOM_KEY_ENTER);
+    MAP(DS_SQUARE, DOOM_KEY_USE);
+    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT);
+
+    /* Cross: FIRE in-game, ESCAPE in Doom's in-game menus. */
+    if (in_menu) {
+        MAP(DS_CROSS, DOOM_KEY_ESCAPE);
+    } else {
+        MAP(DS_CROSS, DOOM_KEY_FIRE);
+    }
+
+    /* Circle: always ENTER (confirm in menus, inert in-game). */
+    MAP(DS_CIRCLE, DOOM_KEY_ENTER);
+
+    /* Y/N for Doom's yes/no dialogs.  Circle = Y, Cross = N. */
     if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
     if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
+
     MAP(DS_OPTIONS, DOOM_KEY_ESCAPE);
     MAP(DS_R1, DOOM_KEY_F2); MAP(DS_L1, DOOM_KEY_F3);
     MAP(DS_R2, DOOM_KEY_RBRACKET); MAP(DS_L2, DOOM_KEY_LBRACKET);
     MAP(DS_L3, DOOM_KEY_COMMA); MAP(DS_R3, DOOM_KEY_PERIOD);
     MAP(DS_TOUCHPAD, DOOM_KEY_TAB);
+
 #undef MAP
 }
 
@@ -382,9 +423,6 @@ static void *audio_thread_fn(void *arg) {
     ps_sound_log("Audio: thread started\n");
     while (g_audio_thread_running) {
         I_SubmitSound();
-        /* No sleep.  sceAudioOutOutput blocks on the hardware queue and
-         * provides the pacing.  SAMPLES_PER_BUF is 2048 so the drain
-         * rate is 23.44/sec, giving ample headroom. */
     }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
@@ -614,7 +652,7 @@ done:
 /* ============================================================
  * WAD menu — 7 visible rows, no wrap-around.
  *
- * v55: Circle (O) = confirm, Cross (X) = back.
+ * v56: X = SELECT, O = QUIT (reverted from v55's swap).
  * ============================================================ */
 
 #define MENU_VISIBLE 7
@@ -631,17 +669,6 @@ static int show_wad_menu(struct ps_ctx *c) {
             u32 r = *(u32 *)buf;
             if (!(r & 0x80000000)) prev_btn = r & DS_PAD_MASK;
         }
-    }
-
-    {
-        char b[80]; int p = 0;
-        const char *m = "DoomPS: menu init prev_btn=0x";
-        while (*m) b[p++] = *m++;
-        const char *hex = "0123456789ABCDEF";
-        for (int k = 7; k >= 0; k--)
-            b[p++] = hex[(prev_btn >> (k * 4)) & 0xF];
-        b[p++] = '\n'; b[p] = 0;
-        udp_log(b);
     }
 
     log_wad_count("DoomPS: menu entering, wads=");
@@ -680,9 +707,9 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        /* v55: Circle = confirm, Cross = back. */
-        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return g_wad_cursor;
-        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return -1;
+        /* v56: Cross = select, Circle = quit (reverted). */
+        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
+        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
 
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -728,8 +755,8 @@ static int show_wad_menu(struct ps_ctx *c) {
         counter[cp] = 0;
         ps_draw_str_center(fb, SCR_H - 110, counter, 0xFF808080, 3);
 
-        /* v55: updated hint. */
-        ps_draw_str_center(fb, SCR_H - 50, "O = SELECT   X = BACK",
+        /* v56: reverted hint. */
+        ps_draw_str_center(fb, SCR_H - 50, "X = SELECT   O = QUIT",
                            0xFF909090, 3);
 
         present(c);
@@ -739,21 +766,13 @@ static int show_wad_menu(struct ps_ctx *c) {
 
 /* ============================================================
  * reset_doom_globals
- *
- * v55:
- *   - ps_libc_close_all_files() before the wipe.
- * v54:
- *   - ps_libc_reset_pool() so session 2 allocates from offset 0.
- *   - delete .default.cfg so volume isn't inherited.
  * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
 
-    /* v55: release any fds Doom left open. */
     ps_libc_close_all_files();
 
-    /* Delete stale config so volume isn't inherited across sessions. */
     {
         struct ps_ctx *c = &g_ctx;
         if (c->unlink_fn) {
@@ -810,7 +829,7 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
 }
 
 /* ============================================================
- * run_doom — start audio thread FIRST, run Doom, then reset state.
+ * run_doom
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -872,7 +891,7 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
 }
 
 /* ============================================================
- * _start — entry point.
+ * _start
  * ============================================================ */
 
 __attribute__((section(".text._start")))
