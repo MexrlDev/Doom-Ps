@@ -1,17 +1,23 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v24:
- *   - Mixer divisions replaced with multiplies.  Divisions were 5 per
- *     sample per SFX channel; with 32 channels × 1024 samples that
- *     was ~160k divisions per submit — several ms of pure overhead
- *     that pushed the audio thread's cycle above the 21.33 ms hardware
- *     drain window.  Now the mixer runs in <0.5 ms.
- *   - Per-channel gain precomputed once per channel.
- *   - Per-submit music scale precomputed once.
+ * v25:
+ *   - MUSIC_AMPL 6 → 12 (music 2× louder)
+ *   - SFX_HEADROOM 2 → 1 (SFX 2× louder)
+ *     → both louder, same music-vs-SFX balance
+ *   - Music timing is now EXACT.  The old code advanced the tick
+ *     accumulator by `1000000 / 48000 = 20` µs per sample, but a real
+ *     sample is 20.833 µs.  That's a 4% drift per second, which is
+ *     the "wrong notes" the user reported.  Now every sample adds
+ *     1e9 ns × SAMPLE_RATE units and the delay is stored in the same
+ *     exact-rational units.
+ *   - Trimmed the debug logs (only first 20 events, first 50 notes).
+ *     The event flood was adding latency on every submit.
+ *   - Reset snd_musicvolume/snd_sfxvolume to 8 at I_InitSound so
+ *     session 2 can't inherit a stale value.
  *
- * v23:
- *   - MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
+ * v24: mixer divisions → multiplies.
+ * v23: MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
  */
 
 #include <stdio.h>
@@ -41,8 +47,9 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
-#define SFX_HEADROOM   2
-#define MUSIC_AMPL     6
+/* v25: both buses 2× louder, same music:sfx ratio as v24. */
+#define SFX_HEADROOM   1
+#define MUSIC_AMPL     12
 
 #define DMX_SAMPLE_RATE 11025
 
@@ -101,8 +108,15 @@ static int      mus_track_end      = 0;
 static int      mus_loop           = 0;
 static int      mus_playing        = 0;
 static int      mus_is_mus         = 0;
-static int      mus_delay_us       = 0;
-static int      mus_tick_acc       = 0;
+
+/* v25: exact-rational timing.
+ *   mus_delay_units and mus_time_units are both in units of
+ *   (nanoseconds × SAMPLE_RATE).  Advancing by one audio sample
+ *   adds 1e9 to mus_time_units (because 1e9 / SAMPLE_RATE ns of real
+ *   time has elapsed, and we scale by SAMPLE_RATE to keep it integer).
+ */
+static s64      mus_delay_units    = 0;
+static s64      mus_time_units     = 0;
 
 static unsigned int note_phase_inc_table[128];
 
@@ -133,7 +147,7 @@ static void music_note_on(int note, int vel, int chan) {
     if (vel <= 0) { music_note_off_chan(chan, note); return; }
     if (vel > 127)  vel = 127;
 
-    if (dbg_note < 200) {
+    if (dbg_note < 50) {
         dbg_note++;
         log_num("M: note N=", note, "");
         log_num("M: note V=", vel, "");
@@ -181,7 +195,8 @@ static void mus_process_event(void) {
             log_str("M: loop restart");
             mus_pos = mus_track_start;
             music_all_notes_off();
-            mus_delay_us = 0;
+            mus_delay_units = 0;
+            mus_time_units  = 0;
         } else {
             log_str("M: END");
             mus_playing = 0;
@@ -196,7 +211,7 @@ static void mus_process_event(void) {
     int has_delay = (ev & 0x80) != 0;
 
     dbg_event++;
-    if (dbg_event <= 100) {
+    if (dbg_event <= 20) {
         log_num("M: ev #", dbg_event, "");
         log_num("M: ev T=", type, "");
         log_num("M: ev C=", chan, "");
@@ -244,17 +259,21 @@ static void mus_process_event(void) {
             delay = (delay << 7) | (b & 0x7F);
             if (!(b & 0x80)) break;
         }
-        mus_delay_us = (delay * 1000000) / 140;
+        /* v25: exact.  1 tick = 1/140 s = 1e9/140 ns.
+         * Convert to our scaled unit: (ns * SAMPLE_RATE).
+         *   delay * 1e9 * SAMPLE_RATE / 140
+         * int64 is good for delay up to ~2.7e7 ticks. */
+        mus_delay_units = ((s64)delay * 1000000000LL * (s64)SAMPLE_RATE) / 140LL;
     } else {
-        mus_delay_us = 0;
+        mus_delay_units = 0;
     }
 }
 
 static void mus_parse_header(void) {
     mus_pos = mus_track_start;
     music_all_notes_off();
-    mus_delay_us = 0;
-    mus_tick_acc = 0;
+    mus_delay_units = 0;
+    mus_time_units  = 0;
 
     if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
@@ -274,38 +293,44 @@ static void mus_parse_header(void) {
     mus_track_start = score_start;
     mus_track_end   = mus_len;
     mus_pos         = score_start;
-    mus_delay_us    = 0;
+    mus_delay_units = 0;
+    mus_time_units  = 0;
     log_str("Music: MUS loaded");
 }
 
 /*
- * v24 — optimized music renderer.
+ * v25 — exact-timed music renderer.
  *
- * / 15 replaced with multiply by 65536/15 = 4369.07 → precomputed
- * per-submit scale.  / 2 replaced with shift.
+ * Each audio sample advances the wall clock by exactly 1e9/SAMPLE_RATE
+ * nanoseconds.  We keep time in units of (nanoseconds × SAMPLE_RATE) so
+ * the arithmetic is integer-exact:
+ *
+ *   advance per sample = 1e9   (because 1e9/SAMPLE_RATE ns × SAMPLE_RATE)
+ *   event delay       = (delay_ticks × 1e9 × SAMPLE_RATE) / 140
+ *
+ * The old code advanced by 1000000/SAMPLE_RATE = 20 µs per sample
+ * (truncated from 20.833), which drifted 4% per second — that was the
+ * "wrong notes" the user heard.
  */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
-
-    int us_per_sample = 1000000 / SAMPLE_RATE;
-    if (us_per_sample < 1) us_per_sample = 1;
 
     int vol = snd_musicvolume;
     if (vol < 0)   vol = 0;
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
-    /* Precompute per-submit music scale: MUSIC_AMPL * vol / 15, fixed 16.16 */
+    /* Precompute music scale: MUSIC_AMPL * vol / 15, fixed 16.16 */
     int music_scale_fp = (MUSIC_AMPL * vol * 65536) / 15;
-    /* Max = 6 * 15 * 65536 / 15 = 393216.  Fits in 32-bit. */
+    /* Max = 12 * 15 * 65536 / 15 = 786432.  Fits in 32-bit. */
 
     for (int i = 0; i < frames; i++) {
-        mus_tick_acc += us_per_sample;
+        mus_time_units += 1000000000LL;   /* one sample's worth of ns, scaled by SAMPLE_RATE */
 
         int safety = 0;
-        while (mus_playing && mus_tick_acc >= mus_delay_us && safety < 200) {
+        while (mus_playing && mus_time_units >= mus_delay_units && safety < 200) {
             safety++;
-            mus_tick_acc -= mus_delay_us;
+            mus_time_units -= mus_delay_units;
             mus_process_event();
             if (!mus_playing) break;
         }
@@ -330,10 +355,7 @@ static void music_render_accum(s32 *accum, int frames) {
             n->phase += n->phase_inc;
         }
 
-        /* Apply music scale (was: mix * MUSIC_AMPL * vol / 15) */
-        mix = ((long long)mix * music_scale_fp) >> 16;
-
-        /* Lowpass filter: g_mus_lpf += (mix - g_mus_lpf) / 2; */
+        mix = (int)(((long long)mix * music_scale_fp) >> 16);
         g_mus_lpf += (mix - g_mus_lpf) >> 1;
 
         accum[i * 2]     += g_mus_lpf;
@@ -361,6 +383,20 @@ void I_InitSound(boolean use_sfx_prefix) {
         channels[i].active = channels[i].releasing = channels[i].fade = 0;
     init_music_tables();
     g_mus_lpf = 0; g_out_lpf_l = 0; g_out_lpf_r = 0;
+
+    /* v25: force a fresh music state at every session start. */
+    music_all_notes_off();
+    mus_playing = 0;
+    mus_data = 0;
+    mus_len = 0;
+    mus_pos = 0;
+    mus_track_start = 0;
+    mus_track_end = 0;
+    mus_loop = 0;
+    mus_is_mus = 0;
+    mus_delay_units = 0;
+    mus_time_units = 0;
+
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
@@ -380,23 +416,9 @@ void I_SetChannels(void) {}
 void I_SetSfxVolume(int volume) { (void)volume; }
 
 /*
- * v24 — optimized mixer.
+ * v25 — mixer.
  *
- * The old code did 5 divisions per sample per active SFX channel:
- *   sample * fade / FADE_MAX
- *   sample * vol / 127
- *   sample /= SFX_HEADROOM
- *   sample * lgain / 255
- *   sample * rgain / 255
- *
- * Now:
- *   fade / FADE_MAX          → >> 10
- *   vol / 127 and pan / 255  → folded into a per-channel 16.16 gain,
- *                              applied as a single multiply + >> 16
- *   SFX_HEADROOM (2)         → >> 1
- *
- * Per sample per channel we now do 3 shifts and 2 multiplies, no
- * divisions.
+ * Divisions folded into per-channel 16.16 gains and shifts.
  */
 void I_SubmitSound(void) {
     dbg_submit++;
@@ -416,10 +438,9 @@ void I_SubmitSound(void) {
         const unsigned char *data = ch->data;
         int length = ch->length, step = ch->step;
 
-        /* Precompute per-channel 16.16 gains: vol/127 * pan/255 */
-        int vol_scaled = (vol * 65536) / 127;            /* 0..65536 */
-        int lgain = ((255 - pan) * vol_scaled) / 255;    /* 0..65536 */
-        int rgain = (pan * vol_scaled) / 255;            /* 0..65536 */
+        int vol_scaled = (vol * 65536) / 127;
+        int lgain = ((255 - pan) * vol_scaled) / 255;
+        int rgain = (pan * vol_scaled) / 255;
 
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
@@ -437,9 +458,9 @@ void I_SubmitSound(void) {
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
-            int sample = sample8 << 8;                /* -32768..32512 */
-            sample = (sample * fade) >> 10;           /* / FADE_MAX */
-            sample >>= 1;                             /* / SFX_HEADROOM */
+            int sample = sample8 << 8;
+            sample = (sample * fade) >> 10;
+            sample >>= SFX_HEADROOM;
 
             mix_accum[i * 2]     += (sample * lgain) >> 16;
             mix_accum[i * 2 + 1] += (sample * rgain) >> 16;
@@ -454,9 +475,6 @@ void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
-        /* g_out_lpf += (l - g_out_lpf) * 3 / 5;
-         *           = (l - g_out_lpf) * 0.6
-         * 0.6 * 65536 = 39321.6 → 39322 */
         g_out_lpf_l += ((l - g_out_lpf_l) * 39322) >> 16;
         g_out_lpf_r += ((r - g_out_lpf_r) * 39322) >> 16;
         mix_final[i * 2]     = soft_clip(g_out_lpf_l);
@@ -522,6 +540,10 @@ void I_InitMusic(void) {
 void I_ShutdownMusic(void) { music_all_notes_off(); mus_playing = 0; }
 
 void I_SetMusicVolume(int volume) {
+    /* Doom passes 0-127 (or 0-15 in some builds).  Clamp to 0-15. */
+    if (volume < 0)   volume = 0;
+    if (volume > 15)  volume = (volume * 15) / 120;
+    if (volume > 15)  volume = 15;
     snd_musicvolume = volume;
     log_num("M:vol=", volume, "");
 }
@@ -547,6 +569,21 @@ void *I_RegisterSong(void *data, int len) {
         ps_sound_log("Music: registered MUS");
     } else {
         s->is_mus = -1;
+        /* v25: log the first 4 bytes so we can tell garbage from
+         * a legitimately unsupported format (DOOM v1.8 DMX). */
+        {
+            char b[64]; int p = 0;
+            const char *m = "Music: bad header bytes=";
+            while (*m) b[p++] = *m++;
+            const char *h = "0123456789ABCDEF";
+            for (int i = 0; i < 4 && i < len; i++) {
+                b[p++] = h[(s->data[i] >> 4) & 0xF];
+                b[p++] = h[s->data[i] & 0xF];
+                b[p++] = ' ';
+            }
+            b[p++] = '\n'; b[p] = 0;
+            ps_sound_log(b);
+        }
         ps_sound_log("Music: unknown format");
     }
     return s;
