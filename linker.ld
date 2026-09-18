@@ -21,17 +21,26 @@ SECTIONS
 
         *(.data)
         *(.data.*)
-        *(.data.rel)
-        *(.data.rel.*)
-        *(.data.rel.ro)
-        *(.data.rel.ro.*)
 
         /* GOT tables — needed by -fpie code */
         *(.got)
         *(.got.plt)
 
-        /* BSS inside .text so file stays ~628 KB.
-         * Bytes are zeros; _start zeroes it again harmlessly. */
+        /* ----------------------------------------------------------
+         * v53: Persistent state section.  NEVER wiped by
+         * reset_doom_globals().  Any global we need to survive between
+         * Doom sessions (function pointers, WAD list, memory pool
+         * pointer) is marked __attribute__((section(".ps_persist"))).
+         * ---------------------------------------------------------- */
+        __ps_persist_start = .;
+        *(.ps_persist)
+        *(.ps_persist.*)
+        __ps_persist_end = .;
+
+        /* ----------------------------------------------------------
+         * Doom's BSS.  Wiped between sessions so D_DoomMain can run
+         * a second time without stale lumps / textures / level data.
+         * ---------------------------------------------------------- */
         __bss_start = .;
         *(.bss)
         *(.bss.*)
@@ -39,11 +48,8 @@ SECTIONS
         __bss_end = .;
     } :text
 
-    /* ------------------------------------------------------------
-     * .rela_out — holds the ELF relocation table.
-     * _start walks __rela_start..__rela_end and applies load_base
-     * to every R_X86_64_RELATIVE entry.
-     * ------------------------------------------------------------ */
+    /* .rela_out — ELF relocation table.  _start walks __rela_start..
+     * __rela_end and applies load_base to every R_X86_64_RELATIVE. */
     .rela_out : {
         __rela_start = .;
         *(.rela.dyn)
@@ -52,20 +58,15 @@ SECTIONS
         *(.rela.text.*)
         *(.rela.data)
         *(.rela.data.*)
-        *(.rela.data.rel)
-        *(.rela.data.rel.*)
         *(.rela.rodata)
         *(.rela.rodata.*)
         *(.rela.bss)
         *(.rela.bss.*)
         *(.rela.got)
         *(.rela.got.*)
-        *(.rela.init_array)
-        *(.rela.fini_array)
         __rela_end = .;
     } :text
 
-    /* Safe to discard */
     /DISCARD/ : {
         *(.comment)
         *(.note.*)
