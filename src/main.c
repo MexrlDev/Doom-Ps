@@ -2,16 +2,13 @@
  * doom-ps/src/main.c — v41
  *
  * v41:
- *   - Multi-WAD receive: accepts connections on port 5000 repeatedly
- *     until 3 seconds of silence. Each WAD uses the new protocol:
+ *   - Multi-WAD receive on port 5000. Each WAD uses a new protocol:
  *     [u64 size][u16 namelen][name bytes][data].
  *   - WAD picker menu with 3-visible scrolling list, up/down navigation
  *     with wrap-around, Cross to select, Circle to quit to Lua.
- *   - In-game Quit Game returns to the menu instead of exiting.
- *   - On Circle-from-menu, all WADs are deleted from the sh content
- *     before returning to Lua. Next launcher run also deletes stale
- *     WADs at the top of recv_wads.
- *   - SAMPLES_PER_BUF aligned with MIXBUF via core.h.
+ *   - In-game Quit Game returns to the menu.
+ *   - On Circle-from-menu, all WADs are deleted from av_contents.
+ *   - Clean exit via setjmp/longjmp (addq $8, %rsp fix from v39).
  */
 
 #include "core.h"
@@ -62,9 +59,7 @@ static int do_relocations(u64 load_base) {
 static void ps_memset(void *dst, u8 val, u64 len) { u8 *d = (u8 *)dst; while (len--) *d++ = val; }
 static void ps_memcpy(void *dst, const void *src, u64 len) { u8 *d = (u8 *)dst; const u8 *s = (const u8 *)src; while (len--) *d++ = *s++; }
 static u64 ps_strlen(const char *s) { u64 n = 0; while (s[n]) n++; return n; }
-static int ps_strcmp(const char *a, const char *b) { while (*a && *a == *b) { a++; b++; } return (u8)*a - (u8)*b; }
 static void ps_strcpy(char *d, const char *s) { while ((*d++ = *s++)); }
-static void ps_strncpy(char *d, const char *s, int n) { int i = 0; while (i < n - 1 && s[i]) { d[i] = s[i]; i++; } d[i] = 0; }
 
 #define DS_SHARE     0x00000001
 #define DS_L3        0x00000002
@@ -109,8 +104,8 @@ static void ps_strncpy(char *d, const char *s, int n) { int i = 0; while (i < n 
 #define KEY_QUEUE_SIZE 32
 
 struct wad_entry {
-    char path[128];    /* /av_contents/content_tmp/NAME */
-    char name[64];     /* NAME */
+    char path[128];
+    char name[64];
 };
 
 static struct wad_entry g_wads[MAX_WADS];
@@ -228,16 +223,10 @@ static void present(struct ps_ctx *c) {
     c->total_frames++;
 }
 
-static void draw_bg(struct ps_ctx *c) {
+static void show_loading(struct ps_ctx *c, int dots, const char *status) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
     u32 *fb = (u32 *)c->fbs[c->active_fb];
     for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
-}
-
-static void show_loading(struct ps_ctx *c, int dots, const char *status) {
-    if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
-    draw_bg(c);
-    u32 *fb = (u32 *)c->fbs[c->active_fb];
     ps_draw_str_center(fb, 280, "DOOM-PS", 0xFFFFAA00, 8);
     ps_draw_str_center(fb, 400, "doomgeneric on Luac0re", 0xFF808080, 3);
     ps_draw_str_center(fb, 445, "By MexrlDev", 0xFF909090, 3);
@@ -253,8 +242,8 @@ static void show_loading(struct ps_ctx *c, int dots, const char *status) {
 
 static void show_wad_progress(struct ps_ctx *c, const char *name, u64 got, u64 total) {
     if (c->video_h < 0 || !c->fbs[c->active_fb]) return;
-    draw_bg(c);
     u32 *fb = (u32 *)c->fbs[c->active_fb];
+    for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
     ps_draw_str_center(fb, 240, "RECEIVING WAD", 0xFFFFAA00, 5);
     if (name) ps_draw_str_center(fb, 400, name, 0xFF8080FF, 4);
     int pct = (total > 0) ? (int)(got * 100 / total) : 0;
@@ -274,7 +263,7 @@ static void show_wad_progress(struct ps_ctx *c, const char *name, u64 got, u64 t
 
 static void show_error_and_hang(struct ps_ctx *c, const char *l1, const char *l2) {
     for (;;) {
-        draw_bg(c);
+        if (c->video_h < 0) continue;
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
         ps_draw_str_center(fb, 300, "DOOM-PS ERROR", 0xFFFF4040, 6);
@@ -327,42 +316,10 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
-static const char *bit_name(u32 bit) {
-    switch (bit) {
-    case DS_SHARE: return "Share"; case DS_L3: return "L3"; case DS_R3: return "R3";
-    case DS_OPTIONS: return "Options"; case DS_UP: return "Up"; case DS_RIGHT: return "Right";
-    case DS_DOWN: return "Down"; case DS_LEFT: return "Left"; case DS_L2: return "L2";
-    case DS_R2: return "R2"; case DS_L1: return "L1"; case DS_R1: return "R1";
-    case DS_TRIANGLE: return "Triangle"; case DS_CIRCLE: return "Circle";
-    case DS_CROSS: return "Cross"; case DS_SQUARE: return "Square";
-    case DS_TOUCHPAD: return "Touchpad";
-    }
-    return "?";
-}
-
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 ch = raw ^ c->pad_prev;
     c->pad_prev = raw;
-
-    static int pad_log_count = 0;
-    if (ch != 0 && pad_log_count < 200) {
-        pad_log_count++;
-        for (u32 b = 1; b != 0; b <<= 1) {
-            if (!(ch & b)) continue;
-            char buf[64]; int p = 0;
-            const char *nm = bit_name(b);
-            const char *m = (raw & b) ? "PRESS " : "REL   ";
-            while (*m) buf[p++] = *m++;
-            while (*nm && p < 30) buf[p++] = *nm++;
-            buf[p++] = ' '; buf[p++] = '0'; buf[p++] = 'x';
-            const char h[] = "0123456789ABCDEF";
-            for (int k = 7; k >= 0; k--) buf[p++] = h[(b >> (k*4)) & 0xF];
-            buf[p++] = '\n'; buf[p] = 0;
-            udp_log(buf);
-        }
-    }
-
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
@@ -393,15 +350,12 @@ static void *audio_thread_fn(void *arg) {
     return 0;
 }
 
-/* --------------- WAD management --------------- */
-
 static void delete_all_wads(void) {
     struct ps_ctx *c = &g_ctx;
     for (int i = 0; i < g_wad_count; i++) {
         if (c->unlink_fn)
             NC(c->G, c->unlink_fn, (u64)g_wads[i].path, 0,0,0,0,0);
     }
-    /* Also attempt to remove any *.wad we know by name */
     g_wad_count = 0;
     g_wad_cursor = 0;
     g_wad_scroll = 0;
@@ -411,8 +365,8 @@ static void delete_all_wads(void) {
 
 static int recv_wads(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
-    if (listen_fd < 0) { udp_log("DoomPS: listen_fd < 0\n"); return -1; }
-    udp_log("DoomPS: waiting for WADs on TCP...\n");
+    if (listen_fd < 0) return -1;
+    udp_log("DoomPS: waiting for WADs\n");
 
     delete_all_wads();
     show_loading(c, 0, "Waiting for WADs...");
@@ -420,7 +374,7 @@ static int recv_wads(s32 listen_fd) {
     if (c->setsockopt_fn) {
         u8 tv[16] = {0};
         *(u64 *)(tv + 0) = 0;
-        *(u64 *)(tv + 8) = 500000;   /* 500 ms accept timeout */
+        *(u64 *)(tv + 8) = 500000;
         (void)NC(c->G, c->setsockopt_fn,
                  (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
     }
@@ -428,18 +382,16 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        /* accept with timeout */
         s32 client = -1;
-        for (int attempt = 0; attempt < 12; attempt++) {   /* 6s of retries */
+        for (int attempt = 0; attempt < 12; attempt++) {
             u8 peer[16]; s32 plen = 16;
             client = (s32)NC(c->G, c->accept_fn,
                              (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
             if (client >= 0) break;
             if (c->usleep_fn) NC(c->G, c->usleep_fn, 500000, 0,0,0,0,0);
         }
-        if (client < 0) break;   /* no more WADs coming */
+        if (client < 0) break;
 
-        /* clear inherited timeout on client */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
             *(u64 *)(tv + 0) = 30;
@@ -448,7 +400,6 @@ static int recv_wads(s32 listen_fd) {
                      (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
         }
 
-        /* [u64 size][u16 namelen][name] */
         u8 hdr[10]; s32 got = 0;
         while (got < 10) {
             s32 n = (s32)NC(c->G, c->recv_fn, (u64)client,
@@ -472,18 +423,15 @@ static int recv_wads(s32 listen_fd) {
         name[namelen] = 0;
         if (name[0] == 0) ps_strcpy(name, "UNKNOWN.WAD");
 
-        /* Build path */
         char path[128];
         ps_strcpy(path, "/av_contents/content_tmp/");
         int pi = 24;
         for (int i = 0; name[i] && pi < 126; i++) path[pi++] = name[i];
         path[pi] = 0;
 
-        /* Close any stale handle */
         s32 stale = (s32)NC(c->G, c->kopen, (u64)path, 0,0,0,0,0);
         if (stale >= 0) NC(c->G, c->kclose, (u64)stale, 0,0,0,0,0);
 
-        /* Open for writing */
         s32 fd = (s32)NC(c->G, c->kopen, (u64)path,
                          (u64)O_WR_CREAT_TRUNC, 0x1FF, 0,0,0);
         diag_kopen("DoomPS: [W] ", path, fd);
@@ -492,7 +440,6 @@ static int recv_wads(s32 listen_fd) {
             continue;
         }
 
-        /* Receive loop with progress */
         u8 chunk[WAD_CHUNK];
         u64 remaining = wad_size;
         int last_pct = -1;
@@ -526,7 +473,6 @@ static int recv_wads(s32 listen_fd) {
             continue;
         }
 
-        /* Register */
         ps_strcpy(g_wads[g_wad_count].name, name);
         ps_strcpy(g_wads[g_wad_count].path, path);
         g_wad_count++;
@@ -539,8 +485,6 @@ done:
     return g_wad_count;
 }
 
-/* --------------- WAD picker menu --------------- */
-
 #define MENU_VISIBLE 3
 
 static int show_wad_menu(struct ps_ctx *c) {
@@ -548,7 +492,6 @@ static int show_wad_menu(struct ps_ctx *c) {
     static int blink = 0;
 
     for (;;) {
-        /* Read pad directly */
         u32 raw = 0;
         if (c->pad_h >= 0 && c->pad_read) {
             u8 buf[128]; ps_memset(buf, 0, 128);
@@ -571,7 +514,6 @@ static int show_wad_menu(struct ps_ctx *c) {
             if (g_wad_cursor >= g_wad_count) g_wad_cursor = 0;
         }
 
-        /* Adjust scroll so cursor is visible */
         if (g_wad_cursor < g_wad_scroll) g_wad_scroll = g_wad_cursor;
         if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE)
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
@@ -580,7 +522,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         if (ch & DS_CIRCLE) return -1;
         if (ch & DS_CROSS)  return g_wad_cursor;
 
-        /* Draw */
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
@@ -601,7 +542,6 @@ static int show_wad_menu(struct ps_ctx *c) {
             }
         }
 
-        /* Scroll indicators */
         char counter[24]; int cp = 0;
         if (g_wad_cursor + 1 >= 10) counter[cp++] = '0' + (g_wad_cursor + 1) / 10;
         counter[cp++] = '0' + (g_wad_cursor + 1) % 10;
@@ -611,7 +551,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         counter[cp] = 0;
         ps_draw_str_center(fb, SCR_H - 180, counter, 0xFF808080, 3);
 
-        /* Help */
         ps_draw_str_center(fb, SCR_H - 100, "X = SELECT   O = QUIT", 0xFF909090, 3);
 
         present(c);
@@ -619,8 +558,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 16000, 0,0,0,0,0);
     }
 }
-
-/* --------------- Doom session --------------- */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
     static const char arg0[] = "doom";
@@ -631,28 +568,22 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     argv[2] = g_wads[wad_idx].path;
     argv[3] = (char *)0;
 
-    /* Save this WAD as c->wad_path for cleanup */
     ps_strcpy(c->wad_path, g_wads[wad_idx].path);
-
     udp_log("DoomPS: launching doom\n");
+
     if (ps_setjmp() == 0) {
         doomgeneric_Create(3, (char **)argv);
-        udp_log("DoomPS: entering tick loop\n");
         while (1) {
             doomgeneric_Tick();
             c->ext->frame_count = c->total_frames;
             if (g_exit_requested) break;
         }
-        udp_log("DoomPS: tick loop exited via flag\n");
-    } else {
-        udp_log("DoomPS: exit via longjmp\n");
     }
 
     g_exit_requested = 0;
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 200000, 0,0,0,0,0);
 
-    /* Reinit audio + pad for menu */
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
     if (c->aud_open)
@@ -664,12 +595,10 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
                            (u64)c->user_id, 0, 0, 0, 0, 0);
 }
 
-/* --------------- Entry point --------------- */
-
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
-    int n_reloc = do_relocations(load_base);
+    do_relocations(load_base);
     { volatile char *p = __bss_start; while (p < __bss_end) *p++ = 0; }
 
     ext->step = 1;
@@ -685,16 +614,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
 
     ext->step = 2;
     c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
-    udp_log("DoomPS: [3] sendto\n");
-    ext->step = 3;
-
-    { int p = 0; const char *m = "DoomPS: reloc count=";
-      while (*m) g_diag[p++] = *m++;
-      int v = n_reloc; char tmp[16]; int t = 0;
-      if (v == 0) tmp[t++] = '0';
-      while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
-      while (t) g_diag[p++] = tmp[--t];
-      g_diag[p++] = '\n'; g_diag[p] = 0; udp_log(g_diag); }
+    udp_log("DoomPS: [3] sendto\n"); ext->step = 3;
 
     extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
     ps_libc_init(G, D, c->log_fd, c->log_sa);
@@ -732,10 +652,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     mkdir("/savedata0/.savegame", 0777);
     udp_log("DoomPS: [10b] mkdir\n"); ext->step = 11;
 
-    if (!c->usleep_fn || !c->load_mod) {
-        ext->status = -1; udp_log("DoomPS: [11] fail\n");
-        ext->step = 11; return;
-    }
+    if (!c->usleep_fn || !c->load_mod) { ext->status = -1; return; }
     ext->step = 12;
 
     s32 vid_mod = (s32)NC(c->G, c->load_mod, (u64)"libSceVideoOut.sprx",0,0,0,0,0);
@@ -836,8 +753,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     s32 tcp_listen_fd = (s32)ext->dbg[0];
     ext->step = 36;
 
-    int rc = recv_wads(tcp_listen_fd);
-    udp_log(rc > 0 ? "DoomPS: [37] wads received\n" : "DoomPS: no wads\n");
+    recv_wads(tcp_listen_fd);
     ext->step = 37;
 
     if (g_wad_count == 0) {
@@ -845,28 +761,24 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                             "Send .wad files from the PC launcher");
     }
 
-    /* Audio thread for menu music (none) and Doom */
     if (c->audio_h >= 0 && c->aud_out) {
         void *pthread_create = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
         if (pthread_create) {
             u64 th = 0;
             g_audio_thread_running = 1;
-            s32 r = (s32)NC(c->G, pthread_create, (u64)&th, 0,
-                            (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
-            udp_log(r == 0 ? "DoomPS: audio thread OK\n" : "DoomPS: audio thread FAIL\n");
+            NC(c->G, pthread_create, (u64)&th, 0,
+               (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
         }
     }
 
     ext->step = 38;
 
-    /* ---- main loop: menu -> doom -> menu -> ... ---- */
     while (1) {
         int sel = show_wad_menu(c);
-        if (sel < 0) break;   /* Circle: quit */
+        if (sel < 0) break;
         run_doom(c, sel);
     }
 
-    /* User quit from menu: delete WADs and return to Lua */
     delete_all_wads();
 
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
