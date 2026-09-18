@@ -1,18 +1,18 @@
 /*
- * doom-ps/src/main.c — v53
+ * doom-ps/src/main.c — v54
  *
- * v53:
- *   - WAD LIST PERSISTS across Doom sessions.  All state that must
- *     survive (g_ctx, g_wads, counts, exit flags, g_jmp_buf) is now
- *     placed in a dedicated linker section .ps_persist that sits
- *     BEFORE __bss_start.  reset_doom_globals() only wipes
- *     __bss_start..__bss_end, so Doom's globals are reset but ours
- *     are untouched.  No more save/restore dance.
- *   - AUDIO: SAMPLES_PER_BUF 1024 → 2048 (see core.h).  Doubles the
- *     hardware queue depth so scheduler jitter doesn't underrun.
- *   - Verbose WAD count logging around the reset so we can see the
- *     state surviving in the log.
+ * v54:
+ *   - MUSIC on session 2+: reset the memory pool in reset_doom_globals()
+ *     (via ps_libc_reset_pool) and close all lingering fds via
+ *     ps_libc_close_all_files().  Combined with lazy fopen in ps_libc v16
+ *     this eliminates the pool exhaustion that made I_RegisterSong
+ *     return NULL on the second session.
+ *   - X = BACK in menus.  Cross now also sends DOOM_KEY_ESCAPE while
+ *     Doom's `menuactive` flag is set.  In-game, Cross still just fires.
+ *     This is possible because Doom is linked into our binary, so its
+ *     globals are directly addressable.
  *
+ * v53: PS_PERSIST section for state that survives the BSS wipe.
  * v52: audio sleep removed, mixer divisions → multiplies.
  * v51: rising-edge menu input; SO_LINGER 0 on listener close.
  * v50: audio sleep 16 → 5 ms; clear FBs on reset.
@@ -34,9 +34,14 @@ extern char __bss_end[];
 extern char __ps_persist_start[];
 extern char __ps_persist_end[];
 
+/* Doom's menu-active flag — same binary, direct linkage. */
+extern int menuactive;
+
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
+extern void  ps_libc_reset_pool(void);
+extern void  ps_libc_close_all_files(void);
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 
@@ -131,9 +136,8 @@ struct wad_entry {
 };
 
 /* ============================================================
- * v53 PERSISTENT STATE — lives in .ps_persist which reset_doom_
- * globals() does not touch.  Everything here survives every Doom
- * session without any explicit save/restore.
+ * v53 PERSISTENT STATE — lives in .ps_persist, which
+ * reset_doom_globals() never touches.
  * ============================================================ */
 PS_PERSIST struct wad_entry g_wads[MAX_WADS];
 PS_PERSIST int g_wad_count = 0;
@@ -367,8 +371,19 @@ static void translate_pad(u32 raw) {
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
     MAP(DS_CROSS, DOOM_KEY_FIRE); MAP(DS_SQUARE, DOOM_KEY_USE);
     MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT); MAP(DS_CIRCLE, DOOM_KEY_ENTER);
+    /* Dialog shortcuts */
     if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
     if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
+
+    /* v54: X = back in menus.  When Doom's `menuactive` is set, we
+     * also forward Cross as ESCAPE so it behaves like Doom's own
+     * "back" key (go up one menu level, or close the top menu). */
+    if (ch & DS_CROSS) {
+        if (menuactive) {
+            push_key(DOOM_KEY_ESCAPE, (raw & DS_CROSS) ? 1 : 0);
+        }
+    }
+
     MAP(DS_OPTIONS, DOOM_KEY_ESCAPE);
     MAP(DS_R1, DOOM_KEY_F2); MAP(DS_L1, DOOM_KEY_F3);
     MAP(DS_R2, DOOM_KEY_RBRACKET); MAP(DS_L2, DOOM_KEY_LBRACKET);
@@ -384,11 +399,8 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
-/* ============================================================
- * Audio thread.  sceAudioOutOutput blocks when the hardware queue
- * is full, which paces us at the correct 23.44 submits/sec for
- * SAMPLES_PER_BUF = 2048.
- * ============================================================ */
+/* Audio thread — tight loop.  sceAudioOutOutput's own blocking is
+ * the pacing.  No usleep. */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
@@ -622,7 +634,6 @@ done:
 
 /* ============================================================
  * WAD menu — 7 visible rows, no wrap-around.
- * X (Cross) = SELECT, O (Circle) = QUIT.
  * ============================================================ */
 
 #define MENU_VISIBLE 7
@@ -688,8 +699,8 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
         if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
+        if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
 
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -745,16 +756,25 @@ static int show_wad_menu(struct ps_ctx *c) {
 
 /* ============================================================
  * reset_doom_globals
+ *
+ * v54: also close all lingering fds and reset the pool.
  * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
+
+    /* Close any fds Doom left open before we lose __files[]. */
+    ps_libc_close_all_files();
 
     volatile char *p = __bss_start;
     while (p < __bss_end) *p++ = 0;
 
     log_wad_count("DoomPS: post-wipe wads=");
 
+    /* Fresh pool for the next session. */
+    ps_libc_reset_pool();
+
+    /* Clear both framebuffers, force active_fb back to 0. */
     if (g_ctx.fbs[0]) {
         u32 *fb = (u32 *)g_ctx.fbs[0];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -793,7 +813,7 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
 }
 
 /* ============================================================
- * run_doom — start audio thread FIRST, run Doom, then reset state.
+ * run_doom
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -855,13 +875,14 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
 }
 
 /* ============================================================
- * _start — entry point.
+ * _start
  * ============================================================ */
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
     do_relocations(load_base);
+
     { volatile char *p = __bss_start; while (p < __bss_end) *p++ = 0; }
 
     ext->step = 1;
