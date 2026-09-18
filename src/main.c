@@ -1,27 +1,21 @@
 /*
- * doom-ps/src/main.c — v48
+ * doom-ps/src/main.c — v49
+ *
+ * v49:
+ *   - Triangle now sends Right Shift (hold to run) instead of TAB,
+ *     so it no longer duplicates Touchpad's map toggle.  Matches the
+ *     controls table in the README ("Triangle: Run (hold)").
  *
  * v48:
- *   - AUDIO: sleep is now 3/4 of a buffer duration (16 ms) instead of
- *     (21.333 - 0.2) ms.  The previous value left us ~2% slower than
- *     the 46.87 Hz hardware drain rate, causing occasional buffer
- *     underruns → music/SFX cut-outs.  3/4 gives ~62 submits/sec
- *     (33% headroom) and eliminates the underruns.
- *   - WAD SWITCH: after Doom exits we now zero the ENTIRE BSS before
- *     returning to the menu.  Doom's D_DoomMain is not reentrant —
- *     lumps, textures, and level caches survive between calls and
- *     corrupt the second session (W_CacheLumpNum: N >= numlumps).
- *     Zeroing BSS wipes Doom's globals.  We save our own state
- *     (g_ctx, g_wads, cursor) and ps_libc's state (fn pointers, pool)
- *     on the stack first, then restore them.
+ *   - Audio thread sleeps 3/4 of a buffer duration (16 ms) for
+ *     ~33% headroom against the 46.87 Hz hardware drain, eliminating
+ *     buffer underruns (music/SFX cut-outs).
+ *   - reset_doom_globals() zeroes BSS between Doom sessions so
+ *     D_DoomMain can run a second time without stale lumps/textures
+ *     (W_CacheLumpNum: N >= numlumps).
  *
- * v47:
- *   - Start audio thread at the BEGINNING of run_doom (was at tail,
- *     which meant it never ran during the game).
- *
- * v46:
- *   - Menu: 7 visible rows, no wrap-around.
- *
+ * v47: audio thread starts at the beginning of run_doom().
+ * v46: 7-visible menu, no wrap-around.
  * v45: poll() before accept() in recv_wads.
  * v44: reset key queue + pad_prev between Doom sessions.
  * v43: WAD path trailing-slash fix (pi 24 → 25).
@@ -74,7 +68,7 @@ static int do_relocations(u64 load_base) {
     Elf64_Rela *e = (Elf64_Rela *)re;
     while (r < e) {
         if (ELF64_R_TYPE(r->r_info) == R_X86_64_RELATIVE) {
-            *(u64 *)(load_base + r->r_offset) = load_base + r->r_addend;
+            *(u64 *)(load_base + r->r_offset) = load_base + r->addend;
             count++;
         }
         r++;
@@ -351,7 +345,9 @@ static void translate_pad(u32 raw) {
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
     MAP(DS_CROSS, DOOM_KEY_FIRE); MAP(DS_SQUARE, DOOM_KEY_USE);
-    MAP(DS_TRIANGLE, DOOM_KEY_TAB); MAP(DS_CIRCLE, DOOM_KEY_ENTER);
+    /* v49: Triangle → Right Shift (hold to run).  Touchpad keeps TAB
+     * (map).  Triangle no longer duplicates the map toggle. */
+    MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT); MAP(DS_CIRCLE, DOOM_KEY_ENTER);
     if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
     if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
     MAP(DS_OPTIONS, DOOM_KEY_ESCAPE);
@@ -372,9 +368,9 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 /*
  * v48 — audio thread.
  *
- * Sleep 3/4 of one buffer duration (16 ms for 1024 @ 48 kHz).  This
- * keeps the hardware queue ahead of the drain even when the mixing
- * pass takes ~0.5 ms.  Submits ~62 times/sec vs. the 46.87/sec drain
+ * Sleep 3/4 of one buffer duration (16 ms for 1024 @ 48 kHz).  Keeps
+ * the hardware queue ahead of the drain even when the mixing pass
+ * takes ~0.5 ms.  Submits ~62 times/sec vs. the 46.87/sec drain
  * rate → 33% headroom → no underruns, no clicks, no cuts.
  */
 static void *audio_thread_fn(void *arg) {
