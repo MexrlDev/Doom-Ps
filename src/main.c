@@ -1,29 +1,23 @@
 /*
- * doom-ps/src/main.c — v46
+ * doom-ps/src/main.c — v47
+ *
+ * v47:
+ *   - FIXED: audio thread was never started.  In v46 I moved the
+ *     pthread_create() call from _start() to the *tail* of run_doom(),
+ *     which only runs after Doom exits — so during the entire Doom
+ *     session nothing called I_SubmitSound() and the speakers were
+ *     silent.  Thread start is now at the *beginning* of run_doom(),
+ *     before doomgeneric_Create().  Thread stop stays at the tail.
  *
  * v46:
- *   - MENU: 3 → 7 visible rows, no wrap-around scrolling.  Removed
- *     the "cursor wrap" that made the viewport snap from the bottom
- *     back up to the top (the "auto-scroll" glitch).  Cursor now
- *     clamps at first/last WAD.  Viewport scrolls by exactly one row
- *     when the cursor steps off the bottom or top of the visible
- *     window — so pressing down on the 7th visible row slides the
- *     list by one, dropping the old 1st row and revealing the next.
- *   - AUDIO THREAD: rate-limited with sceKernelUsleep.  On PS5,
- *     sceAudioOutOutput returns immediately when the buffer queue
- *     has a free slot instead of blocking, so the audio thread was
- *     spinning at ~100 submits/sec (2.15× the 47/sec playback rate)
- *     and eating a whole CPU core.  That starved the main Doom loop
- *     (11 fps instead of ~35) which is what made the music stutter
- *     and cut out.  Now the thread sleeps one buffer duration
- *     (~21.3 ms for 1024 samples @ 48 kHz) between submits.
+ *   - Menu: 7 visible rows, no wrap-around scrolling.
+ *   - Audio thread rate-limited with sceKernelUsleep (~21 ms/buffer).
  *
  * v45:
- *   - recv_wads() uses poll() before accept() so it can time out
- *     instead of blocking forever after the last WAD.
+ *   - recv_wads() polls the listen socket so it can time out.
  *
  * v44:
- *   - Reset key queue + pad_prev at end of run_doom().
+ *   - Reset key queue + pad_prev between Doom sessions.
  *
  * v43:
  *   - WAD path trailing slash fix (pi 24 → 25).
@@ -366,24 +360,19 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 }
 
 /*
- * v46 — audio thread.
+ * Audio thread — rate-limited so it doesn't spin a CPU core.
  *
- * sceAudioOutOutput on PS5 returns quickly when there's a free slot in
- * the hardware buffer queue instead of blocking until the previous
- * buffer finishes playing.  Without rate-limiting, this loop spun at
- * ~100 submits/sec (2.15× the 47/sec playback rate), burning an entire
- * CPU core and starving the main Doom loop, which dropped to ~11 fps.
- *
- * Now we sleep one buffer duration between submits.  SAMPLES_PER_BUF /
- * SAMPLE_RATE = 1024 / 48000 = 21.33 ms.  Sleep for the full duration
- * so the hardware has time to drain; if we underrun slightly, no big
- * deal.
+ * sceAudioOutOutput on PS5 returns quickly instead of blocking until
+ * the previous buffer has drained, so calling it in a tight loop
+ * hammers the kernel and starves the main Doom render loop.  Sleep
+ * slightly less than one buffer duration (1024/48000 = 21.33 ms)
+ * between submits so the hardware queue stays full without wasting
+ * CPU.
  */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
     struct ps_ctx *c = &g_ctx;
-    /* buffer duration in microseconds (integer, slightly under true value) */
     const u64 buf_us = ((u64)SAMPLES_PER_BUF * 1000000ULL) / SAMPLE_RATE - 200;
     while (g_audio_thread_running) {
         I_SubmitSound();
@@ -626,7 +615,6 @@ done:
 static int show_wad_menu(struct ps_ctx *c) {
     int prev_btn = 0;
 
-    /* Keep cursor visible at entry. */
     if (g_wad_cursor < g_wad_scroll)
         g_wad_scroll = g_wad_cursor;
     if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE)
@@ -647,9 +635,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         u32 ch = raw ^ (u32)prev_btn;
         prev_btn = raw;
 
-        /* Cursor movement — CLAMPED, no wrap-around.  This is what
-         * stops the viewport from jumping back to the top when the
-         * user reaches the last entry. */
         if (ch & DS_UP) {
             if (g_wad_cursor > 0) g_wad_cursor--;
         }
@@ -657,10 +642,6 @@ static int show_wad_menu(struct ps_ctx *c) {
             if (g_wad_cursor < g_wad_count - 1) g_wad_cursor++;
         }
 
-        /* Viewport follows cursor by exactly one row when the cursor
-         * steps off the bottom or top of the visible window.  This
-         * gives the "scroll by one, drop the top, reveal the bottom"
-         * behaviour the user asked for. */
         if (g_wad_cursor < g_wad_scroll) {
             g_wad_scroll = g_wad_cursor;
         } else if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE) {
@@ -670,7 +651,6 @@ static int show_wad_menu(struct ps_ctx *c) {
         if (ch & DS_CIRCLE) return -1;
         if (ch & DS_CROSS)  return g_wad_cursor;
 
-        /* ---- draw ---- */
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
@@ -680,10 +660,8 @@ static int show_wad_menu(struct ps_ctx *c) {
         int list_y = 180;
         int row_h  = MENU_ROW_H;
 
-        /* "more above" hint */
         if (g_wad_scroll > 0) {
-            ps_draw_str_center(fb, list_y - 30,
-                               "^ MORE ^", 0xFF505050, 3);
+            ps_draw_str_center(fb, list_y - 30, "^ MORE ^", 0xFF505050, 3);
         }
 
         for (int i = 0; i < MENU_VISIBLE; i++) {
@@ -699,13 +677,11 @@ static int show_wad_menu(struct ps_ctx *c) {
             }
         }
 
-        /* "more below" hint */
         if (g_wad_scroll + MENU_VISIBLE < g_wad_count) {
             int y = list_y + MENU_VISIBLE * row_h;
             ps_draw_str_center(fb, y, "v MORE v", 0xFF505050, 3);
         }
 
-        /* counter  e.g.  3/12 */
         char counter[24]; int cp = 0;
         int cur = g_wad_cursor + 1;
         if (cur >= 100) counter[cp++] = '0' + (cur / 100) % 10;
@@ -727,6 +703,10 @@ static int show_wad_menu(struct ps_ctx *c) {
     }
 }
 
+/* ============================================================
+ * run_doom — start audio thread FIRST, then run Doom.
+ * ============================================================ */
+
 static void run_doom(struct ps_ctx *c, int wad_idx) {
     static const char arg0[] = "doom";
     static const char arg1[] = "-iwad";
@@ -739,6 +719,20 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     ps_strcpy(c->wad_path, g_wads[wad_idx].path);
     udp_log("DoomPS: launching doom\n");
 
+    /* ---- v47 FIX: start audio thread BEFORE Doom runs ---- */
+    if (c->audio_h >= 0 && c->aud_out) {
+        void *pthread_create = SYM(c->G, c->D, LIBKERNEL_HANDLE,
+                                   "scePthreadCreate");
+        if (pthread_create) {
+            u64 th = 0;
+            g_audio_thread_running = 1;
+            NC(c->G, pthread_create, (u64)&th, 0,
+               (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
+        } else {
+            udp_log("DoomPS: WARN scePthreadCreate not resolved\n");
+        }
+    }
+
     if (ps_setjmp() == 0) {
         doomgeneric_Create(3, (char **)argv);
         while (1) {
@@ -748,11 +742,11 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
         }
     }
 
+    /* Doom exited — stop audio thread and reset state. */
     g_exit_requested = 0;
     g_audio_thread_running = 0;
-    if (c->usleep_fn) NC(c->G, c->usleep_fn, 200000, 0,0,0,0,0);
+    if (c->usleep_fn) NC(c->G, c->usleep_fn, 150000, 0,0,0,0,0);
 
-    /* wipe input state */
     c->key_wp   = 0;
     c->key_rp   = 0;
     c->pad_prev = 0;
@@ -766,18 +760,6 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
-
-    /* Restart the audio thread for the next session. */
-    if (c->audio_h >= 0 && c->aud_out) {
-        void *pthread_create = SYM(c->G, c->D, LIBKERNEL_HANDLE,
-                                   "scePthreadCreate");
-        if (pthread_create) {
-            u64 th = 0;
-            g_audio_thread_running = 1;
-            NC(c->G, pthread_create, (u64)&th, 0,
-               (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
-        }
-    }
 }
 
 __attribute__((section(".text._start")))
@@ -949,8 +931,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
                             "Send .wad files from the PC launcher");
     }
 
-    /* Audio thread is now (re)started at the beginning of each Doom
-     * session by run_doom(), so it doesn't spin during the menu. */
     ext->step = 38;
 
     while (1) {
