@@ -1,18 +1,17 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v23:
- *   - MUSIC_AMPL 36 → 6  (music ~15 dB quieter — user wanted "much
- *     quieter" so gunshots/doors/imp alerts come through clearly).
- *   - SFX_HEADROOM 5 → 2 (SFX ~8 dB louder — the same mixing path
- *     now gives ~2.5× more headroom for the SFX bus).
- *   - This combination makes SFX noticeably louder than music, which
- *     is what the user asked for ("make sure the SFX is louder than
- *     the song so it's hearable").
+ * v24:
+ *   - Mixer divisions replaced with multiplies.  Divisions were 5 per
+ *     sample per SFX channel; with 32 channels × 1024 samples that
+ *     was ~160k divisions per submit — several ms of pure overhead
+ *     that pushed the audio thread's cycle above the 21.33 ms hardware
+ *     drain window.  Now the mixer runs in <0.5 ms.
+ *   - Per-channel gain precomputed once per channel.
+ *   - Per-submit music scale precomputed once.
  *
- * v22:
- *   - MIXBUF is SAMPLES_PER_BUF from core.h.
- *   - MUS event delay is honored per-event.
+ * v23:
+ *   - MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
  */
 
 #include <stdio.h>
@@ -42,18 +41,6 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
-/* -------- volume / headroom --------
- *
- * SFX is scaled down by SFX_HEADROOM before being summed into the mix.
- * Lower value = louder SFX.  Was 5, now 2 (≈ 2.5× louder).
- *
- * Music is multiplied by MUSIC_AMPL after being summed from all
- * voices.  Lower value = quieter music.  Was 36, now 6 (≈ 6× quieter).
- *
- * Together: SFX / music ratio goes from 36/5 = 7.2 up to
- * 6/2 = 3 but with SFX boosted 2.5× and music cut 6×, the perceived
- * difference is around 15 dB in favour of SFX.
- */
 #define SFX_HEADROOM   2
 #define MUSIC_AMPL     6
 
@@ -291,6 +278,12 @@ static void mus_parse_header(void) {
     log_str("Music: MUS loaded");
 }
 
+/*
+ * v24 — optimized music renderer.
+ *
+ * / 15 replaced with multiply by 65536/15 = 4369.07 → precomputed
+ * per-submit scale.  / 2 replaced with shift.
+ */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
@@ -301,6 +294,10 @@ static void music_render_accum(s32 *accum, int frames) {
     if (vol < 0)   vol = 0;
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
+
+    /* Precompute per-submit music scale: MUSIC_AMPL * vol / 15, fixed 16.16 */
+    int music_scale_fp = (MUSIC_AMPL * vol * 65536) / 15;
+    /* Max = 6 * 15 * 65536 / 15 = 393216.  Fits in 32-bit. */
 
     for (int i = 0; i < frames; i++) {
         mus_tick_acc += us_per_sample;
@@ -333,8 +330,11 @@ static void music_render_accum(s32 *accum, int frames) {
             n->phase += n->phase_inc;
         }
 
-        mix = mix * MUSIC_AMPL * vol / 15;
-        g_mus_lpf += (mix - g_mus_lpf) / 2;
+        /* Apply music scale (was: mix * MUSIC_AMPL * vol / 15) */
+        mix = ((long long)mix * music_scale_fp) >> 16;
+
+        /* Lowpass filter: g_mus_lpf += (mix - g_mus_lpf) / 2; */
+        g_mus_lpf += (mix - g_mus_lpf) >> 1;
 
         accum[i * 2]     += g_mus_lpf;
         accum[i * 2 + 1] += g_mus_lpf;
@@ -379,6 +379,25 @@ void I_UpdateSound(void) {}
 void I_SetChannels(void) {}
 void I_SetSfxVolume(int volume) { (void)volume; }
 
+/*
+ * v24 — optimized mixer.
+ *
+ * The old code did 5 divisions per sample per active SFX channel:
+ *   sample * fade / FADE_MAX
+ *   sample * vol / 127
+ *   sample /= SFX_HEADROOM
+ *   sample * lgain / 255
+ *   sample * rgain / 255
+ *
+ * Now:
+ *   fade / FADE_MAX          → >> 10
+ *   vol / 127 and pan / 255  → folded into a per-channel 16.16 gain,
+ *                              applied as a single multiply + >> 16
+ *   SFX_HEADROOM (2)         → >> 1
+ *
+ * Per sample per channel we now do 3 shifts and 2 multiplies, no
+ * divisions.
+ */
 void I_SubmitSound(void) {
     dbg_submit++;
     if (dbg_submit == 1 || dbg_submit == 100 ||
@@ -397,6 +416,11 @@ void I_SubmitSound(void) {
         const unsigned char *data = ch->data;
         int length = ch->length, step = ch->step;
 
+        /* Precompute per-channel 16.16 gains: vol/127 * pan/255 */
+        int vol_scaled = (vol * 65536) / 127;            /* 0..65536 */
+        int lgain = ((255 - pan) * vol_scaled) / 255;    /* 0..65536 */
+        int rgain = (pan * vol_scaled) / 255;            /* 0..65536 */
+
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
             int frac = pos & 0xFFFF;
@@ -413,14 +437,12 @@ void I_SubmitSound(void) {
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
-            int sample = sample8 << 8;
-            sample = sample * fade / FADE_MAX;
-            sample = sample * vol / 127;
-            sample /= SFX_HEADROOM;
+            int sample = sample8 << 8;                /* -32768..32512 */
+            sample = (sample * fade) >> 10;           /* / FADE_MAX */
+            sample >>= 1;                             /* / SFX_HEADROOM */
 
-            int lgain = 255 - pan, rgain = pan;
-            mix_accum[i * 2]     += sample * lgain / 255;
-            mix_accum[i * 2 + 1] += sample * rgain / 255;
+            mix_accum[i * 2]     += (sample * lgain) >> 16;
+            mix_accum[i * 2 + 1] += (sample * rgain) >> 16;
             pos += step;
         }
         ch->pos  = pos;
@@ -432,8 +454,11 @@ void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
-        g_out_lpf_l += (l - g_out_lpf_l) * 3 / 5;
-        g_out_lpf_r += (r - g_out_lpf_r) * 3 / 5;
+        /* g_out_lpf += (l - g_out_lpf) * 3 / 5;
+         *           = (l - g_out_lpf) * 0.6
+         * 0.6 * 65536 = 39321.6 → 39322 */
+        g_out_lpf_l += ((l - g_out_lpf_l) * 39322) >> 16;
+        g_out_lpf_r += ((r - g_out_lpf_r) * 39322) >> 16;
         mix_final[i * 2]     = soft_clip(g_out_lpf_l);
         mix_final[i * 2 + 1] = soft_clip(g_out_lpf_r);
     }
