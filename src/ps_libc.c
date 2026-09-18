@@ -1,6 +1,13 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
+ * v13: exit() only fires the error dialog when code != 0.  Doom writes
+ *      to stderr during normal operation (W_Init, S_Init, Z_Init, ...),
+ *      so __last_err is always populated by the time Quit Game runs.
+ *      The old code called __error_cb() on every exit, trapping the
+ *      user on the red "DOOM INTERNAL ERROR" screen forever.  I_Error
+ *      exits with -1, normal quit with 0 — gate on that.
+ *
  * v12: exit() now calls ps_doom_exit_now() (setjmp/longjmp back to
  *      _start cleanup) instead of for(;;) {}.  When Doom's Quit Game
  *      or an I_Error fires exit(), we tear down video/audio/equeue
@@ -1029,6 +1036,11 @@ void _exit(int code) { (void)code; for (;;) {} }
  * that terminates the process.  We jump back to _start's cleanup
  * block via longjmp so video/audio/equeue are torn down and control
  * returns to LuaC0re.  ps_doom_exit_now() never returns.
+ *
+ * v13 fix: Doom writes to stderr during normal operation (W_Init,
+ * S_Init, Z_Init, ...), so __capture_err() is always populated by
+ * the time exit(0) runs from the main menu's Quit Game.  Only fire
+ * the error dialog for a real error (I_Error exits with -1).
  */
 void exit(int code) {
     char b[60]; int p = 0;
@@ -1042,7 +1054,7 @@ void exit(int code) {
     b[p++] = '\n'; b[p] = 0;
     ps_libc_log(b);
 
-    if (__error_cb && __last_err_len > 0) {
+    if (code != 0 && __error_cb && __last_err_len > 0) {
         __error_cb(__last_err);
     }
     ps_doom_exit_now();   /* longjmp back to _start cleanup */
