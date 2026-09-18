@@ -1,17 +1,14 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v24:
- *   - Mixer divisions replaced with multiplies.  Divisions were 5 per
- *     sample per SFX channel; with 32 channels × 1024 samples that
- *     was ~160k divisions per submit — several ms of pure overhead
- *     that pushed the audio thread's cycle above the 21.33 ms hardware
- *     drain window.  Now the mixer runs in <0.5 ms.
- *   - Per-channel gain precomputed once per channel.
- *   - Per-submit music scale precomputed once.
+ * v25:
+ *   - Diagnostic hex logging in I_RegisterSong: logs incoming length
+ *     and first 8 bytes as hex, so we can see exactly what bytes Doom
+ *     passes when music fails on session 2.
+ *   - Extra "I_InitMusic reached" log for tracing.
  *
- * v23:
- *   - MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
+ * v24: mixer divisions → multiplies.
+ * v23: MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
  */
 
 #include <stdio.h>
@@ -278,12 +275,6 @@ static void mus_parse_header(void) {
     log_str("Music: MUS loaded");
 }
 
-/*
- * v24 — optimized music renderer.
- *
- * / 15 replaced with multiply by 65536/15 = 4369.07 → precomputed
- * per-submit scale.  / 2 replaced with shift.
- */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
@@ -295,9 +286,7 @@ static void music_render_accum(s32 *accum, int frames) {
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
-    /* Precompute per-submit music scale: MUSIC_AMPL * vol / 15, fixed 16.16 */
     int music_scale_fp = (MUSIC_AMPL * vol * 65536) / 15;
-    /* Max = 6 * 15 * 65536 / 15 = 393216.  Fits in 32-bit. */
 
     for (int i = 0; i < frames; i++) {
         mus_tick_acc += us_per_sample;
@@ -330,10 +319,7 @@ static void music_render_accum(s32 *accum, int frames) {
             n->phase += n->phase_inc;
         }
 
-        /* Apply music scale (was: mix * MUSIC_AMPL * vol / 15) */
         mix = ((long long)mix * music_scale_fp) >> 16;
-
-        /* Lowpass filter: g_mus_lpf += (mix - g_mus_lpf) / 2; */
         g_mus_lpf += (mix - g_mus_lpf) >> 1;
 
         accum[i * 2]     += g_mus_lpf;
@@ -379,25 +365,6 @@ void I_UpdateSound(void) {}
 void I_SetChannels(void) {}
 void I_SetSfxVolume(int volume) { (void)volume; }
 
-/*
- * v24 — optimized mixer.
- *
- * The old code did 5 divisions per sample per active SFX channel:
- *   sample * fade / FADE_MAX
- *   sample * vol / 127
- *   sample /= SFX_HEADROOM
- *   sample * lgain / 255
- *   sample * rgain / 255
- *
- * Now:
- *   fade / FADE_MAX          → >> 10
- *   vol / 127 and pan / 255  → folded into a per-channel 16.16 gain,
- *                              applied as a single multiply + >> 16
- *   SFX_HEADROOM (2)         → >> 1
- *
- * Per sample per channel we now do 3 shifts and 2 multiplies, no
- * divisions.
- */
 void I_SubmitSound(void) {
     dbg_submit++;
     if (dbg_submit == 1 || dbg_submit == 100 ||
@@ -416,10 +383,9 @@ void I_SubmitSound(void) {
         const unsigned char *data = ch->data;
         int length = ch->length, step = ch->step;
 
-        /* Precompute per-channel 16.16 gains: vol/127 * pan/255 */
-        int vol_scaled = (vol * 65536) / 127;            /* 0..65536 */
-        int lgain = ((255 - pan) * vol_scaled) / 255;    /* 0..65536 */
-        int rgain = (pan * vol_scaled) / 255;            /* 0..65536 */
+        int vol_scaled = (vol * 65536) / 127;
+        int lgain = ((255 - pan) * vol_scaled) / 255;
+        int rgain = (pan * vol_scaled) / 255;
 
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
@@ -437,9 +403,9 @@ void I_SubmitSound(void) {
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
-            int sample = sample8 << 8;                /* -32768..32512 */
-            sample = (sample * fade) >> 10;           /* / FADE_MAX */
-            sample >>= 1;                             /* / SFX_HEADROOM */
+            int sample = sample8 << 8;
+            sample = (sample * fade) >> 10;
+            sample >>= 1;
 
             mix_accum[i * 2]     += (sample * lgain) >> 16;
             mix_accum[i * 2 + 1] += (sample * rgain) >> 16;
@@ -454,9 +420,6 @@ void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
-        /* g_out_lpf += (l - g_out_lpf) * 3 / 5;
-         *           = (l - g_out_lpf) * 0.6
-         * 0.6 * 65536 = 39321.6 → 39322 */
         g_out_lpf_l += ((l - g_out_lpf_l) * 39322) >> 16;
         g_out_lpf_r += ((r - g_out_lpf_r) * 39322) >> 16;
         mix_final[i * 2]     = soft_clip(g_out_lpf_l);
@@ -516,6 +479,7 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 void I_InitMusic(void) {
     init_music_tables();
     g_mus_lpf = 0;
+    log_str("I_InitMusic reached");
     log_str("I_InitMusic done");
 }
 
@@ -533,13 +497,42 @@ void I_PauseSong(void) {
 
 void I_ResumeSong(void) {}
 
+/* v25: log the first 8 bytes of the incoming song so we can see exactly
+ * what Doom is passing when music fails on session 2. */
+static void log_song_bytes(const unsigned char *p, int len) {
+    char b[128]; int bp = 0;
+    const char *hex = "0123456789ABCDEF";
+    const char *pre = "Music: len=";
+    while (*pre) b[bp++] = *pre++;
+    /* decimal len */
+    char tmp[16]; int t = 0; int v = len;
+    if (v == 0) tmp[t++] = '0';
+    else { while (v > 0) { tmp[t++] = '0' + (v % 10); v /= 10; } }
+    while (t) b[bp++] = tmp[--t];
+    const char *mid = " bytes=";
+    while (*mid) b[bp++] = *mid++;
+    int n = len < 8 ? len : 8;
+    for (int i = 0; i < n; i++) {
+        b[bp++] = hex[(p[i] >> 4) & 0xF];
+        b[bp++] = hex[p[i] & 0xF];
+        b[bp++] = ' ';
+    }
+    b[bp++] = '\n'; b[bp] = 0;
+    ps_sound_log(b);
+}
+
 void *I_RegisterSong(void *data, int len) {
     song_t *s = (song_t *)malloc(sizeof(song_t));
-    if (!s) return 0;
+    if (!s) { ps_sound_log("Music: song_t malloc failed"); return 0; }
     s->data = (unsigned char *)malloc((unsigned)len);
-    if (!s->data) return 0;
+    if (!s->data) {
+        ps_sound_log("Music: data malloc failed");
+        return 0;
+    }
     memcpy(s->data, data, len);
     s->len = len;
+
+    log_song_bytes(s->data, len);
 
     if (len >= 4 && s->data[0] == 'M' && s->data[1] == 'U' &&
         s->data[2] == 'S' && s->data[3] == 0x1A) {
