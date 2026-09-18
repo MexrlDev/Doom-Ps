@@ -1,14 +1,30 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v20:
- *   - Music tempo fix: MUS_TICKS_PER_EVENT 2 → 6.  The notes were
- *     firing every 14 ms (2 ticks @ 140 Hz).  Real Doom music uses
- *     about 40 ms between events (6 ticks).  This was the "insane
- *     fast" music.
- *   - SFX_HEADROOM 3 → 5 to give more room for overlapping sounds.
- *   - Softer output limiter (linear to 24000 instead of 20000).
- *   - Everything else identical to v19.
+ * v21 — MUS TIMING + SFX LIMITER FIX
+ *
+ *   MUS timing:
+ *     The MUS format encodes a variable-length delay AFTER each event
+ *     (high-bit continuation, 140 Hz ticks).  Previous versions used a
+ *     fixed 6-tick gap and never read the delay bytes at all, which
+ *     flattened all the rhythm and made fast passages sound frantic.
+ *     Now the parser reads the delay properly and schedules the next
+ *     event at the exact microsecond the file specifies.
+ *
+ *   SFX limiter:
+ *     The old soft_clip divided the excess by 4 above 24000, then by
+ *     16 above 30000.  With 3–4 overlapping gunshots, the sum easily
+ *     exceeded 24000, and the -12 dB drop sounded like a cut.  The
+ *     new limiter compresses the excess by 2:1 (gentle) and only
+ *     hard-limits as a final safety net.
+ *
+ *   Volume:
+ *     MUSIC_AMPL 80 → 48 (music lowered by about 4 dB).
+ *     SFX_HEADROOM kept at 5 (SFX volume unchanged).
+ *
+ *   Buffer:
+ *     SAMPLES_PER_BUF 512 → 1024 to give the audio thread more time
+ *     to mix and submit before the hardware buffer underruns.
  */
 
 #include <stdio.h>
@@ -34,21 +50,18 @@ int snd_sfxdevice   = 0;
 int snd_musicvolume = 8;
 int snd_sfxvolume   = 8;
 
-#define NCHANNELS           16
-#define MIXBUF              512
-#define MUSIC_MAX_NOTES     24
+#define NCHANNELS           32
+#define MIXBUF              1024
+#define MUSIC_MAX_NOTES     32
 
 #define SFX_HEADROOM   5
-#define MUSIC_AMPL     80
+#define MUSIC_AMPL     48
 
 #define DMX_SAMPLE_RATE 11025
 
 #define FADE_MAX       1024
 #define FADE_STEP_IN   6
 #define FADE_STEP_OUT  3
-
-/* 6 ticks @ 140 Hz = ~43 ms between events. */
-#define MUS_TICKS_PER_EVENT 6
 
 static int dbg_submit = 0;
 static int dbg_tick   = 0;
@@ -102,7 +115,8 @@ static int      mus_track_end      = 0;
 static int      mus_loop           = 0;
 static int      mus_playing        = 0;
 static int      mus_is_mus         = 0;
-static int      mus_next_event_tick = 0;
+static int      mus_delay_us       = 0;  /* microseconds until next event */
+static int      mus_tick_acc       = 0;  /* accumulator for delay timing */
 
 static unsigned int note_phase_inc_table[128];
 
@@ -175,13 +189,36 @@ static void music_all_notes_off(void) {
         mus_notes[i].active = mus_notes[i].releasing = 0;
 }
 
+/* ----------------------------------------------------------------
+ * MUS event parser.
+ *
+ * Event byte layout:
+ *   bit 7: has-delay flag
+ *   bits 6-4: type (0-7)
+ *   bits 3-0: channel (0-15)
+ *
+ * Data bytes per type:
+ *   0 = release note   : 1 byte
+ *   1 = play note      : 1 byte, plus a second volume byte if bit 7
+ *                        of the first data byte is set
+ *   2 = pitch bend     : 1 byte
+ *   3 = system event   : 1 byte
+ *   4 = controller     : 2 bytes
+ *   5 = end of measure : 0 bytes
+ *   6 = finish         : 0 bytes (end of song data)
+ *   7 = unused         : 1 byte
+ *
+ * After the event data, if the has-delay flag was set, a variable-
+ * length delay follows.  Each byte contributes 7 bits; bit 7 marks
+ * continuation.  Delay is in 140 Hz ticks (1 tick = 7142.857 µs).
+ * ---------------------------------------------------------------- */
 static void mus_process_event(void) {
-    if (mus_pos + 2 >= mus_track_end) {
+    if (mus_pos >= mus_track_end) {
         if (mus_loop) {
             log_str("M: loop restart");
             mus_pos = mus_track_start;
             music_all_notes_off();
-            mus_next_event_tick = MUS_TICKS_PER_EVENT;
+            mus_delay_us = 0;
         } else {
             log_str("M: END");
             mus_playing = 0;
@@ -190,13 +227,10 @@ static void mus_process_event(void) {
         return;
     }
 
-    unsigned char ev = mus_data[mus_pos];
-    unsigned char d1 = mus_data[mus_pos + 1];
-    unsigned char d2 = mus_data[mus_pos + 2];
-    mus_pos += 3;
-
+    unsigned char ev = mus_data[mus_pos++];
     int type = (ev >> 4) & 0x07;
     int chan = ev & 0x0F;
+    int has_delay = (ev & 0x80) != 0;
 
     dbg_event++;
     if (dbg_event <= 100) {
@@ -206,15 +240,75 @@ static void mus_process_event(void) {
     }
 
     switch (type) {
-    case 0: music_note_off_chan(chan, d1); break;
-    case 1: music_note_on(d1 & 0x7F, d2 ? d2 : 64, chan); break;
-    default: break;
+    case 0: /* Release note */
+        if (mus_pos < mus_track_end)
+            music_note_off_chan(chan, mus_data[mus_pos++]);
+        break;
+
+    case 1: { /* Play note */
+        if (mus_pos < mus_track_end) {
+            unsigned char b1 = mus_data[mus_pos++];
+            int note = b1 & 0x7F;
+            int vol = 64;
+            if (b1 & 0x80) {
+                if (mus_pos < mus_track_end)
+                    vol = mus_data[mus_pos++];
+            }
+            music_note_on(note, vol, chan);
+        }
+        break;
+    }
+
+    case 2: /* Pitch bend */
+        if (mus_pos < mus_track_end) mus_pos++;
+        break;
+
+    case 3: /* System event */
+        if (mus_pos < mus_track_end) mus_pos++;
+        break;
+
+    case 4: /* Controller */
+        if (mus_pos + 1 < mus_track_end) mus_pos += 2;
+        else mus_pos = mus_track_end;
+        break;
+
+    case 5: /* End of measure — no data bytes */
+        break;
+
+    case 6: /* Finish */
+        mus_playing = 0;
+        music_all_notes_off();
+        return;
+
+    case 7: /* Unused — 1 byte */
+        if (mus_pos < mus_track_end) mus_pos++;
+        break;
+
+    default:
+        mus_pos++;
+        break;
+    }
+
+    /* Read the variable-length delay. */
+    if (has_delay) {
+        int delay = 0;
+        while (mus_pos < mus_track_end) {
+            unsigned char b = mus_data[mus_pos++];
+            delay = (delay << 7) | (b & 0x7F);
+            if (!(b & 0x80)) break;
+        }
+        /* 1 tick = 1/140 s = 7142.857 µs */
+        mus_delay_us = (delay * 1000000) / 140;
+    } else {
+        mus_delay_us = 0;
     }
 }
 
 static void mus_parse_header(void) {
     mus_pos = mus_track_start;
     music_all_notes_off();
+    mus_delay_us = 0;
+    mus_tick_acc = 0;
 
     if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
@@ -234,10 +328,12 @@ static void mus_parse_header(void) {
         return;
     }
 
-    mus_track_start    = score_start;
-    mus_track_end      = mus_len;
-    mus_pos            = score_start;
-    mus_next_event_tick = MUS_TICKS_PER_EVENT;
+    mus_track_start = score_start;
+    mus_track_end   = mus_len;
+    mus_pos         = score_start;
+
+    /* Fire the first event immediately. */
+    mus_delay_us = 0;
 
     log_str("Music: MUS loaded");
 }
@@ -245,7 +341,6 @@ static void mus_parse_header(void) {
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
-    int us_per_tick = 1000000 / 140;
     int us_per_sample = 1000000 / SAMPLE_RATE;
     if (us_per_sample < 1) us_per_sample = 1;
 
@@ -254,20 +349,16 @@ static void music_render_accum(s32 *accum, int frames) {
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
-    static int tick_acc = 0;
-
     for (int i = 0; i < frames; i++) {
-        if (mus_playing) {
-            tick_acc += us_per_sample;
-            while (tick_acc >= us_per_tick) {
-                tick_acc -= us_per_tick;
-                mus_next_event_tick--;
-                if (mus_next_event_tick <= 0) {
-                    mus_process_event();
-                    if (!mus_playing) break;
-                    mus_next_event_tick = MUS_TICKS_PER_EVENT;
-                }
-            }
+        mus_tick_acc += us_per_sample;
+
+        /* Fire events whose delay has expired. */
+        int safety = 0;
+        while (mus_playing && mus_tick_acc >= mus_delay_us && safety < 200) {
+            safety++;
+            mus_tick_acc -= mus_delay_us;
+            mus_process_event();
+            if (!mus_playing) break;
         }
         if (!mus_playing) break;
 
@@ -298,13 +389,21 @@ static void music_render_accum(s32 *accum, int frames) {
     }
 }
 
+/* ----------------------------------------------------------------
+ * Smooth limiter.  Linear below 0.75 FS; above that, excess is
+ * compressed by 2:1.  Only pathological sums touch the hard limit.
+ * This is what fixes the "cutting" on rapid fire — 3–4 overlapping
+ * gunshots no longer trigger a -12 dB step.
+ * ---------------------------------------------------------------- */
 static inline s16 soft_clip(s32 v) {
-    if (v > 24000) v = 24000 + (v - 24000) / 4;
-    if (v > 30000) v = 30000 + (v - 30000) / 16;
-    if (v > 32767) v = 32767;
-    if (v < -24000) v = -24000 + (v + 24000) / 4;
-    if (v < -30000) v = -30000 + (v + 30000) / 16;
-    if (v < -32768) v = -32768;
+    const s32 knee = 24576;  /* 0.75 × 32768 */
+    if (v > knee) {
+        v = knee + (v - knee) / 2;
+        if (v > 32767) v = 32767;
+    } else if (v < -knee) {
+        v = -knee + (v + knee) / 2;
+        if (v < -32768) v = -32768;
+    }
     return (s16)v;
 }
 
@@ -369,7 +468,6 @@ void I_SubmitSound(void) {
                 if (fade > FADE_MAX) fade = FADE_MAX;
             }
 
-            /* Linear interpolation to soften the stair-step of 11k→48k. */
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
@@ -389,7 +487,6 @@ void I_SubmitSound(void) {
 
     music_render_accum(mix_accum, MIXBUF);
 
-    /* Output reconstruction LPF: smooths residual stair-step artifacts. */
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
