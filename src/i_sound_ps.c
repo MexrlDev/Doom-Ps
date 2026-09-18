@@ -1,19 +1,17 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v25:
- *   - MUSIC_AMPL 6 → 12 and SFX_HEADROOM 2 → 1.  Both doubled,
- *     ratio preserved.
- *   - Music timing FIXED: the tick accumulator advanced by
- *     1000000 / 48000 = 20 µs per sample, but the true interval is
- *     20.833 µs.  Music played 4% slow, causing notes to drift and
- *     the "wrong notes" the user noticed.  Now we accumulate the
- *     fractional remainder (1000000 % 48000 = 40000) in a secondary
- *     counter, adding 1 µs whenever it crosses 48000.
+ * v24:
+ *   - Mixer divisions replaced with multiplies.  Divisions were 5 per
+ *     sample per SFX channel; with 32 channels × 1024 samples that
+ *     was ~160k divisions per submit — several ms of pure overhead
+ *     that pushed the audio thread's cycle above the 21.33 ms hardware
+ *     drain window.  Now the mixer runs in <0.5 ms.
+ *   - Per-channel gain precomputed once per channel.
+ *   - Per-submit music scale precomputed once.
  *
- * v24: mixer divisions → multiplies.
- * v23: MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
- * v22: MIXBUF = SAMPLES_PER_BUF from core.h.
+ * v23:
+ *   - MUSIC_AMPL 36 → 6, SFX_HEADROOM 5 → 2.
  */
 
 #include <stdio.h>
@@ -43,9 +41,8 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
-/* v25: both doubled for louder output, ratio preserved. */
-#define SFX_HEADROOM   1
-#define MUSIC_AMPL     12
+#define SFX_HEADROOM   2
+#define MUSIC_AMPL     6
 
 #define DMX_SAMPLE_RATE 11025
 
@@ -106,7 +103,6 @@ static int      mus_playing        = 0;
 static int      mus_is_mus         = 0;
 static int      mus_delay_us       = 0;
 static int      mus_tick_acc       = 0;
-static int      mus_tick_acc_frac  = 0;   /* v25 fractional accumulator */
 
 static unsigned int note_phase_inc_table[128];
 
@@ -259,7 +255,6 @@ static void mus_parse_header(void) {
     music_all_notes_off();
     mus_delay_us = 0;
     mus_tick_acc = 0;
-    mus_tick_acc_frac = 0;
 
     if (!mus_data || mus_len < 16) { mus_playing = 0; return; }
     if (mus_data[0] != 'M' || mus_data[1] != 'U' ||
@@ -284,31 +279,28 @@ static void mus_parse_header(void) {
 }
 
 /*
- * v25: fixed timing.  1000000/48000 = 20.833 µs/sample, not 20.
- * Advance by 20, and every 6 samples add an extra 1 µs (via the
- * fractional accumulator) to make the average exactly right.
+ * v24 — optimized music renderer.
+ *
+ * / 15 replaced with multiply by 65536/15 = 4369.07 → precomputed
+ * per-submit scale.  / 2 replaced with shift.
  */
 static void music_render_accum(s32 *accum, int frames) {
     if (!mus_playing) return;
 
-    int us_per_sample = 1000000 / SAMPLE_RATE;   /* = 20 */
-    int us_frac      = 1000000 % SAMPLE_RATE;    /* = 40000 */
+    int us_per_sample = 1000000 / SAMPLE_RATE;
+    if (us_per_sample < 1) us_per_sample = 1;
 
     int vol = snd_musicvolume;
     if (vol < 0)   vol = 0;
     if (vol > 15)  vol = (vol * 15) / 120;
     if (vol > 15)  vol = 15;
 
-    /* Precompute music scale: MUSIC_AMPL * vol / 15 in 16.16 */
+    /* Precompute per-submit music scale: MUSIC_AMPL * vol / 15, fixed 16.16 */
     int music_scale_fp = (MUSIC_AMPL * vol * 65536) / 15;
+    /* Max = 6 * 15 * 65536 / 15 = 393216.  Fits in 32-bit. */
 
     for (int i = 0; i < frames; i++) {
         mus_tick_acc += us_per_sample;
-        mus_tick_acc_frac += us_frac;
-        if (mus_tick_acc_frac >= SAMPLE_RATE) {
-            mus_tick_acc_frac -= SAMPLE_RATE;
-            mus_tick_acc += 1;
-        }
 
         int safety = 0;
         while (mus_playing && mus_tick_acc >= mus_delay_us && safety < 200) {
@@ -338,8 +330,10 @@ static void music_render_accum(s32 *accum, int frames) {
             n->phase += n->phase_inc;
         }
 
+        /* Apply music scale (was: mix * MUSIC_AMPL * vol / 15) */
         mix = ((long long)mix * music_scale_fp) >> 16;
 
+        /* Lowpass filter: g_mus_lpf += (mix - g_mus_lpf) / 2; */
         g_mus_lpf += (mix - g_mus_lpf) >> 1;
 
         accum[i * 2]     += g_mus_lpf;
@@ -385,6 +379,25 @@ void I_UpdateSound(void) {}
 void I_SetChannels(void) {}
 void I_SetSfxVolume(int volume) { (void)volume; }
 
+/*
+ * v24 — optimized mixer.
+ *
+ * The old code did 5 divisions per sample per active SFX channel:
+ *   sample * fade / FADE_MAX
+ *   sample * vol / 127
+ *   sample /= SFX_HEADROOM
+ *   sample * lgain / 255
+ *   sample * rgain / 255
+ *
+ * Now:
+ *   fade / FADE_MAX          → >> 10
+ *   vol / 127 and pan / 255  → folded into a per-channel 16.16 gain,
+ *                              applied as a single multiply + >> 16
+ *   SFX_HEADROOM (2)         → >> 1
+ *
+ * Per sample per channel we now do 3 shifts and 2 multiplies, no
+ * divisions.
+ */
 void I_SubmitSound(void) {
     dbg_submit++;
     if (dbg_submit == 1 || dbg_submit == 100 ||
@@ -403,9 +416,10 @@ void I_SubmitSound(void) {
         const unsigned char *data = ch->data;
         int length = ch->length, step = ch->step;
 
-        int vol_scaled = (vol * 65536) / 127;
-        int lgain = ((255 - pan) * vol_scaled) / 255;
-        int rgain = (pan * vol_scaled) / 255;
+        /* Precompute per-channel 16.16 gains: vol/127 * pan/255 */
+        int vol_scaled = (vol * 65536) / 127;            /* 0..65536 */
+        int lgain = ((255 - pan) * vol_scaled) / 255;    /* 0..65536 */
+        int rgain = (pan * vol_scaled) / 255;            /* 0..65536 */
 
         for (int i = 0; i < MIXBUF; i++) {
             int idx = pos >> 16;
@@ -423,9 +437,9 @@ void I_SubmitSound(void) {
             int s0 = (int)data[idx] - 128;
             int s1 = (idx + 1 < length) ? (int)data[idx + 1] - 128 : s0;
             int sample8 = s0 + ((s1 - s0) * frac >> 16);
-            int sample = sample8 << 8;
-            sample = (sample * fade) >> 10;
-            sample >>= 1;   /* / SFX_HEADROOM (=1, still >>1 for headroom) */
+            int sample = sample8 << 8;                /* -32768..32512 */
+            sample = (sample * fade) >> 10;           /* / FADE_MAX */
+            sample >>= 1;                             /* / SFX_HEADROOM */
 
             mix_accum[i * 2]     += (sample * lgain) >> 16;
             mix_accum[i * 2 + 1] += (sample * rgain) >> 16;
@@ -440,6 +454,9 @@ void I_SubmitSound(void) {
     for (int i = 0; i < MIXBUF; i++) {
         int l = mix_accum[i * 2];
         int r = mix_accum[i * 2 + 1];
+        /* g_out_lpf += (l - g_out_lpf) * 3 / 5;
+         *           = (l - g_out_lpf) * 0.6
+         * 0.6 * 65536 = 39321.6 → 39322 */
         g_out_lpf_l += ((l - g_out_lpf_l) * 39322) >> 16;
         g_out_lpf_r += ((r - g_out_lpf_r) * 39322) >> 16;
         mix_final[i * 2]     = soft_clip(g_out_lpf_l);
@@ -499,7 +516,6 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 void I_InitMusic(void) {
     init_music_tables();
     g_mus_lpf = 0;
-    mus_tick_acc_frac = 0;
     log_str("I_InitMusic done");
 }
 
@@ -519,9 +535,9 @@ void I_ResumeSong(void) {}
 
 void *I_RegisterSong(void *data, int len) {
     song_t *s = (song_t *)malloc(sizeof(song_t));
-    if (!s) { log_str("Music: song_t malloc FAILED"); return 0; }
+    if (!s) return 0;
     s->data = (unsigned char *)malloc((unsigned)len);
-    if (!s->data) { log_str("Music: song data malloc FAILED"); return 0; }
+    if (!s->data) return 0;
     memcpy(s->data, data, len);
     s->len = len;
 
