@@ -1,30 +1,15 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
- * v21 — MUS TIMING + SFX LIMITER FIX
- *
- *   MUS timing:
- *     The MUS format encodes a variable-length delay AFTER each event
- *     (high-bit continuation, 140 Hz ticks).  Previous versions used a
- *     fixed 6-tick gap and never read the delay bytes at all, which
- *     flattened all the rhythm and made fast passages sound frantic.
- *     Now the parser reads the delay properly and schedules the next
- *     event at the exact microsecond the file specifies.
- *
- *   SFX limiter:
- *     The old soft_clip divided the excess by 4 above 24000, then by
- *     16 above 30000.  With 3–4 overlapping gunshots, the sum easily
- *     exceeded 24000, and the -12 dB drop sounded like a cut.  The
- *     new limiter compresses the excess by 2:1 (gentle) and only
- *     hard-limits as a final safety net.
- *
- *   Volume:
- *     MUSIC_AMPL 80 → 48 (music lowered by about 4 dB).
- *     SFX_HEADROOM kept at 5 (SFX volume unchanged).
- *
- *   Buffer:
- *     SAMPLES_PER_BUF 512 → 1024 to give the audio thread more time
- *     to mix and submit before the hardware buffer underruns.
+ * v22:
+ *   - MIXBUF is now SAMPLES_PER_BUF from core.h.  Previously hardcoded
+ *     to 1024 while core.h had SAMPLES_PER_BUF 512, so sceAudioOutOpen
+ *     configured the hardware for 512 but the mixer submitted 1024-
+ *     sample buffers.  Only the first half of each buffer reached the
+ *     speakers, which made everything play at 2× speed and cut off SFX
+ *     tails.  Fixed by pulling both from the same macro.
+ *   - MUSIC_AMPL 48 → 36 (music ~4 dB quieter, SFX unchanged).
+ *   - MUS event delay is now honored per-event (unchanged from v21).
  */
 
 #include <stdio.h>
@@ -51,11 +36,11 @@ int snd_musicvolume = 8;
 int snd_sfxvolume   = 8;
 
 #define NCHANNELS           32
-#define MIXBUF              1024
+#define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
 #define SFX_HEADROOM   5
-#define MUSIC_AMPL     48
+#define MUSIC_AMPL     36
 
 #define DMX_SAMPLE_RATE 11025
 
@@ -64,7 +49,6 @@ int snd_sfxvolume   = 8;
 #define FADE_STEP_OUT  3
 
 static int dbg_submit = 0;
-static int dbg_tick   = 0;
 static int dbg_event  = 0;
 static int dbg_note   = 0;
 
@@ -115,8 +99,8 @@ static int      mus_track_end      = 0;
 static int      mus_loop           = 0;
 static int      mus_playing        = 0;
 static int      mus_is_mus         = 0;
-static int      mus_delay_us       = 0;  /* microseconds until next event */
-static int      mus_tick_acc       = 0;  /* accumulator for delay timing */
+static int      mus_delay_us       = 0;
+static int      mus_tick_acc       = 0;
 
 static unsigned int note_phase_inc_table[128];
 
@@ -189,29 +173,6 @@ static void music_all_notes_off(void) {
         mus_notes[i].active = mus_notes[i].releasing = 0;
 }
 
-/* ----------------------------------------------------------------
- * MUS event parser.
- *
- * Event byte layout:
- *   bit 7: has-delay flag
- *   bits 6-4: type (0-7)
- *   bits 3-0: channel (0-15)
- *
- * Data bytes per type:
- *   0 = release note   : 1 byte
- *   1 = play note      : 1 byte, plus a second volume byte if bit 7
- *                        of the first data byte is set
- *   2 = pitch bend     : 1 byte
- *   3 = system event   : 1 byte
- *   4 = controller     : 2 bytes
- *   5 = end of measure : 0 bytes
- *   6 = finish         : 0 bytes (end of song data)
- *   7 = unused         : 1 byte
- *
- * After the event data, if the has-delay flag was set, a variable-
- * length delay follows.  Each byte contributes 7 bits; bit 7 marks
- * continuation.  Delay is in 140 Hz ticks (1 tick = 7142.857 µs).
- * ---------------------------------------------------------------- */
 static void mus_process_event(void) {
     if (mus_pos >= mus_track_end) {
         if (mus_loop) {
@@ -240,12 +201,11 @@ static void mus_process_event(void) {
     }
 
     switch (type) {
-    case 0: /* Release note */
+    case 0:
         if (mus_pos < mus_track_end)
             music_note_off_chan(chan, mus_data[mus_pos++]);
         break;
-
-    case 1: { /* Play note */
+    case 1: {
         if (mus_pos < mus_track_end) {
             unsigned char b1 = mus_data[mus_pos++];
             int note = b1 & 0x7F;
@@ -258,38 +218,23 @@ static void mus_process_event(void) {
         }
         break;
     }
-
-    case 2: /* Pitch bend */
+    case 2: case 3:
         if (mus_pos < mus_track_end) mus_pos++;
         break;
-
-    case 3: /* System event */
-        if (mus_pos < mus_track_end) mus_pos++;
-        break;
-
-    case 4: /* Controller */
+    case 4:
         if (mus_pos + 1 < mus_track_end) mus_pos += 2;
         else mus_pos = mus_track_end;
         break;
-
-    case 5: /* End of measure — no data bytes */
-        break;
-
-    case 6: /* Finish */
+    case 5: break;
+    case 6:
         mus_playing = 0;
         music_all_notes_off();
         return;
-
-    case 7: /* Unused — 1 byte */
+    case 7:
         if (mus_pos < mus_track_end) mus_pos++;
-        break;
-
-    default:
-        mus_pos++;
         break;
     }
 
-    /* Read the variable-length delay. */
     if (has_delay) {
         int delay = 0;
         while (mus_pos < mus_track_end) {
@@ -297,7 +242,6 @@ static void mus_process_event(void) {
             delay = (delay << 7) | (b & 0x7F);
             if (!(b & 0x80)) break;
         }
-        /* 1 tick = 1/140 s = 7142.857 µs */
         mus_delay_us = (delay * 1000000) / 140;
     } else {
         mus_delay_us = 0;
@@ -319,9 +263,6 @@ static void mus_parse_header(void) {
     }
 
     int score_start = mus_data[6] | (mus_data[7] << 8);
-    log_num("M: score_start=", score_start, "");
-    log_num("M: len=", mus_len, "");
-
     if (score_start < 16 || score_start >= mus_len) {
         log_str("Music: bad MUS score offset");
         mus_playing = 0;
@@ -331,10 +272,7 @@ static void mus_parse_header(void) {
     mus_track_start = score_start;
     mus_track_end   = mus_len;
     mus_pos         = score_start;
-
-    /* Fire the first event immediately. */
-    mus_delay_us = 0;
-
+    mus_delay_us    = 0;
     log_str("Music: MUS loaded");
 }
 
@@ -352,7 +290,6 @@ static void music_render_accum(s32 *accum, int frames) {
     for (int i = 0; i < frames; i++) {
         mus_tick_acc += us_per_sample;
 
-        /* Fire events whose delay has expired. */
         int safety = 0;
         while (mus_playing && mus_tick_acc >= mus_delay_us && safety < 200) {
             safety++;
@@ -389,14 +326,8 @@ static void music_render_accum(s32 *accum, int frames) {
     }
 }
 
-/* ----------------------------------------------------------------
- * Smooth limiter.  Linear below 0.75 FS; above that, excess is
- * compressed by 2:1.  Only pathological sums touch the hard limit.
- * This is what fixes the "cutting" on rapid fire — 3–4 overlapping
- * gunshots no longer trigger a -12 dB step.
- * ---------------------------------------------------------------- */
 static inline s16 soft_clip(s32 v) {
-    const s32 knee = 24576;  /* 0.75 × 32768 */
+    const s32 knee = 24576;
     if (v > knee) {
         v = knee + (v - knee) / 2;
         if (v > 32767) v = 32767;
@@ -414,18 +345,14 @@ void I_InitSound(boolean use_sfx_prefix) {
     for (int i = 0; i < NCHANNELS; i++)
         channels[i].active = channels[i].releasing = channels[i].fade = 0;
     init_music_tables();
-    g_mus_lpf = 0;
-    g_out_lpf_l = 0;
-    g_out_lpf_r = 0;
+    g_mus_lpf = 0; g_out_lpf_l = 0; g_out_lpf_r = 0;
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
     log_str("I_InitSound done");
 }
 
-void I_ShutdownSound(void) {
-    for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0;
-}
+void I_ShutdownSound(void) { for (int i = 0; i < NCHANNELS; i++) channels[i].active = 0; }
 
 int I_GetSfxLumpNum(sfxinfo_t *sfxinfo) {
     char namebuf[16];
@@ -573,20 +500,6 @@ void *I_RegisterSong(void *data, int len) {
     if (!s->data) return 0;
     memcpy(s->data, data, len);
     s->len = len;
-
-    if (len >= 4) {
-        char b[40]; int p = 0;
-        const char *pre = "Music: fmt=";
-        while (*pre) b[p++] = *pre++;
-        const char h[] = "0123456789ABCDEF";
-        for (int i = 0; i < 4; i++) {
-            b[p++] = h[(s->data[i] >> 4) & 0xF];
-            b[p++] = h[s->data[i] & 0xF];
-            b[p++] = ' ';
-        }
-        b[p++] = '\n'; b[p] = 0;
-        ps_sound_log(b);
-    }
 
     if (len >= 4 && s->data[0] == 'M' && s->data[1] == 'U' &&
         s->data[2] == 'S' && s->data[3] == 0x1A) {
