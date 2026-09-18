@@ -1,15 +1,18 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
+ * v23:
+ *   - MUSIC_AMPL 36 → 6  (music ~15 dB quieter — user wanted "much
+ *     quieter" so gunshots/doors/imp alerts come through clearly).
+ *   - SFX_HEADROOM 5 → 2 (SFX ~8 dB louder — the same mixing path
+ *     now gives ~2.5× more headroom for the SFX bus).
+ *   - This combination makes SFX noticeably louder than music, which
+ *     is what the user asked for ("make sure the SFX is louder than
+ *     the song so it's hearable").
+ *
  * v22:
- *   - MIXBUF is now SAMPLES_PER_BUF from core.h.  Previously hardcoded
- *     to 1024 while core.h had SAMPLES_PER_BUF 512, so sceAudioOutOpen
- *     configured the hardware for 512 but the mixer submitted 1024-
- *     sample buffers.  Only the first half of each buffer reached the
- *     speakers, which made everything play at 2× speed and cut off SFX
- *     tails.  Fixed by pulling both from the same macro.
- *   - MUSIC_AMPL 48 → 36 (music ~4 dB quieter, SFX unchanged).
- *   - MUS event delay is now honored per-event (unchanged from v21).
+ *   - MIXBUF is SAMPLES_PER_BUF from core.h.
+ *   - MUS event delay is honored per-event.
  */
 
 #include <stdio.h>
@@ -39,8 +42,20 @@ int snd_sfxvolume   = 8;
 #define MIXBUF              SAMPLES_PER_BUF
 #define MUSIC_MAX_NOTES     32
 
-#define SFX_HEADROOM   5
-#define MUSIC_AMPL     36
+/* -------- volume / headroom --------
+ *
+ * SFX is scaled down by SFX_HEADROOM before being summed into the mix.
+ * Lower value = louder SFX.  Was 5, now 2 (≈ 2.5× louder).
+ *
+ * Music is multiplied by MUSIC_AMPL after being summed from all
+ * voices.  Lower value = quieter music.  Was 36, now 6 (≈ 6× quieter).
+ *
+ * Together: SFX / music ratio goes from 36/5 = 7.2 up to
+ * 6/2 = 3 but with SFX boosted 2.5× and music cut 6×, the perceived
+ * difference is around 15 dB in favour of SFX.
+ */
+#define SFX_HEADROOM   2
+#define MUSIC_AMPL     6
 
 #define DMX_SAMPLE_RATE 11025
 
