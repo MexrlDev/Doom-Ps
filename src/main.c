@@ -1,18 +1,20 @@
 /*
- * doom-ps/src/main.c — v53
+ * doom-ps/src/main.c — v54
  *
- * v53:
- *   - WAD LIST PERSISTS across Doom sessions.  All state that must
- *     survive (g_ctx, g_wads, counts, exit flags, g_jmp_buf) is now
- *     placed in a dedicated linker section .ps_persist that sits
- *     BEFORE __bss_start.  reset_doom_globals() only wipes
- *     __bss_start..__bss_end, so Doom's globals are reset but ours
- *     are untouched.  No more save/restore dance.
- *   - AUDIO: SAMPLES_PER_BUF 1024 → 2048 (see core.h).  Doubles the
- *     hardware queue depth so scheduler jitter doesn't underrun.
- *   - Verbose WAD count logging around the reset so we can see the
- *     state surviving in the log.
+ * v54:
+ *   - CROSS → ESCAPE in Doom menus.  We extern the Doom global
+ *     `menuactive` (from m_menu.c).  When menuactive != 0, Cross sends
+ *     DOOM_KEY_ESCAPE (back out one level per press).  Otherwise it
+ *     sends DOOM_KEY_FIRE (in-game shooting).  We remember which key
+ *     we pressed so the release event always matches.
+ *   - ERROR SCREENS exit to Lua.  Both show_error_and_hang() and
+ *     ps_error_display() now show "Press O to go back to LuaC0re"
+ *     and wait for Circle.  show_error_and_hang returns -1 → _start
+ *     jumps to cleanup.  ps_error_display sets g_force_exit and
+ *     longjmps → run_doom skips reset → _start breaks out of the
+ *     session loop → cleanup.
  *
+ * v53: PS_PERSIST linker section; SAMPLES_PER_BUF 2048.
  * v52: audio sleep removed, mixer divisions → multiplies.
  * v51: rising-edge menu input; SO_LINGER 0 on listener close.
  * v50: audio sleep 16 → 5 ms; clear FBs on reset.
@@ -33,6 +35,9 @@ extern char __bss_start[];
 extern char __bss_end[];
 extern char __ps_persist_start[];
 extern char __ps_persist_end[];
+
+/* Doom global from m_menu.c — 1 when a menu is open, 0 otherwise. */
+extern int menuactive;
 
 extern void *malloc(unsigned long size);
 extern void  free(void *p);
@@ -131,15 +136,14 @@ struct wad_entry {
 };
 
 /* ============================================================
- * v53 PERSISTENT STATE — lives in .ps_persist which reset_doom_
- * globals() does not touch.  Everything here survives every Doom
- * session without any explicit save/restore.
+ * Persistent state (survives the inter-session BSS wipe).
  * ============================================================ */
 PS_PERSIST struct wad_entry g_wads[MAX_WADS];
 PS_PERSIST int g_wad_count = 0;
 PS_PERSIST int g_wad_cursor = 0;
 PS_PERSIST int g_wad_scroll = 0;
 PS_PERSIST int g_session_count = 0;
+PS_PERSIST int g_force_exit = 0;   /* v54 */
 
 PS_PERSIST struct ps_ctx {
     void *G, *D;
@@ -253,6 +257,19 @@ static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     udp_log(g_diag);
 }
 
+/* Read the raw pad bitmask, returns 0 if unavailable. */
+static u32 read_pad_raw(struct ps_ctx *c) {
+    if (c->pad_h < 0 || !c->pad_read) return 0;
+    u8 buf[128]; ps_memset(buf, 0, 128);
+    s32 n = (s32)NC(c->G, c->pad_read,
+                    (u64)c->pad_h, (u64)buf, 1, 0, 0, 0);
+    if (n > 0 && (u32)n < 0x80000000) {
+        u32 r = *(u32 *)buf;
+        if (!(r & 0x80000000)) return r & DS_PAD_MASK;
+    }
+    return 0;
+}
+
 static void present(struct ps_ctx *c) {
     if (c->video_h < 0 || !c->vid_flip) return;
     NC(c->G, c->vid_flip, (u64)c->video_h, (u64)c->active_fb, 1,
@@ -303,33 +320,68 @@ static void show_wad_progress(struct ps_ctx *c, const char *name, u64 got, u64 t
     present(c);
 }
 
-static void show_error_and_hang(struct ps_ctx *c, const char *l1, const char *l2) {
-    for (;;) {
-        if (c->video_h < 0) continue;
-        u32 *fb = (u32 *)c->fbs[c->active_fb];
-        for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
-        ps_draw_str_center(fb, 300, "DOOM-PS ERROR", 0xFFFF4040, 6);
-        if (l1) ps_draw_str_center(fb, 500, l1, 0xFFFFFFFF, 4);
-        if (l2) ps_draw_str_center(fb, 600, l2, 0xFFA0A0A0, 3);
-        ps_draw_str_center(fb, 900, "Reboot game to recover", 0xFF808080, 3);
-        present(c);
-        if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
+/*
+ * v54: shared helper that draws the error screen and waits for Circle.
+ * Returns when the user pressed Circle (rising edge, after a release).
+ * If `use_longjmp` is non-zero, calls ps_doom_exit_now() instead of
+ * returning (used from the ps_libc error callback context, where we
+ * must unwind Doom's call stack).
+ */
+static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
+                              int use_longjmp) {
+    /* Wait for pad to be released first, so a held Circle from the game
+     * doesn't immediately trigger the exit.  Max 2 s. */
+    int waited = 0;
+    while (waited < 2000) {
+        if (read_pad_raw(c) == 0) break;
+        if (c->usleep_fn) NC(c->G, c->usleep_fn, 50000, 0,0,0,0,0);
+        waited += 50;
     }
+
+    u32 prev = 0;
+    for (;;) {
+        if (c->video_h >= 0 && c->fbs[c->active_fb]) {
+            u32 *fb = (u32 *)c->fbs[c->active_fb];
+            for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
+            ps_draw_str_center(fb, 220, "DOOM-PS ERROR", 0xFFFF4040, 6);
+            if (l1) ps_draw_str_center(fb, 420, l1, 0xFFFFFFFF, 4);
+            if (l2) ps_draw_str_center(fb, 520, l2, 0xFFA0A0A0, 3);
+            ps_draw_str_center(fb, 820, "Press O to go back to LuaC0re",
+                               0xFFFFAA00, 4);
+            present(c);
+        }
+
+        u32 raw = read_pad_raw(c);
+        u32 ch = raw ^ prev;
+        prev = raw;
+
+        if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) {
+            if (use_longjmp) {
+                g_force_exit = 1;
+                ps_doom_exit_now();
+                for (;;) {}  /* unreachable */
+            }
+            return;
+        }
+
+        if (c->usleep_fn) NC(c->G, c->usleep_fn, 50000, 0,0,0,0,0);
+    }
+}
+
+/* Called from _start (before the session loop) or from Doom internals
+ * via ps_libc's error callback. */
+static int show_error_and_hang(struct ps_ctx *c, const char *l1, const char *l2) {
+    error_screen_wait(c, l1, l2, 0);
+    return -1;
 }
 
 static void ps_error_display(const char *msg) {
     struct ps_ctx *c = &g_ctx;
     if (c->video_h < 0) return;
-    for (;;) {
-        u32 *fb = (u32 *)c->fbs[c->active_fb];
-        for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
-        ps_draw_str_center(fb, 180, "DOOM INTERNAL ERROR", 0xFFFF4040, 6);
-        if (msg && msg[0]) ps_draw_str_center(fb, 400, msg, 0xFFFFFFFF, 3);
-        else ps_draw_str_center(fb, 400, "(no message)", 0xFFA0A0A0, 3);
-        ps_draw_str_center(fb, 900, "Reboot game to recover", 0xFF808080, 3);
-        present(c);
-        if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
-    }
+    error_screen_wait(c,
+                      "DOOM INTERNAL ERROR",
+                      msg && msg[0] ? msg : "(no message)",
+                      1);
 }
 
 static void blit_doom_frame(u32 *fb, const u32 *doom) {
@@ -358,6 +410,9 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
+/* v54: Cross remembers which key it sent, so release matches press. */
+static u8 s_cross_key = DOOM_KEY_FIRE;
+
 static void translate_pad(u32 raw) {
     struct ps_ctx *c = &g_ctx;
     u32 ch = raw ^ c->pad_prev;
@@ -365,7 +420,20 @@ static void translate_pad(u32 raw) {
 #define MAP(b,k) if (ch & (b)) push_key((k), (raw & (b)) ? 1 : 0)
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
-    MAP(DS_CROSS, DOOM_KEY_FIRE); MAP(DS_SQUARE, DOOM_KEY_USE);
+
+    /* Cross: Escape when a Doom menu is open (back out), Fire otherwise
+     * (shooting in-game).  Remember the key we pressed so the release
+     * always matches, regardless of menuactive changing mid-press. */
+    if (ch & DS_CROSS) {
+        if (raw & DS_CROSS) {
+            s_cross_key = menuactive ? DOOM_KEY_ESCAPE : DOOM_KEY_FIRE;
+            push_key(s_cross_key, 1);
+        } else {
+            push_key(s_cross_key, 0);
+        }
+    }
+
+    MAP(DS_SQUARE, DOOM_KEY_USE);
     MAP(DS_TRIANGLE, DOOM_KEY_RSHIFT); MAP(DS_CIRCLE, DOOM_KEY_ENTER);
     if (ch & DS_CIRCLE) push_key(DOOM_KEY_Y, (raw & DS_CIRCLE) ? 1 : 0);
     if (ch & DS_CROSS)  push_key(DOOM_KEY_N, (raw & DS_CROSS)  ? 1 : 0);
@@ -384,12 +452,6 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
-/* ============================================================
- * Audio thread.  sceAudioOutOutput is expected to block when the
- * hardware queue is full, so we submit in a tight loop and let the
- * syscall pace us.  With SAMPLES_PER_BUF = 2048 the drain rate is
- * 23.44/sec, giving ample slack for scheduler jitter.
- * ============================================================ */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
@@ -629,17 +691,7 @@ done:
 #define MENU_ROW_H   100
 
 static int show_wad_menu(struct ps_ctx *c) {
-    u32 prev_btn = 0;
-
-    if (c->pad_h >= 0 && c->pad_read) {
-        u8 buf[128]; ps_memset(buf, 0, 128);
-        s32 n = (s32)NC(c->G, c->pad_read,
-                        (u64)c->pad_h, (u64)buf, 1, 0, 0, 0);
-        if (n > 0 && (u32)n < 0x80000000) {
-            u32 r = *(u32 *)buf;
-            if (!(r & 0x80000000)) prev_btn = r & DS_PAD_MASK;
-        }
-    }
+    u32 prev_btn = read_pad_raw(c);
 
     {
         char b[80]; int p = 0;
@@ -666,16 +718,7 @@ static int show_wad_menu(struct ps_ctx *c) {
     }
 
     for (;;) {
-        u32 raw = 0;
-        if (c->pad_h >= 0 && c->pad_read) {
-            u8 buf[128]; ps_memset(buf, 0, 128);
-            s32 n = (s32)NC(c->G, c->pad_read,
-                            (u64)c->pad_h, (u64)buf, 1, 0, 0, 0);
-            if (n > 0 && (u32)n < 0x80000000) {
-                u32 r = *(u32 *)buf;
-                if (!(r & 0x80000000)) raw = r & DS_PAD_MASK;
-            }
-        }
+        u32 raw = read_pad_raw(c);
         u32 ch = raw ^ prev_btn;
         prev_btn = raw;
 
@@ -688,7 +731,6 @@ static int show_wad_menu(struct ps_ctx *c) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
         }
 
-        /* Rising edge only — a held button does not trigger. */
         if ((ch & DS_CIRCLE) && (raw & DS_CIRCLE)) return -1;
         if ((ch & DS_CROSS)  && (raw & DS_CROSS))  return g_wad_cursor;
 
@@ -746,12 +788,6 @@ static int show_wad_menu(struct ps_ctx *c) {
 
 /* ============================================================
  * reset_doom_globals
- *
- * v53: All OUR state lives in .ps_persist which is placed BEFORE
- * __bss_start in the linker script.  So a simple wipe of __bss_start
- * ..__bss_end does NOT touch g_ctx, g_wads, g_wad_count, g_jmp_buf,
- * g_exit_requested, g_audio_thread_running or ps_libc's internal
- * state (also marked PS_PERSIST).  No save/restore dance required.
  * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
@@ -762,8 +798,6 @@ static void reset_doom_globals(void) {
 
     log_wad_count("DoomPS: post-wipe wads=");
 
-    /* Clear both framebuffers and force active_fb back to 0 so the
-     * menu redraws from scratch. */
     if (g_ctx.fbs[0]) {
         u32 *fb = (u32 *)g_ctx.fbs[0];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
@@ -777,22 +811,12 @@ static void reset_doom_globals(void) {
     udp_log("DoomPS: globals reset done\n");
 }
 
-/* ============================================================
- * wait_for_pad_release — 160 ms continuous release.
- * ============================================================ */
 static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
     if (c->pad_h < 0 || !c->pad_read) return;
     int elapsed = 0;
     int released_for = 0;
     while (elapsed < max_ms) {
-        u8 buf[128]; ps_memset(buf, 0, 128);
-        s32 n = (s32)NC(c->G, c->pad_read,
-                        (u64)c->pad_h, (u64)buf, 1, 0, 0, 0);
-        u32 raw = 0;
-        if (n > 0 && (u32)n < 0x80000000) {
-            u32 r = *(u32 *)buf;
-            if (!(r & 0x80000000)) raw = r & DS_PAD_MASK;
-        }
+        u32 raw = read_pad_raw(c);
         if (raw == 0) {
             released_for += 16;
             if (released_for >= 160) return;
@@ -805,7 +829,7 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
 }
 
 /* ============================================================
- * run_doom — start audio thread FIRST, run Doom, then reset state.
+ * run_doom
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -846,6 +870,13 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 150000, 0,0,0,0,0);
 
+    /* v54: if the error screen asked us to bail out entirely, skip the
+     * reset and let _start break out of the session loop. */
+    if (g_force_exit) {
+        udp_log("DoomPS: forcing exit to Lua\n");
+        return;
+    }
+
     wait_for_pad_release(c, 2000);
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
 
@@ -867,7 +898,7 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
 }
 
 /* ============================================================
- * _start — entry point.
+ * _start
  * ============================================================ */
 
 __attribute__((section(".text._start")))
@@ -875,7 +906,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     u64 load_base = (u64)&_start;
     do_relocations(load_base);
 
-    /* Wipe only the Doom BSS — persistent state lives outside. */
     { volatile char *p = __bss_start; while (p < __bss_end) *p++ = 0; }
 
     ext->step = 1;
@@ -889,11 +919,11 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->log_fd = ext->log_fd;
     for (int i = 0; i < 16; i++) c->log_sa[i] = ext->log_addr[i];
 
-    /* Reset WAD list for fresh start. */
     g_wad_count = 0;
     g_wad_cursor = 0;
     g_wad_scroll = 0;
     g_session_count = 0;
+    g_force_exit = 0;
 
     ext->step = 2;
     c->sendto_fn = SYM(G, D, LIBKERNEL_HANDLE, "sendto");
@@ -1042,8 +1072,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 37;
 
     if (g_wad_count == 0) {
-        show_error_and_hang(c, "No WAD files received",
-                            "Send .wad files from the PC launcher");
+        if (show_error_and_hang(c, "No WAD files received",
+                                "Send .wad files from the PC launcher") < 0) {
+            goto cleanup;   /* v54: user asked to exit to Lua */
+        }
     }
 
     ext->step = 38;
@@ -1053,8 +1085,10 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int sel = show_wad_menu(c);
         if (sel < 0) break;
         run_doom(c, sel);
+        if (g_force_exit) break;   /* v54: error screen exit */
     }
 
+cleanup:
     delete_all_wads();
 
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
