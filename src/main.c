@@ -1,32 +1,27 @@
 /*
- * doom-ps/src/main.c — v55b
+ * doom-ps/src/main.c — v55c
  *
- * v55b:
- *   - Post-WAD accept timeout raised from 300 ms to 3000 ms.  The
- *     previous 300 ms window was occasionally exceeded by Python's
- *     close→sleep→reconnect sequence on the phone, so the console
- *     would give up after receiving only WAD 1 of 2.  3000 ms gives
- *     plenty of slack while still feeling instant to the user.
+ * v55c:
+ *   - Call ps_libc_reset_pool() in reset_doom_globals().  __pool_used
+ *     lives in .ps_persist and was never reset between Doom sessions,
+ *     so each session's allocations landed at progressively higher
+ *     offsets.  Fixes potential OOM after 2-3 sessions and the music
+ *     load failures seen on session 2.
  *
- * v55:
- *   - WAD stall detection: SO_RCVTIMEO 30 s → 5 s, retries 30 → 3.
- *     A stalled sender now triggers the error screen after ~20 s.
- *   - WAD truncation error: any incomplete WAD deletes the partial
- *     file AND every WAD received so far this session, then shows
- *     "WAD TRANSFER INCOMPLETE" and exits to Lua on Circle.
- *
- * v54: Cross→Escape in Doom menus; error screens exit to Lua on Circle.
- * v53: PS_PERSIST linker section; SAMPLES_PER_BUF 2048.
- * v52: audio sleep removed, mixer divisions → multiplies.
- * v51: rising-edge menu input; SO_LINGER 0 on listener close.
- * v50: audio sleep 16 → 5 ms; clear FBs on reset.
- * v49: Triangle → Right Shift.
- * v48: BSS reset between Doom sessions.
- * v47: audio thread starts at the beginning of run_doom.
- * v46: 7-visible menu, no wrap-around.
- * v45: poll() before accept().
- * v44: reset key queue + pad_prev.
- * v43: WAD path trailing-slash fix.
+ * v55b: post-WAD accept timeout 300 → 3000 ms.
+ * v55:  WAD stall detection; truncation error.
+ * v54:  Cross→Escape in Doom menus; error screens exit to Lua on Circle.
+ * v53:  PS_PERSIST linker section; SAMPLES_PER_BUF 2048.
+ * v52:  audio sleep removed, mixer divisions → multiplies.
+ * v51:  rising-edge menu input; SO_LINGER 0 on listener close.
+ * v50:  audio sleep 16 → 5 ms; clear FBs on reset.
+ * v49:  Triangle → Right Shift.
+ * v48:  BSS reset between Doom sessions.
+ * v47:  audio thread starts at the beginning of run_doom.
+ * v46:  7-visible menu, no wrap-around.
+ * v45:  poll() before accept().
+ * v44:  reset key queue + pad_prev.
+ * v43:  WAD path trailing-slash fix.
  */
 
 #include "core.h"
@@ -38,7 +33,6 @@ extern char __bss_end[];
 extern char __ps_persist_start[];
 extern char __ps_persist_end[];
 
-/* Doom global from m_menu.c — 1 when a menu is open, 0 otherwise. */
 extern int menuactive;
 
 extern void *malloc(unsigned long size);
@@ -48,6 +42,7 @@ extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
 
 extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
+extern void ps_libc_reset_pool(void);
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -64,8 +59,6 @@ extern void doomgeneric_Tick(void);
 
 #define MAX_WADS 32
 
-/* v55: WAD transfer stall tuning.  A stalled sender triggers an error
- * after WAD_RECV_TIMEOUT_SEC * (WAD_RECV_MAX_RETRIES + 1) seconds. */
 #define WAD_RECV_TIMEOUT_SEC  5
 #define WAD_RECV_MAX_RETRIES  3
 
@@ -142,9 +135,6 @@ struct wad_entry {
     char name[64];
 };
 
-/* ============================================================
- * Persistent state (survives the inter-session BSS wipe).
- * ============================================================ */
 PS_PERSIST struct wad_entry g_wads[MAX_WADS];
 PS_PERSIST int g_wad_count = 0;
 PS_PERSIST int g_wad_cursor = 0;
@@ -343,20 +333,16 @@ static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
             ps_draw_str_center(fb, 220, "DOOM-PS ERROR", 0xFFFF4040, 6);
             if (l1) ps_draw_str_center(fb, 420, l1, 0xFFFFFFFF, 4);
             if (l2) {
-                /* l2 may be a two-line message: "name\nxxx KB / yyy KB".
-                 * Draw each line separately. */
                 char line[64]; int lp = 0;
                 const char *sp = l2;
                 for (;;) {
                     if (*sp == 0 || *sp == '\n' || lp >= 63) {
                         line[lp] = 0;
-                        if (lp > 0) {
+                        if (lp > 0)
                             ps_draw_str_center(fb, 520, line, 0xFFA0A0A0, 3);
-                        }
                         if (*sp == 0) break;
                         sp++;
                         lp = 0;
-                        /* Second line drawn at y=560 */
                         while (*sp && *sp != '\n' && lp < 63) line[lp++] = *sp++;
                         line[lp] = 0;
                         if (lp > 0)
@@ -440,7 +426,6 @@ static void translate_pad(u32 raw) {
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
 
-    /* Cross: Escape in Doom menus (back), Fire in-game. */
     if (ch & DS_CROSS) {
         if (raw & DS_CROSS) {
             s_cross_key = menuactive ? DOOM_KEY_ESCAPE : DOOM_KEY_FIRE;
@@ -478,10 +463,6 @@ static void *audio_thread_fn(void *arg) {
     ps_sound_log("Audio: thread exiting\n");
     return 0;
 }
-
-/* ============================================================
- * doomgeneric callbacks
- * ============================================================ */
 
 void DG_Init(void) {
     udp_log("DoomPS: DG_Init entered\n");
@@ -550,10 +531,6 @@ int DG_GetKey(int *pressed, unsigned char *doomKey) {
 
 void DG_SetWindowTitle(const char *t) { (void)t; }
 
-/* ============================================================
- * WAD management
- * ============================================================ */
-
 static void delete_all_wads(void) {
     struct ps_ctx *c = &g_ctx;
     for (int i = 0; i < g_wad_count; i++) {
@@ -580,7 +557,6 @@ static int wait_readable(struct ps_ctx *c, s32 fd, int wait_ms) {
     return 1;
 }
 
-/* Build "name\nNNN KB / MMM KB" into msg (up to max bytes). */
 static void build_truncation_msg(char *msg, int max,
                                  const char *name, u64 got, u64 total) {
     int mp = 0;
@@ -608,19 +584,15 @@ static void build_truncation_msg(char *msg, int max,
     msg[mp] = 0;
 }
 
-/* Handle an incomplete WAD transfer: delete partial + all session WADs,
- * show error screen, wait for Circle.  Returns -2 to signal exit. */
 static int handle_wad_truncation(struct ps_ctx *c,
                                  const char *partial_path,
                                  const char *name,
                                  u64 got, u64 total) {
     udp_log("DoomPS: WAD truncated, deleting + error\n");
 
-    /* Delete the partial file. */
     if (c->unlink_fn)
         NC(c->G, c->unlink_fn, (u64)partial_path, 0,0,0,0,0);
 
-    /* Delete every previously-completed WAD this session. */
     for (int i = 0; i < g_wad_count; i++) {
         if (c->unlink_fn)
             NC(c->G, c->unlink_fn, (u64)g_wads[i].path, 0,0,0,0,0);
@@ -647,10 +619,6 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        /* v55b: first client gets 30 s (Python sleeps wad_delay after
-         * shellcode).  Subsequent clients get 3000 ms — was 300 ms,
-         * which was occasionally exceeded by Python's close→sleep→
-         * reconnect sequence, causing us to give up after WAD 1. */
         int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
 
         int ready = wait_readable(c, listen_fd, wait_ms);
@@ -668,7 +636,6 @@ static int recv_wads(s32 listen_fd) {
                              (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client < 0) break;
 
-        /* v55: 5 s recv timeout so stalls are detected quickly. */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
             *(u64 *)(tv + 0) = WAD_RECV_TIMEOUT_SEC;
@@ -780,7 +747,6 @@ static int recv_wads(s32 listen_fd) {
         NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
 
         if (remaining > 0) {
-            /* v55: partial WAD.  Delete + error + exit to Lua. */
             (void)stalled;
             return handle_wad_truncation(c, path, name,
                                          wad_size - remaining, wad_size);
@@ -797,10 +763,6 @@ done:
     show_loading(c, 3, "WADs ready");
     return g_wad_count;
 }
-
-/* ============================================================
- * WAD menu — 7 visible rows, no wrap-around.
- * ============================================================ */
 
 #define MENU_VISIBLE 7
 #define MENU_ROW_H   100
@@ -901,9 +863,6 @@ static int show_wad_menu(struct ps_ctx *c) {
     }
 }
 
-/* ============================================================
- * reset_doom_globals — wipe Doom's BSS (ours lives in .ps_persist).
- * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
@@ -912,6 +871,12 @@ static void reset_doom_globals(void) {
     while (p < __bss_end) *p++ = 0;
 
     log_wad_count("DoomPS: post-wipe wads=");
+
+    /* v55c: reset the libc memory pool so the next session starts
+     * allocating from offset 0.  __pool_used is in .ps_persist so
+     * it survived the wipe above. */
+    ps_libc_reset_pool();
+    udp_log("DoomPS: pool reset\n");
 
     if (g_ctx.fbs[0]) {
         u32 *fb = (u32 *)g_ctx.fbs[0];
@@ -942,10 +907,6 @@ static void wait_for_pad_release(struct ps_ctx *c, int max_ms) {
         elapsed += 16;
     }
 }
-
-/* ============================================================
- * run_doom
- * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
     static const char arg0[] = "doom";
@@ -1009,10 +970,6 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
 
     reset_doom_globals();
 }
-
-/* ============================================================
- * _start
- * ============================================================ */
 
 __attribute__((section(".text._start")))
 void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
@@ -1185,8 +1142,6 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     ext->step = 37;
 
     if (wad_result == -2) {
-        /* v55: transfer was cut off, error screen already shown,
-         * all WADs deleted.  User pressed O.  Exit to Lua. */
         udp_log("DoomPS: exiting due to WAD error\n");
         goto cleanup;
     }
