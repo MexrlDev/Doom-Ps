@@ -1,5 +1,11 @@
 /*
- * doom-ps/src/main.c — v43
+ * doom-ps/src/main.c — v44
+ *
+ * v44:
+ *   - Reset key queue + pad_prev at the end of run_doom() so a held
+ *     button from the previous Doom session doesn't ghost-press into
+ *     the WAD menu (e.g. Circle-to-quit instantly selects the first
+ *     WAD when the menu redraws).  Cosmetic — no crash fix.
  *
  * v43:
  *   - FIXED: WAD path was missing the trailing slash. "/av_contents/
@@ -8,7 +14,6 @@
  *     The resulting path /av_contents/content_tmpDOOM.WAD failed to
  *     open with EACCES, so the launcher appeared "stuck at loading".
  *     Changed pi = 24 → pi = 25.
- *   - Everything else identical to v42.
  */
 
 #include "core.h"
@@ -663,6 +668,12 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     g_exit_requested = 0;
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 200000, 0,0,0,0,0);
+
+    /* v44: wipe input state so a held Circle/Cross from the previous
+     * Doom session doesn't ghost-press into the WAD menu. */
+    c->key_wp   = 0;
+    c->key_rp   = 0;
+    c->pad_prev = 0;
 
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
