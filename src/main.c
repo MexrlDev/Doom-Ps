@@ -1,19 +1,26 @@
 /*
- * doom-ps/src/main.c — v44
+ * doom-ps/src/main.c — v45
+ *
+ * v45:
+ *   - FIXED: recv_wads() hung forever after the last WAD because
+ *     accept() on a blocking listen socket never returns if no new
+ *     client arrives.  The 12-iteration retry loop with usleep was
+ *     useless — SO_RCVTIMEO (0x1006) only affects recv(), not
+ *     accept(), on PS5's kernel.  Now we poll() the listen socket
+ *     with a timeout before each accept().  First client gets a 30 s
+ *     window (Python sleeps wad_delay before connecting); subsequent
+ *     clients get 3 s.  On poll timeout we break out of the accept
+ *     loop and drop into the WAD menu.
+ *   - Added poll_fn to struct ps_ctx, resolved in _start().
  *
  * v44:
  *   - Reset key queue + pad_prev at the end of run_doom() so a held
  *     button from the previous Doom session doesn't ghost-press into
- *     the WAD menu (e.g. Circle-to-quit instantly selects the first
- *     WAD when the menu redraws).  Cosmetic — no crash fix.
+ *     the WAD menu.
  *
  * v43:
- *   - FIXED: WAD path was missing the trailing slash. "/av_contents/
- *     content_tmp/" is 25 characters (indices 0..24), but the code
- *     started writing the filename at index 24, overwriting the slash.
- *     The resulting path /av_contents/content_tmpDOOM.WAD failed to
- *     open with EACCES, so the launcher appeared "stuck at loading".
- *     Changed pi = 24 → pi = 25.
+ *   - FIXED: WAD path was missing the trailing slash.  Changed
+ *     pi = 24 → pi = 25.
  */
 
 #include "core.h"
@@ -129,6 +136,7 @@ static struct ps_ctx {
     void *kopen, *kwrite, *kclose, *clock_gettime;
     void *accept_fn, *recv_fn, *close_fn, *sendto_fn, *setsockopt_fn, *cancel;
     void *unlink_fn;
+    void *poll_fn;                                   /* v45 */
     void *vid_open, *vid_close, *vid_reg, *vid_flip, *vid_rate, *vid_evt;
     s32   video_h;
     void *vmem;
@@ -447,6 +455,26 @@ static void delete_all_wads(void) {
 
 #define WAD_CHUNK 4096
 
+/*
+ * Wait for the listen socket to become readable, up to wait_ms.
+ * Returns 1 if readable, 0 on timeout, -1 if poll unavailable/failed.
+ *
+ * struct pollfd on x86_64 FreeBSD: int fd; short events; short revents;
+ * POLLIN = 0x0001.
+ */
+static int wait_readable(struct ps_ctx *c, s32 fd, int wait_ms) {
+    if (!c->poll_fn) return -1;
+    u8 pfd[8];
+    *(s32*)(pfd + 0) = fd;
+    *(u16*)(pfd + 4) = 0x0001;   /* POLLIN  */
+    *(u16*)(pfd + 6) = 0;        /* revents */
+    s32 pr = (s32)NC(c->G, c->poll_fn,
+                     (u64)pfd, 1, (u64)(s64)wait_ms, 0, 0, 0);
+    if (pr < 0) return -1;
+    if (pr == 0) return 0;
+    return 1;
+}
+
 static int recv_wads(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
     if (listen_fd < 0) return -1;
@@ -455,27 +483,35 @@ static int recv_wads(s32 listen_fd) {
     delete_all_wads();
     show_loading(c, 0, "Waiting for WADs...");
 
-    if (c->setsockopt_fn) {
-        u8 tv[16] = {0};
-        *(u64 *)(tv + 0) = 0;
-        *(u64 *)(tv + 8) = 500000;
-        (void)NC(c->G, c->setsockopt_fn,
-                 (u64)listen_fd, 0xFFFF, 0x1006, (u64)tv, 16, 0);
-    }
-
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        s32 client = -1;
-        for (int attempt = 0; attempt < 12; attempt++) {
-            u8 peer[16]; s32 plen = 16;
-            client = (s32)NC(c->G, c->accept_fn,
-                             (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
-            if (client >= 0) break;
-            if (c->usleep_fn) NC(c->G, c->usleep_fn, 500000, 0,0,0,0,0);
+        /* v45 — first client gets a generous window (Python sleeps
+         * wad_delay ~2s after shellcode send); subsequent clients get
+         * a short window (Python reconnects immediately after each
+         * WAD).  On timeout we break and drop into the menu. */
+        int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
+
+        int ready = wait_readable(c, listen_fd, wait_ms);
+        if (ready <= 0) {
+            if (ready < 0) {
+                /* poll unavailable — fall back to a single blocking
+                 * accept.  Only happens if poll_fn failed to resolve,
+                 * which shouldn't occur on PS5. */
+                udp_log("DoomPS: WARN poll unavailable, blocking accept\n");
+            } else {
+                udp_log("DoomPS: accept window elapsed\n");
+                break;
+            }
         }
+
+        u8 peer[16]; s32 plen = 16;
+        s32 client = (s32)NC(c->G, c->accept_fn,
+                             (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client < 0) break;
 
+        /* 30-second recv timeout on the accepted client so a stalled
+         * transfer can't wedge the loop. */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
             *(u64 *)(tv + 0) = 30;
@@ -507,9 +543,8 @@ static int recv_wads(s32 listen_fd) {
         name[namelen] = 0;
         if (name[0] == 0) ps_strcpy(name, "UNKNOWN.WAD");
 
-        /* Build "/av_contents/content_tmp/" + name.
-         * The prefix is 25 characters (indices 0..24), the trailing
-         * slash is at index 24, so the name starts at index 25. */
+        /* "/av_contents/content_tmp/" = 25 chars (indices 0..24), so
+         * the filename goes at index 25. */
         char path[128];
         ps_strcpy(path, "/av_contents/content_tmp/");
         int pi = 25;
@@ -669,8 +704,8 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 200000, 0,0,0,0,0);
 
-    /* v44: wipe input state so a held Circle/Cross from the previous
-     * Doom session doesn't ghost-press into the WAD menu. */
+    /* v44 — wipe input state so a held button from the previous Doom
+     * session doesn't ghost-press into the WAD menu. */
     c->key_wp   = 0;
     c->key_rp   = 0;
     c->pad_prev = 0;
@@ -736,6 +771,11 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->recv_fn       = SYM(G, D, LIBKERNEL_HANDLE, "recv");
     c->close_fn      = SYM(G, D, LIBKERNEL_HANDLE, "close");
     c->setsockopt_fn = SYM(G, D, LIBKERNEL_HANDLE, "setsockopt");
+    c->poll_fn       = SYM(G, D, LIBKERNEL_HANDLE, "poll");      /* v45 */
+    if (!c->poll_fn)
+        udp_log("DoomPS: WARN poll() not resolved\n");
+    else
+        udp_log("DoomPS: [10] poll OK\n");
     udp_log("DoomPS: [10] sockets\n"); ext->step = 10;
 
     mkdir("./.savegame", 0777);
