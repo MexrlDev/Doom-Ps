@@ -1,19 +1,18 @@
 /*
- * doom-ps/src/main.c — v54
+ * doom-ps/src/main.c — v55
  *
- * v54:
- *   - CROSS → ESCAPE in Doom menus.  We extern the Doom global
- *     `menuactive` (from m_menu.c).  When menuactive != 0, Cross sends
- *     DOOM_KEY_ESCAPE (back out one level per press).  Otherwise it
- *     sends DOOM_KEY_FIRE (in-game shooting).  We remember which key
- *     we pressed so the release event always matches.
- *   - ERROR SCREENS exit to Lua.  Both show_error_and_hang() and
- *     ps_error_display() now show "Press O to go back to LuaC0re"
- *     and wait for Circle.  show_error_and_hang returns -1 → _start
- *     jumps to cleanup.  ps_error_display sets g_force_exit and
- *     longjmps → run_doom skips reset → _start breaks out of the
- *     session loop → cleanup.
+ * v55:
+ *   - WAD STALL DETECTION: SO_RCVTIMEO on the accepted client reduced
+ *     from 30 s → 5 s, and the per-transfer retry counter reduced from
+ *     30 → 3.  A stalled sender now triggers the error screen after
+ *     ~20 seconds instead of ~15 minutes.
+ *   - WAD TRUNCATION ERROR: if a transfer is cut short (stall OR
+ *     graceful close with bytes remaining), we now delete the partial
+ *     file, delete every WAD received so far this session, clear the
+ *     WAD list, and show a "WAD TRANSFER INCOMPLETE" error screen.
+ *     User presses O to return to Lua.
  *
+ * v54: Cross→Escape in Doom menus; error screens exit to Lua on Circle.
  * v53: PS_PERSIST linker section; SAMPLES_PER_BUF 2048.
  * v52: audio sleep removed, mixer divisions → multiplies.
  * v51: rising-edge menu input; SO_LINGER 0 on listener close.
@@ -61,6 +60,11 @@ extern void doomgeneric_Tick(void);
 #define O_WR_CREAT_TRUNC  (O_WRONLY_ | O_CREAT_ | O_TRUNC_)
 
 #define MAX_WADS 32
+
+/* v55: WAD transfer stall tuning.  A stalled sender triggers an error
+ * after WAD_RECV_TIMEOUT_SEC * (WAD_RECV_MAX_RETRIES + 1) seconds. */
+#define WAD_RECV_TIMEOUT_SEC  5
+#define WAD_RECV_MAX_RETRIES  3
 
 typedef struct { u64 r_offset; u64 r_info; s64 r_addend; } Elf64_Rela;
 #define ELF64_R_TYPE(i) ((u32)((i) & 0xffffffffU))
@@ -143,7 +147,7 @@ PS_PERSIST int g_wad_count = 0;
 PS_PERSIST int g_wad_cursor = 0;
 PS_PERSIST int g_wad_scroll = 0;
 PS_PERSIST int g_session_count = 0;
-PS_PERSIST int g_force_exit = 0;   /* v54 */
+PS_PERSIST int g_force_exit = 0;
 
 PS_PERSIST struct ps_ctx {
     void *G, *D;
@@ -257,7 +261,6 @@ static void diag_kopen(const char *prefix, const char *path, s32 fd) {
     udp_log(g_diag);
 }
 
-/* Read the raw pad bitmask, returns 0 if unavailable. */
 static u32 read_pad_raw(struct ps_ctx *c) {
     if (c->pad_h < 0 || !c->pad_read) return 0;
     u8 buf[128]; ps_memset(buf, 0, 128);
@@ -320,17 +323,8 @@ static void show_wad_progress(struct ps_ctx *c, const char *name, u64 got, u64 t
     present(c);
 }
 
-/*
- * v54: shared helper that draws the error screen and waits for Circle.
- * Returns when the user pressed Circle (rising edge, after a release).
- * If `use_longjmp` is non-zero, calls ps_doom_exit_now() instead of
- * returning (used from the ps_libc error callback context, where we
- * must unwind Doom's call stack).
- */
 static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
                               int use_longjmp) {
-    /* Wait for pad to be released first, so a held Circle from the game
-     * doesn't immediately trigger the exit.  Max 2 s. */
     int waited = 0;
     while (waited < 2000) {
         if (read_pad_raw(c) == 0) break;
@@ -345,7 +339,33 @@ static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
             for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF200000;
             ps_draw_str_center(fb, 220, "DOOM-PS ERROR", 0xFFFF4040, 6);
             if (l1) ps_draw_str_center(fb, 420, l1, 0xFFFFFFFF, 4);
-            if (l2) ps_draw_str_center(fb, 520, l2, 0xFFA0A0A0, 3);
+            if (l2) {
+                /* l2 may be a two-line message: "name\nxxx KB / yyy KB".
+                 * Draw each line separately. */
+                char line[64]; int lp = 0;
+                const char *sp = l2;
+                for (;;) {
+                    if (*sp == 0 || *sp == '\n' || lp >= 63) {
+                        line[lp] = 0;
+                        if (lp > 0) {
+                            ps_draw_str_center(fb, 520 + (lp > 0 ? 0 : 0),
+                                               line, 0xFFA0A0A0, 3);
+                        }
+                        if (*sp == 0) break;
+                        sp++;
+                        lp = 0;
+                        /* Second line drawn at y=560 */
+                        while (*sp && *sp != '\n' && lp < 63) line[lp++] = *sp++;
+                        line[lp] = 0;
+                        if (lp > 0)
+                            ps_draw_str_center(fb, 560, line, 0xFFA0A0A0, 3);
+                        if (*sp == 0) break;
+                        sp++;
+                        break;
+                    }
+                    line[lp++] = *sp++;
+                }
+            }
             ps_draw_str_center(fb, 820, "Press O to go back to LuaC0re",
                                0xFFFFAA00, 4);
             present(c);
@@ -359,7 +379,7 @@ static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
             if (use_longjmp) {
                 g_force_exit = 1;
                 ps_doom_exit_now();
-                for (;;) {}  /* unreachable */
+                for (;;) {}
             }
             return;
         }
@@ -368,8 +388,6 @@ static void error_screen_wait(struct ps_ctx *c, const char *l1, const char *l2,
     }
 }
 
-/* Called from _start (before the session loop) or from Doom internals
- * via ps_libc's error callback. */
 static int show_error_and_hang(struct ps_ctx *c, const char *l1, const char *l2) {
     error_screen_wait(c, l1, l2, 0);
     return -1;
@@ -410,7 +428,6 @@ static void push_key(u8 key, u8 pressed) {
     c->key_wp = next;
 }
 
-/* v54: Cross remembers which key it sent, so release matches press. */
 static u8 s_cross_key = DOOM_KEY_FIRE;
 
 static void translate_pad(u32 raw) {
@@ -421,9 +438,7 @@ static void translate_pad(u32 raw) {
     MAP(DS_UP, DOOM_KEY_UP); MAP(DS_DOWN, DOOM_KEY_DOWN);
     MAP(DS_LEFT, DOOM_KEY_LEFT); MAP(DS_RIGHT, DOOM_KEY_RIGHT);
 
-    /* Cross: Escape when a Doom menu is open (back out), Fire otherwise
-     * (shooting in-game).  Remember the key we pressed so the release
-     * always matches, regardless of menuactive changing mid-press. */
+    /* Cross: Escape in Doom menus (back), Fire in-game. */
     if (ch & DS_CROSS) {
         if (raw & DS_CROSS) {
             s_cross_key = menuactive ? DOOM_KEY_ESCAPE : DOOM_KEY_FIRE;
@@ -563,6 +578,62 @@ static int wait_readable(struct ps_ctx *c, s32 fd, int wait_ms) {
     return 1;
 }
 
+/* Build "name\nNNN KB / MMM KB" into msg (up to max bytes). */
+static void build_truncation_msg(char *msg, int max,
+                                 const char *name, u64 got, u64 total) {
+    int mp = 0;
+    for (int i = 0; name[i] && mp < max - 4 && mp < 40; i++) msg[mp++] = name[i];
+    msg[mp++] = '\n';
+
+    char tmp[24]; int t;
+    u64 v = got / 1024;
+    t = 0; if (v == 0) tmp[t++] = '0';
+    else { while (v && t < 20) { tmp[t++] = '0' + (v % 10); v /= 10; } }
+    while (t && mp < max - 1) msg[mp++] = tmp[--t];
+    if (mp < max - 1) msg[mp++] = ' ';
+    if (mp < max - 1) msg[mp++] = 'K';
+    if (mp < max - 1) msg[mp++] = 'B';
+    if (mp < max - 1) msg[mp++] = ' ';
+    if (mp < max - 1) msg[mp++] = '/';
+    if (mp < max - 1) msg[mp++] = ' ';
+    v = total / 1024;
+    t = 0; if (v == 0) tmp[t++] = '0';
+    else { while (v && t < 20) { tmp[t++] = '0' + (v % 10); v /= 10; } }
+    while (t && mp < max - 1) msg[mp++] = tmp[--t];
+    if (mp < max - 1) msg[mp++] = ' ';
+    if (mp < max - 1) msg[mp++] = 'K';
+    if (mp < max - 1) msg[mp++] = 'B';
+    msg[mp] = 0;
+}
+
+/* Handle an incomplete WAD transfer: delete partial + all session WADs,
+ * show error screen, wait for Circle.  Returns -2 to signal exit. */
+static int handle_wad_truncation(struct ps_ctx *c,
+                                 const char *partial_path,
+                                 const char *name,
+                                 u64 got, u64 total) {
+    udp_log("DoomPS: WAD truncated, deleting + error\n");
+
+    /* Delete the partial file. */
+    if (c->unlink_fn)
+        NC(c->G, c->unlink_fn, (u64)partial_path, 0,0,0,0,0);
+
+    /* Delete every previously-completed WAD this session. */
+    for (int i = 0; i < g_wad_count; i++) {
+        if (c->unlink_fn)
+            NC(c->G, c->unlink_fn, (u64)g_wads[i].path, 0,0,0,0,0);
+    }
+    g_wad_count  = 0;
+    g_wad_cursor = 0;
+    g_wad_scroll = 0;
+
+    char msg[128];
+    build_truncation_msg(msg, sizeof(msg), name, got, total);
+
+    show_error_and_hang(c, "WAD TRANSFER INCOMPLETE", msg);
+    return -2;
+}
+
 static int recv_wads(s32 listen_fd) {
     struct ps_ctx *c = &g_ctx;
     if (listen_fd < 0) return -1;
@@ -590,20 +661,34 @@ static int recv_wads(s32 listen_fd) {
                              (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client < 0) break;
 
+        /* v55: reduced from 30 s → 5 s so stalls are detected quickly. */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
-            *(u64 *)(tv + 0) = 30;
+            *(u64 *)(tv + 0) = WAD_RECV_TIMEOUT_SEC;
             *(u64 *)(tv + 8) = 0;
             (void)NC(c->G, c->setsockopt_fn,
                      (u64)client, 0xFFFF, 0x1006, (u64)tv, 16, 0);
         }
 
         u8 hdr[10]; s32 got = 0;
+        int hdr_retries = 0;
         while (got < 10) {
             s32 n = (s32)NC(c->G, c->recv_fn, (u64)client,
                             (u64)(hdr + got), (u64)(10 - got), 0,0,0);
-            if (n <= 0) { NC(c->G, c->close_fn, (u64)client,0,0,0,0,0); goto done; }
-            got += n;
+            if (n > 0) {
+                got += n;
+                hdr_retries = 0;
+            } else if (n == 0) {
+                NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
+                goto done;
+            } else {
+                hdr_retries++;
+                if (hdr_retries > WAD_RECV_MAX_RETRIES) {
+                    udp_log("DoomPS: header stall, aborting\n");
+                    NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
+                    goto done;
+                }
+            }
         }
         u64 wad_size = 0;
         for (int i = 0; i < 8; i++) wad_size |= ((u64)hdr[i] << (i * 8));
@@ -612,11 +697,24 @@ static int recv_wads(s32 listen_fd) {
 
         char name[64];
         got = 0;
+        int name_retries = 0;
         while (got < namelen) {
             s32 n = (s32)NC(c->G, c->recv_fn, (u64)client,
                             (u64)(name + got), (u64)(namelen - got), 0,0,0);
-            if (n <= 0) { NC(c->G, c->close_fn, (u64)client,0,0,0,0,0); goto done; }
-            got += n;
+            if (n > 0) {
+                got += n;
+                name_retries = 0;
+            } else if (n == 0) {
+                NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
+                goto done;
+            } else {
+                name_retries++;
+                if (name_retries > WAD_RECV_MAX_RETRIES) {
+                    udp_log("DoomPS: name stall, aborting\n");
+                    NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
+                    goto done;
+                }
+            }
         }
         name[namelen] = 0;
         if (name[0] == 0) ps_strcpy(name, "UNKNOWN.WAD");
@@ -642,7 +740,11 @@ static int recv_wads(s32 listen_fd) {
         u64 remaining = wad_size;
         int last_pct = -1;
         show_wad_progress(c, name, 0, wad_size);
+
+        /* v55: stall detection.  Any successful recv resets the counter.
+         * WAD_RECV_MAX_RETRIES consecutive timeouts = sender stalled. */
         int retries = 0;
+        int stalled = 0;
         while (remaining > 0) {
             u64 want = remaining < WAD_CHUNK ? remaining : WAD_CHUNK;
             s32 n = (s32)NC(c->G, c->recv_fn, (u64)client,
@@ -657,18 +759,26 @@ static int recv_wads(s32 listen_fd) {
                     show_wad_progress(c, name, wad_size - remaining, wad_size);
                     last_pct = pct;
                 }
-            } else if (n == 0) break;
-            else {
+            } else if (n == 0) {
+                udp_log("DoomPS: sender closed early\n");
+                break;
+            } else {
                 retries++;
-                if (retries > 30) break;
+                if (retries > WAD_RECV_MAX_RETRIES) {
+                    udp_log("DoomPS: sender stalled\n");
+                    stalled = 1;
+                    break;
+                }
             }
         }
         NC(c->G, c->kclose, (u64)fd, 0,0,0,0,0);
         NC(c->G, c->close_fn, (u64)client,0,0,0,0,0);
 
         if (remaining > 0) {
-            udp_log("DoomPS: WAD truncated, skipping\n");
-            continue;
+            /* v55: partial WAD.  Delete + error + exit to Lua. */
+            (void)stalled;
+            return handle_wad_truncation(c, path, name,
+                                         wad_size - remaining, wad_size);
         }
 
         ps_strcpy(g_wads[g_wad_count].name, name);
@@ -787,7 +897,7 @@ static int show_wad_menu(struct ps_ctx *c) {
 }
 
 /* ============================================================
- * reset_doom_globals
+ * reset_doom_globals — wipe Doom's BSS (ours lives in .ps_persist).
  * ============================================================ */
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
@@ -870,8 +980,6 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 150000, 0,0,0,0,0);
 
-    /* v54: if the error screen asked us to bail out entirely, skip the
-     * reset and let _start break out of the session loop. */
     if (g_force_exit) {
         udp_log("DoomPS: forcing exit to Lua\n");
         return;
@@ -1068,13 +1176,20 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     s32 tcp_listen_fd = (s32)ext->dbg[0];
     ext->step = 36;
 
-    recv_wads(tcp_listen_fd);
+    int wad_result = recv_wads(tcp_listen_fd);
     ext->step = 37;
+
+    if (wad_result == -2) {
+        /* v55: transfer was cut off, error screen already shown,
+         * all WADs deleted.  User pressed O.  Exit to Lua. */
+        udp_log("DoomPS: exiting due to WAD error\n");
+        goto cleanup;
+    }
 
     if (g_wad_count == 0) {
         if (show_error_and_hang(c, "No WAD files received",
                                 "Send .wad files from the PC launcher") < 0) {
-            goto cleanup;   /* v54: user asked to exit to Lua */
+            goto cleanup;
         }
     }
 
@@ -1085,7 +1200,7 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int sel = show_wad_menu(c);
         if (sel < 0) break;
         run_doom(c, sel);
-        if (g_force_exit) break;   /* v54: error screen exit */
+        if (g_force_exit) break;
     }
 
 cleanup:
