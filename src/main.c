@@ -1,26 +1,30 @@
 /*
- * doom-ps/src/main.c — v47
+ * doom-ps/src/main.c — v48
+ *
+ * v48:
+ *   - AUDIO: sleep is now 3/4 of a buffer duration (16 ms) instead of
+ *     (21.333 - 0.2) ms.  The previous value left us ~2% slower than
+ *     the 46.87 Hz hardware drain rate, causing occasional buffer
+ *     underruns → music/SFX cut-outs.  3/4 gives ~62 submits/sec
+ *     (33% headroom) and eliminates the underruns.
+ *   - WAD SWITCH: after Doom exits we now zero the ENTIRE BSS before
+ *     returning to the menu.  Doom's D_DoomMain is not reentrant —
+ *     lumps, textures, and level caches survive between calls and
+ *     corrupt the second session (W_CacheLumpNum: N >= numlumps).
+ *     Zeroing BSS wipes Doom's globals.  We save our own state
+ *     (g_ctx, g_wads, cursor) and ps_libc's state (fn pointers, pool)
+ *     on the stack first, then restore them.
  *
  * v47:
- *   - FIXED: audio thread was never started.  In v46 I moved the
- *     pthread_create() call from _start() to the *tail* of run_doom(),
- *     which only runs after Doom exits — so during the entire Doom
- *     session nothing called I_SubmitSound() and the speakers were
- *     silent.  Thread start is now at the *beginning* of run_doom(),
- *     before doomgeneric_Create().  Thread stop stays at the tail.
+ *   - Start audio thread at the BEGINNING of run_doom (was at tail,
+ *     which meant it never ran during the game).
  *
  * v46:
- *   - Menu: 7 visible rows, no wrap-around scrolling.
- *   - Audio thread rate-limited with sceKernelUsleep (~21 ms/buffer).
+ *   - Menu: 7 visible rows, no wrap-around.
  *
- * v45:
- *   - recv_wads() polls the listen socket so it can time out.
- *
- * v44:
- *   - Reset key queue + pad_prev between Doom sessions.
- *
- * v43:
- *   - WAD path trailing slash fix (pi 24 → 25).
+ * v45: poll() before accept() in recv_wads.
+ * v44: reset key queue + pad_prev between Doom sessions.
+ * v43: WAD path trailing-slash fix (pi 24 → 25).
  */
 
 #include "core.h"
@@ -35,6 +39,12 @@ extern void  free(void *p);
 extern void  ps_libc_set_error_cb(void (*cb)(const char *msg));
 extern void  I_SubmitSound(void);
 extern int   mkdir(const char *path, unsigned int mode);
+
+/* v48: libc state save/restore across BSS clear */
+extern void ps_libc_save(void *buf);
+extern void ps_libc_restore(const void *buf);
+extern void ps_libc_reset_pool(void);
+#define PS_LIBC_SAVE_SIZE 256
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -360,20 +370,18 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 }
 
 /*
- * Audio thread — rate-limited so it doesn't spin a CPU core.
+ * v48 — audio thread.
  *
- * sceAudioOutOutput on PS5 returns quickly instead of blocking until
- * the previous buffer has drained, so calling it in a tight loop
- * hammers the kernel and starves the main Doom render loop.  Sleep
- * slightly less than one buffer duration (1024/48000 = 21.33 ms)
- * between submits so the hardware queue stays full without wasting
- * CPU.
+ * Sleep 3/4 of one buffer duration (16 ms for 1024 @ 48 kHz).  This
+ * keeps the hardware queue ahead of the drain even when the mixing
+ * pass takes ~0.5 ms.  Submits ~62 times/sec vs. the 46.87/sec drain
+ * rate → 33% headroom → no underruns, no clicks, no cuts.
  */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
     struct ps_ctx *c = &g_ctx;
-    const u64 buf_us = ((u64)SAMPLES_PER_BUF * 1000000ULL) / SAMPLE_RATE - 200;
+    const u64 buf_us = ((u64)SAMPLES_PER_BUF * 1000000ULL) / SAMPLE_RATE * 3 / 4;
     while (g_audio_thread_running) {
         I_SubmitSound();
         if (c->usleep_fn)
@@ -475,8 +483,8 @@ static int wait_readable(struct ps_ctx *c, s32 fd, int wait_ms) {
     if (!c->poll_fn) return -1;
     u8 pfd[8];
     *(s32*)(pfd + 0) = fd;
-    *(u16*)(pfd + 4) = 0x0001;   /* POLLIN  */
-    *(u16*)(pfd + 6) = 0;        /* revents */
+    *(u16*)(pfd + 4) = 0x0001;
+    *(u16*)(pfd + 6) = 0;
     s32 pr = (s32)NC(c->G, c->poll_fn,
                      (u64)pfd, 1, (u64)(s64)wait_ms, 0, 0, 0);
     if (pr < 0) return -1;
@@ -635,12 +643,8 @@ static int show_wad_menu(struct ps_ctx *c) {
         u32 ch = raw ^ (u32)prev_btn;
         prev_btn = raw;
 
-        if (ch & DS_UP) {
-            if (g_wad_cursor > 0) g_wad_cursor--;
-        }
-        if (ch & DS_DOWN) {
-            if (g_wad_cursor < g_wad_count - 1) g_wad_cursor++;
-        }
+        if (ch & DS_UP)   { if (g_wad_cursor > 0) g_wad_cursor--; }
+        if (ch & DS_DOWN) { if (g_wad_cursor < g_wad_count - 1) g_wad_cursor++; }
 
         if (g_wad_cursor < g_wad_scroll) {
             g_wad_scroll = g_wad_cursor;
@@ -704,7 +708,48 @@ static int show_wad_menu(struct ps_ctx *c) {
 }
 
 /* ============================================================
- * run_doom — start audio thread FIRST, then run Doom.
+ * v48: reset all Doom globals between sessions.
+ *
+ * Doom's code is linked into our binary, so its globals live in the
+ * same BSS range as ours.  Zeroing BSS wipes Doom's state (lumps,
+ * textures, caches) which is exactly what we need for the second
+ * D_DoomMain call.  But it also wipes our own state and ps_libc's
+ * state, so we snapshot those to the stack first and restore after.
+ * ============================================================ */
+static void reset_doom_globals(void) {
+    u8 libc_save[PS_LIBC_SAVE_SIZE];
+    ps_libc_save(libc_save);
+
+    struct ps_ctx saved_ctx = g_ctx;
+    struct wad_entry saved_wads[MAX_WADS];
+    ps_memcpy(saved_wads, g_wads, sizeof(saved_wads));
+    int saved_count  = g_wad_count;
+    int saved_cursor = g_wad_cursor;
+    int saved_scroll = g_wad_scroll;
+
+    /* Wipe every static byte in the binary. */
+    volatile char *p = __bss_start;
+    while (p < __bss_end) *p++ = 0;
+
+    /* Restore our own state. */
+    g_ctx = saved_ctx;
+    ps_memcpy(g_wads, saved_wads, sizeof(saved_wads));
+    g_wad_count  = saved_count;
+    g_wad_cursor = saved_cursor;
+    g_wad_scroll = saved_scroll;
+
+    /* Restore ps_libc's state (fn pointers, pool, log config). */
+    ps_libc_restore(libc_save);
+
+    /* Reuse the same 64 MB pool for the next Doom session — otherwise
+     * every restart leaks a fresh one. */
+    ps_libc_reset_pool();
+
+    udp_log("DoomPS: doom globals reset\n");
+}
+
+/* ============================================================
+ * run_doom — start audio thread FIRST, run Doom, then reset state.
  * ============================================================ */
 
 static void run_doom(struct ps_ctx *c, int wad_idx) {
@@ -719,7 +764,7 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     ps_strcpy(c->wad_path, g_wads[wad_idx].path);
     udp_log("DoomPS: launching doom\n");
 
-    /* ---- v47 FIX: start audio thread BEFORE Doom runs ---- */
+    /* Start audio thread BEFORE Doom runs. */
     if (c->audio_h >= 0 && c->aud_out) {
         void *pthread_create = SYM(c->G, c->D, LIBKERNEL_HANDLE,
                                    "scePthreadCreate");
@@ -760,6 +805,9 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
+
+    /* v48: wipe Doom's globals so the next session starts clean. */
+    reset_doom_globals();
 }
 
 __attribute__((section(".text._start")))
@@ -937,6 +985,8 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
         int sel = show_wad_menu(c);
         if (sel < 0) break;
         run_doom(c, sel);
+        /* run_doom calls reset_doom_globals() on exit, so Doom's
+         * state is clean and the loop can safely pick another WAD. */
     }
 
     delete_all_wads();
