@@ -1,11 +1,15 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
+ * v16b:
+ *   - Fixed fseek: NC takes exactly 8 args (gadget, fn, a1..a6), the
+ *     v16 draft had 9.  Build now compiles.
+ *
  * v16:
  *   - fopen now reads the file in 1 MB chunks.  A single
- *     sceKernelRead of 12.4 MB was silently failing partway on
- *     PS5, leaving f->size < real file size.  Doom's fread past
- *     f->size returned 0, and Doom used the stale Z_Alloc buffer.
+ *     sceKernelRead of 12.4 MB was silently failing partway on PS5,
+ *     leaving f->size < real file size.  Doom's fread past f->size
+ *     returned 0, and Doom used the stale Z_Alloc buffer.
  *   - fopen now KEEPS THE FD OPEN (previously it closed after
  *     caching).  If Doom uses its own lseek+read on wad_file->handle,
  *     the fd is valid.
@@ -14,6 +18,7 @@
  *     missing or the position is past the cached size.
  *   - ps_libc_close_all_files() added (called from main.c before the
  *     BSS wipe).
+ *   - Pool 128 MB max (was 64 MB) for more headroom.
  *
  * v15: PS_PERSIST markers for state that survives the BSS wipe.
  * v14: ps_libc_save / ps_libc_restore / ps_libc_reset_pool.
@@ -88,7 +93,7 @@ void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa) {
 }
 
 /* ============================================================
- * vsnprintf engine (unchanged from v14)
+ * vsnprintf engine
  * ============================================================ */
 typedef struct {
     char *buf;
@@ -370,7 +375,7 @@ static void *try_mmap_pool(u64 size) {
 
 static void pool_init(void) {
     static const u64 sizes[] = {
-        128ULL*1024*1024,   /* v16: 128 MB to give more headroom */
+        128ULL*1024*1024,
         64ULL*1024*1024,
         48ULL*1024*1024,
         32ULL*1024*1024,
@@ -696,7 +701,7 @@ static int __errno_val = 0;
 int *__errno_location(void) { return &__errno_val; }
 
 /* ============================================================
- * stdio — v16 with chunked reads and persistent fd
+ * stdio — v16b with chunked reads and persistent fd
  * ============================================================ */
 struct _ps_file {
     int fd;
@@ -893,9 +898,10 @@ int fseek(FILE *f, long off, int whence) {
     else if (whence == 1) f->pos += off;
     else if (whence == 2) f->pos = f->size + off;
 
-    /* v16: also seek the fd (Doom may use it directly). */
+    /* v16b: also seek the fd.  NC takes exactly 8 args
+     * (gadget, fn, a1, a2, a3, a4, a5, a6). */
     if (f->fd > 0 && fn_klseek) {
-        NC(__G, fn_klseek, (u64)f->fd, (u64)off, (u64)whence, 0,0,0,0);
+        NC(__G, fn_klseek, (u64)f->fd, (u64)off, (u64)whence, 0, 0, 0);
     }
     return 0;
 }
@@ -1123,7 +1129,7 @@ void ps_libc_reset_pool(void) {
     if (__pool && __pool_size > 0) {
         size_t n = __pool_used;
         if (n > __pool_size) n = __pool_size;
-        if (n > 32768) n = 32768;   /* only zero the first 32 KB */
+        if (n > 32768) n = 32768;
         for (size_t i = 0; i < n; i++) __pool[i] = 0;
     }
     __pool_used = 0;
