@@ -1,26 +1,32 @@
 /*
- * doom-ps/src/main.c — v45
+ * doom-ps/src/main.c — v46
+ *
+ * v46:
+ *   - MENU: 3 → 7 visible rows, no wrap-around scrolling.  Removed
+ *     the "cursor wrap" that made the viewport snap from the bottom
+ *     back up to the top (the "auto-scroll" glitch).  Cursor now
+ *     clamps at first/last WAD.  Viewport scrolls by exactly one row
+ *     when the cursor steps off the bottom or top of the visible
+ *     window — so pressing down on the 7th visible row slides the
+ *     list by one, dropping the old 1st row and revealing the next.
+ *   - AUDIO THREAD: rate-limited with sceKernelUsleep.  On PS5,
+ *     sceAudioOutOutput returns immediately when the buffer queue
+ *     has a free slot instead of blocking, so the audio thread was
+ *     spinning at ~100 submits/sec (2.15× the 47/sec playback rate)
+ *     and eating a whole CPU core.  That starved the main Doom loop
+ *     (11 fps instead of ~35) which is what made the music stutter
+ *     and cut out.  Now the thread sleeps one buffer duration
+ *     (~21.3 ms for 1024 samples @ 48 kHz) between submits.
  *
  * v45:
- *   - FIXED: recv_wads() hung forever after the last WAD because
- *     accept() on a blocking listen socket never returns if no new
- *     client arrives.  The 12-iteration retry loop with usleep was
- *     useless — SO_RCVTIMEO (0x1006) only affects recv(), not
- *     accept(), on PS5's kernel.  Now we poll() the listen socket
- *     with a timeout before each accept().  First client gets a 30 s
- *     window (Python sleeps wad_delay before connecting); subsequent
- *     clients get 3 s.  On poll timeout we break out of the accept
- *     loop and drop into the WAD menu.
- *   - Added poll_fn to struct ps_ctx, resolved in _start().
+ *   - recv_wads() uses poll() before accept() so it can time out
+ *     instead of blocking forever after the last WAD.
  *
  * v44:
- *   - Reset key queue + pad_prev at the end of run_doom() so a held
- *     button from the previous Doom session doesn't ghost-press into
- *     the WAD menu.
+ *   - Reset key queue + pad_prev at end of run_doom().
  *
  * v43:
- *   - FIXED: WAD path was missing the trailing slash.  Changed
- *     pi = 24 → pi = 25.
+ *   - WAD path trailing slash fix (pi 24 → 25).
  */
 
 #include "core.h"
@@ -136,7 +142,7 @@ static struct ps_ctx {
     void *kopen, *kwrite, *kclose, *clock_gettime;
     void *accept_fn, *recv_fn, *close_fn, *sendto_fn, *setsockopt_fn, *cancel;
     void *unlink_fn;
-    void *poll_fn;                                   /* v45 */
+    void *poll_fn;
     void *vid_open, *vid_close, *vid_reg, *vid_flip, *vid_rate, *vid_evt;
     s32   video_h;
     void *vmem;
@@ -359,10 +365,31 @@ void dg_audio_callback(const short *pcm, int sample_count) {
     NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
 }
 
+/*
+ * v46 — audio thread.
+ *
+ * sceAudioOutOutput on PS5 returns quickly when there's a free slot in
+ * the hardware buffer queue instead of blocking until the previous
+ * buffer finishes playing.  Without rate-limiting, this loop spun at
+ * ~100 submits/sec (2.15× the 47/sec playback rate), burning an entire
+ * CPU core and starving the main Doom loop, which dropped to ~11 fps.
+ *
+ * Now we sleep one buffer duration between submits.  SAMPLES_PER_BUF /
+ * SAMPLE_RATE = 1024 / 48000 = 21.33 ms.  Sleep for the full duration
+ * so the hardware has time to drain; if we underrun slightly, no big
+ * deal.
+ */
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
-    while (g_audio_thread_running) I_SubmitSound();
+    struct ps_ctx *c = &g_ctx;
+    /* buffer duration in microseconds (integer, slightly under true value) */
+    const u64 buf_us = ((u64)SAMPLES_PER_BUF * 1000000ULL) / SAMPLE_RATE - 200;
+    while (g_audio_thread_running) {
+        I_SubmitSound();
+        if (c->usleep_fn)
+            NC(c->G, c->usleep_fn, buf_us, 0,0,0,0,0);
+    }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
 }
@@ -455,13 +482,6 @@ static void delete_all_wads(void) {
 
 #define WAD_CHUNK 4096
 
-/*
- * Wait for the listen socket to become readable, up to wait_ms.
- * Returns 1 if readable, 0 on timeout, -1 if poll unavailable/failed.
- *
- * struct pollfd on x86_64 FreeBSD: int fd; short events; short revents;
- * POLLIN = 0x0001.
- */
 static int wait_readable(struct ps_ctx *c, s32 fd, int wait_ms) {
     if (!c->poll_fn) return -1;
     u8 pfd[8];
@@ -486,18 +506,11 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        /* v45 — first client gets a generous window (Python sleeps
-         * wad_delay ~2s after shellcode send); subsequent clients get
-         * a short window (Python reconnects immediately after each
-         * WAD).  On timeout we break and drop into the menu. */
         int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
 
         int ready = wait_readable(c, listen_fd, wait_ms);
         if (ready <= 0) {
             if (ready < 0) {
-                /* poll unavailable — fall back to a single blocking
-                 * accept.  Only happens if poll_fn failed to resolve,
-                 * which shouldn't occur on PS5. */
                 udp_log("DoomPS: WARN poll unavailable, blocking accept\n");
             } else {
                 udp_log("DoomPS: accept window elapsed\n");
@@ -510,8 +523,6 @@ static int recv_wads(s32 listen_fd) {
                              (u64)listen_fd, (u64)peer, (u64)&plen, 0,0,0);
         if (client < 0) break;
 
-        /* 30-second recv timeout on the accepted client so a stalled
-         * transfer can't wedge the loop. */
         if (c->setsockopt_fn) {
             u8 tv[16] = {0};
             *(u64 *)(tv + 0) = 30;
@@ -543,8 +554,6 @@ static int recv_wads(s32 listen_fd) {
         name[namelen] = 0;
         if (name[0] == 0) ps_strcpy(name, "UNKNOWN.WAD");
 
-        /* "/av_contents/content_tmp/" = 25 chars (indices 0..24), so
-         * the filename goes at index 25. */
         char path[128];
         ps_strcpy(path, "/av_contents/content_tmp/");
         int pi = 25;
@@ -607,10 +616,22 @@ done:
     return g_wad_count;
 }
 
-#define MENU_VISIBLE 3
+/* ============================================================
+ * WAD menu — 7 visible rows, no wrap-around.
+ * ============================================================ */
+
+#define MENU_VISIBLE 7
+#define MENU_ROW_H   100
 
 static int show_wad_menu(struct ps_ctx *c) {
     int prev_btn = 0;
+
+    /* Keep cursor visible at entry. */
+    if (g_wad_cursor < g_wad_scroll)
+        g_wad_scroll = g_wad_cursor;
+    if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE)
+        g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
+    if (g_wad_scroll < 0) g_wad_scroll = 0;
 
     for (;;) {
         u32 raw = 0;
@@ -626,53 +647,80 @@ static int show_wad_menu(struct ps_ctx *c) {
         u32 ch = raw ^ (u32)prev_btn;
         prev_btn = raw;
 
+        /* Cursor movement — CLAMPED, no wrap-around.  This is what
+         * stops the viewport from jumping back to the top when the
+         * user reaches the last entry. */
         if (ch & DS_UP) {
-            g_wad_cursor--;
-            if (g_wad_cursor < 0) g_wad_cursor = g_wad_count - 1;
+            if (g_wad_cursor > 0) g_wad_cursor--;
         }
         if (ch & DS_DOWN) {
-            g_wad_cursor++;
-            if (g_wad_cursor >= g_wad_count) g_wad_cursor = 0;
+            if (g_wad_cursor < g_wad_count - 1) g_wad_cursor++;
         }
 
-        if (g_wad_cursor < g_wad_scroll) g_wad_scroll = g_wad_cursor;
-        if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE)
+        /* Viewport follows cursor by exactly one row when the cursor
+         * steps off the bottom or top of the visible window.  This
+         * gives the "scroll by one, drop the top, reveal the bottom"
+         * behaviour the user asked for. */
+        if (g_wad_cursor < g_wad_scroll) {
+            g_wad_scroll = g_wad_cursor;
+        } else if (g_wad_cursor >= g_wad_scroll + MENU_VISIBLE) {
             g_wad_scroll = g_wad_cursor - MENU_VISIBLE + 1;
-        if (g_wad_scroll < 0) g_wad_scroll = 0;
+        }
 
         if (ch & DS_CIRCLE) return -1;
         if (ch & DS_CROSS)  return g_wad_cursor;
 
+        /* ---- draw ---- */
         u32 *fb = (u32 *)c->fbs[c->active_fb];
         for (int i = 0; i < SCR_W * SCR_H; i++) fb[i] = 0xFF101018;
 
-        ps_draw_str_center(fb, 60, "DOOM-PS", 0xFFFFAA00, 6);
-        ps_draw_str_center(fb, 140, "SELECT WAD", 0xFF808080, 4);
-        int list_y = 260;
-        int row_h = 100;
+        ps_draw_str_center(fb, 25, "DOOM-PS", 0xFFFFAA00, 6);
+        ps_draw_str_center(fb, 95, "SELECT WAD", 0xFF808080, 4);
+
+        int list_y = 180;
+        int row_h  = MENU_ROW_H;
+
+        /* "more above" hint */
+        if (g_wad_scroll > 0) {
+            ps_draw_str_center(fb, list_y - 30,
+                               "^ MORE ^", 0xFF505050, 3);
+        }
+
         for (int i = 0; i < MENU_VISIBLE; i++) {
             int idx = g_wad_scroll + i;
             if (idx >= g_wad_count) break;
             int y = list_y + i * row_h;
             int sel = (idx == g_wad_cursor);
             if (sel) {
-                ps_fill_rect(fb, 120, y - 20, SCR_W - 240, 80, 0xFFFFAA00);
+                ps_fill_rect(fb, 80, y - 15, SCR_W - 160, 76, 0xFFFFAA00);
                 ps_draw_str_center(fb, y, g_wads[idx].name, 0xFF000000, 5);
             } else {
                 ps_draw_str_center(fb, y, g_wads[idx].name, 0xFFFFFFFF, 5);
             }
         }
 
-        char counter[24]; int cp = 0;
-        if (g_wad_cursor + 1 >= 10) counter[cp++] = '0' + (g_wad_cursor + 1) / 10;
-        counter[cp++] = '0' + (g_wad_cursor + 1) % 10;
-        counter[cp++] = '/';
-        if (g_wad_count >= 10) counter[cp++] = '0' + g_wad_count / 10;
-        counter[cp++] = '0' + g_wad_count % 10;
-        counter[cp] = 0;
-        ps_draw_str_center(fb, SCR_H - 180, counter, 0xFF808080, 3);
+        /* "more below" hint */
+        if (g_wad_scroll + MENU_VISIBLE < g_wad_count) {
+            int y = list_y + MENU_VISIBLE * row_h;
+            ps_draw_str_center(fb, y, "v MORE v", 0xFF505050, 3);
+        }
 
-        ps_draw_str_center(fb, SCR_H - 100, "X = SELECT   O = QUIT", 0xFF909090, 3);
+        /* counter  e.g.  3/12 */
+        char counter[24]; int cp = 0;
+        int cur = g_wad_cursor + 1;
+        if (cur >= 100) counter[cp++] = '0' + (cur / 100) % 10;
+        if (cur >= 10)  counter[cp++] = '0' + (cur / 10) % 10;
+        counter[cp++] = '0' + cur % 10;
+        counter[cp++] = '/';
+        int tot = g_wad_count;
+        if (tot >= 100) counter[cp++] = '0' + (tot / 100) % 10;
+        if (tot >= 10)  counter[cp++] = '0' + (tot / 10) % 10;
+        counter[cp++] = '0' + tot % 10;
+        counter[cp] = 0;
+        ps_draw_str_center(fb, SCR_H - 110, counter, 0xFF808080, 3);
+
+        ps_draw_str_center(fb, SCR_H - 50, "X = SELECT   O = QUIT",
+                           0xFF909090, 3);
 
         present(c);
         if (c->usleep_fn) NC(c->G, c->usleep_fn, 16000, 0,0,0,0,0);
@@ -704,8 +752,7 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     g_audio_thread_running = 0;
     if (c->usleep_fn) NC(c->G, c->usleep_fn, 200000, 0,0,0,0,0);
 
-    /* v44 — wipe input state so a held button from the previous Doom
-     * session doesn't ghost-press into the WAD menu. */
+    /* wipe input state */
     c->key_wp   = 0;
     c->key_rp   = 0;
     c->pad_prev = 0;
@@ -719,6 +766,18 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
     if (c->pad_geth)
         c->pad_h = (s32)NC(c->G, c->pad_geth,
                            (u64)c->user_id, 0, 0, 0, 0, 0);
+
+    /* Restart the audio thread for the next session. */
+    if (c->audio_h >= 0 && c->aud_out) {
+        void *pthread_create = SYM(c->G, c->D, LIBKERNEL_HANDLE,
+                                   "scePthreadCreate");
+        if (pthread_create) {
+            u64 th = 0;
+            g_audio_thread_running = 1;
+            NC(c->G, pthread_create, (u64)&th, 0,
+               (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
+        }
+    }
 }
 
 __attribute__((section(".text._start")))
@@ -771,11 +830,9 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->recv_fn       = SYM(G, D, LIBKERNEL_HANDLE, "recv");
     c->close_fn      = SYM(G, D, LIBKERNEL_HANDLE, "close");
     c->setsockopt_fn = SYM(G, D, LIBKERNEL_HANDLE, "setsockopt");
-    c->poll_fn       = SYM(G, D, LIBKERNEL_HANDLE, "poll");      /* v45 */
-    if (!c->poll_fn)
-        udp_log("DoomPS: WARN poll() not resolved\n");
-    else
-        udp_log("DoomPS: [10] poll OK\n");
+    c->poll_fn       = SYM(G, D, LIBKERNEL_HANDLE, "poll");
+    if (!c->poll_fn) udp_log("DoomPS: WARN poll() not resolved\n");
+    else             udp_log("DoomPS: [10] poll OK\n");
     udp_log("DoomPS: [10] sockets\n"); ext->step = 10;
 
     mkdir("./.savegame", 0777);
@@ -815,111 +872,3 @@ void _start(u64 eboot_base, u64 dlsym_addr, struct ext_args *ext) {
     c->pad_init_fn = SYM(c->G, c->D, pad_mod, "scePadInit");
     c->pad_geth    = SYM(c->G, c->D, pad_mod, "scePadGetHandle");
     c->pad_read    = SYM(c->G, c->D, pad_mod, "scePadRead");
-    ext->step = 19;
-
-    if (c->cancel) {
-        u64 gs = *(u64 *)(eboot_base + EBOOT_GS_THREAD);
-        if (gs) NC(c->G, c->cancel, gs, 0,0,0,0,0);
-    }
-    NC(c->G, c->usleep_fn, 300000, 0,0,0,0,0);
-    ext->step = 20;
-
-    s32 emu_vid = *(s32 *)(eboot_base + EBOOT_VIDOUT);
-    if (c->vid_close && emu_vid >= 0)
-        NC(c->G, c->vid_close, (u64)emu_vid, 0,0,0,0,0);
-    NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
-    ext->step = 21;
-
-    c->video_h = (s32)NC(c->G, c->vid_open, 0xFF, 0, 0, 0, 0, 0);
-    if (c->video_h < 0) { ext->status = -10; ext->step = 22; return; }
-    ext->step = 23;
-
-    if (c->create_eq) NC(c->G, c->create_eq, (u64)&c->eq, (u64)"doomq",0,0,0,0);
-    if (c->vid_evt && c->eq)
-        NC(c->G, c->vid_evt, c->eq, (u64)c->video_h,0,0,0,0);
-    ext->step = 24;
-
-    u64 mem_total = c->dm_size ? NC(c->G, c->dm_size,0,0,0,0,0,0) : 0x300000000ULL;
-    u64 phys = 0;
-    NC(c->G, c->alloc_dm, 0, mem_total, FB_TOTAL, 0x200000, 3, (u64)&phys);
-    ext->step = 25;
-    c->vmem = 0;
-    NC(c->G, c->map_dm, (u64)&c->vmem, FB_TOTAL, 0x33, 0, phys, 0x200000);
-    if (!c->vmem) { ext->status = -21; ext->step = 26; return; }
-    ext->step = 27;
-
-    c->fbs[0] = c->vmem;
-    c->fbs[1] = (u8 *)c->vmem + FB_ALIGNED;
-    for (int i = 0; i < SCR_W * SCR_H; i++) {
-        ((u32 *)c->fbs[0])[i] = 0xFF000000;
-        ((u32 *)c->fbs[1])[i] = 0xFF000000;
-    }
-    ext->step = 28;
-
-    u8 attr[64]; ps_memset(attr, 0, 64);
-    *(u32*)(attr+0) = 0x80000000; *(u32*)(attr+4) = 1;
-    *(u32*)(attr+12) = SCR_W; *(u32*)(attr+16) = SCR_H; *(u32*)(attr+20) = SCR_W;
-    if (NC(c->G, c->vid_reg, (u64)c->video_h, 0, (u64)c->fbs, 2, (u64)attr, 0) != 0) {
-        ext->status = -30; ext->step = 30; return;
-    }
-    ext->step = 31;
-    if (c->vid_rate) NC(c->G, c->vid_rate, (u64)c->video_h, 0,0,0,0,0);
-
-    show_loading(c, 0, "Doom-PS starting up");
-    ps_libc_set_error_cb(ps_error_display);
-    ext->step = 33;
-
-    if (c->aud_close)
-        for (int h = 0; h < 8; h++)
-            NC(c->G, c->aud_close, (u64)h,0,0,0,0,0);
-    if (c->aud_open)
-        c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
-                             SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
-    ext->step = 34;
-    if (c->pad_init_fn) NC(c->G, c->pad_init_fn, 0,0,0,0,0,0);
-    if (c->pad_geth)
-        c->pad_h = (s32)NC(c->G, c->pad_geth, (u64)c->user_id, 0,0,0,0,0);
-    ext->step = 35;
-
-    s32 tcp_listen_fd = (s32)ext->dbg[0];
-    ext->step = 36;
-
-    recv_wads(tcp_listen_fd);
-    ext->step = 37;
-
-    if (g_wad_count == 0) {
-        show_error_and_hang(c, "No WAD files received",
-                            "Send .wad files from the PC launcher");
-    }
-
-    if (c->audio_h >= 0 && c->aud_out) {
-        void *pthread_create = SYM(G, D, LIBKERNEL_HANDLE, "scePthreadCreate");
-        if (pthread_create) {
-            u64 th = 0;
-            g_audio_thread_running = 1;
-            NC(c->G, pthread_create, (u64)&th, 0,
-               (u64)audio_thread_fn, 0, (u64)"doom_audio", 0);
-        }
-    }
-
-    ext->step = 38;
-
-    while (1) {
-        int sel = show_wad_menu(c);
-        if (sel < 0) break;
-        run_doom(c, sel);
-    }
-
-    delete_all_wads();
-
-    if (c->usleep_fn) NC(c->G, c->usleep_fn, 100000, 0,0,0,0,0);
-    if (c->aud_close && c->audio_h >= 0)
-        NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
-    if (c->vid_close && c->video_h >= 0)
-        NC(c->G, c->vid_close, (u64)c->video_h, 0,0,0,0,0);
-    if (c->delete_eq && c->eq)
-        NC(c->G, c->delete_eq, c->eq, 0,0,0,0,0);
-    ext->status = 0;
-    ext->step = 99;
-    udp_log("DoomPS: cleanup done, returning to Lua\n");
-}
