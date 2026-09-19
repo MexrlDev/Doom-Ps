@@ -1,6 +1,14 @@
 /*
  * i_sound_ps.c — Doom sound backend for PS4/PS5.
  *
+ * v26:
+ *   - I_InitSound: explicit zero of all channel fields (not just active/
+ *     releasing/fade) so session 2+ starts from a guaranteed clean state.
+ *     Also resets dbg_submit/dbg_event/dbg_note for fresh heartbeat logs.
+ *   - I_InitMusic: explicit reset of all MUS player state variables.
+ *     Belt-and-suspenders on top of the BSS wipe; the real fix is the
+ *     streaming fopen in ps_libc.c v16.
+ *
  * v25:
  *   - Diagnostic hex logging in I_RegisterSong: logs incoming length
  *     and first 8 bytes as hex, so we can see exactly what bytes Doom
@@ -343,10 +351,25 @@ void I_BindSoundVariables(void) {}
 
 void I_InitSound(boolean use_sfx_prefix) {
     (void)use_sfx_prefix;
-    for (int i = 0; i < NCHANNELS; i++)
-        channels[i].active = channels[i].releasing = channels[i].fade = 0;
+    /* Explicit zero — belt-and-suspenders on top of the BSS wipe, because
+     * a session-2 init should always start from a clean slate even if some
+     * compiler optimisation or linker-section quirk left stale bytes. */
+    for (int i = 0; i < NCHANNELS; i++) {
+        channels[i].active    = 0;
+        channels[i].releasing = 0;
+        channels[i].fade      = 0;
+        channels[i].data      = 0;
+        channels[i].pos       = 0;
+        channels[i].volume    = 0;
+        channels[i].pan       = 0;
+        channels[i].step      = 0;
+        channels[i].length    = 0;
+    }
     init_music_tables();
     g_mus_lpf = 0; g_out_lpf_l = 0; g_out_lpf_r = 0;
+    dbg_submit = 0;  /* reset counters so session 2 gets fresh heartbeat logs */
+    dbg_event  = 0;
+    dbg_note   = 0;
     if (snd_musicdevice == 0) snd_musicdevice = 3;
     log_num("I_InitSound: musicvol=", snd_musicvolume, "");
     log_num("I_InitSound: sfxvol=",   snd_sfxvolume,   "");
@@ -478,7 +501,18 @@ void I_PrecacheSounds(sfxinfo_t *sounds, int num_sounds) {
 
 void I_InitMusic(void) {
     init_music_tables();
-    g_mus_lpf = 0;
+    g_mus_lpf    = 0;
+    mus_data     = 0;
+    mus_len      = 0;
+    mus_pos      = 0;
+    mus_track_start = 0;
+    mus_track_end   = 0;
+    mus_loop     = 0;
+    mus_playing  = 0;
+    mus_is_mus   = 0;
+    mus_delay_us = 0;
+    mus_tick_acc = 0;
+    music_all_notes_off();
     log_str("I_InitMusic reached");
     log_str("I_InitMusic done");
 }
