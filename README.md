@@ -1,4 +1,5 @@
 # doom-ps
+* Can you give me [one more day](https://open.spotify.com/track/2n0XjGSB8TO42W8k1G1F3a?si=lJz4SXNZTRCM1W_LsohkyQ&utm_source=copy-link)..
 
 Doom (via [doomgeneric](https://github.com/ozkl/doomgeneric)) running as
 homebrew on PS4 / PS5 through the **Luac0re** shellcode loader.
@@ -22,7 +23,7 @@ doom-ps/
 │   └── ps_libc.c           freestanding libc (printf, malloc, fopen, etc.)
 ├── Makefile
 ├── linker.ld               base-0 single RWX segment (from EmuC0re)
-├── doom_launcher.lua       Luac0re payload (mirrors nes.lua)
+├── doom_launcher.lua       Luac0re payload
 ├── doom-luncher.py         launcher: streams shellcode + WAD over TCP
 ├── build.sh                one-shot clone + build
 └── .github/workflows/
@@ -72,7 +73,8 @@ python3 doom_launcher.py 192.168.1.50 /path/to/DOOM.WAD
 ### 2. Run the launcher from your phone
 1. make a folder and add the python in it and also put the bin in the same folder as the python, and put the wad in /wad folder. don’t forget to change the Python to ur ip, and put the wad file name you want to send
 2. Press the start button on either iPhone Pythonica, Android PyCode.
-   
+
+3. [Instructions on Pythonica & PyCode](https://github.com/MexrlDev/repo/tree/main/Mobile-Python-Tools#how-to-setup-the-scripts-in-this-folder)
 
 The launcher:
 
@@ -92,7 +94,7 @@ Shellcode writes the WAD to `/av_contents/content_tmp/doom.wad`
 | Button       | Action                    |
 |--------------|---------------------------|
 | D-Pad        | Move / turn               |
-| Cross ×      | Fire                      |
+| Cross ×      | Fire / Back (Doom menu)   |
 | Square □     | Use / open door           |
 | Triangle △   | Run (hold)                |
 | Circle ○     | Enter / confirm           |
@@ -134,7 +136,7 @@ different game, update these three constants in `src/core.h`:
 
 | WAD File | Game Title | Type | Notes |
 |---|---|---|---|
-| `DOOM1.WAD` | Doom Shareware | Shareware | Free to distribute. Contains Episode 1 only. |
+| `DOOM1.WAD` | Doom Shareware 1.9 | Shareware | Free to distribute. Contains Episode 1 only. |
 | `DOOM.WAD` | The Ultimate Doom | IWAD | Includes the original three episodes plus the fourth episode (Thy Flesh Consumed). |
 | `doom.wad` | Doom (Registered/Retail) | Retail | The original 3-episode release. |
 | `doom2.wad` | Doom II: Hell on Earth | Commercial | 32 levels, new weapons & enemies. |
