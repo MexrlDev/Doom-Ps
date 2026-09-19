@@ -154,6 +154,11 @@ different game, update these three constants in `src/core.h`:
 | `strife1.wad` | Strife | Commercial | RPG-flavored Doom engine game. |
 
 ---
+## Issues
+1. SFX + Music cutting but stable (if music is lowest muted in menu option > sound volume and kept SFX only it’ll work stable .
+2. switching from WAD to another via Quit Game in doom. switching to another WAD makes music doesn’t work for the new game BUTTT. SFX works so eh. fix it later max..
+
+---
 ## Credits
 
 * **MexrlDev** — Project Development
