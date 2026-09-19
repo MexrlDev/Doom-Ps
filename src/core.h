@@ -42,7 +42,7 @@ typedef signed char    s8;
  * which absorbs the scheduler jitter that was causing the cuts.
  * --------------------------------------------------------------- */
 #define SAMPLE_RATE      48000
-#define SAMPLES_PER_BUF  2048
+#define SAMPLES_PER_BUF  4096
 #define AUDIO_S16_STEREO 1
 
 struct ext_args {
