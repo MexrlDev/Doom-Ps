@@ -127,6 +127,7 @@ Shellcode writes the WAD to `/av_contents/content_tmp/doom.wad`
 | L1           | Load menu (F3)            |
 | R2           | Next weapon               |
 | L2           | Previous weapon           |
+| TouchPad     | Open Menu           |
 
 ---
 
@@ -140,20 +141,6 @@ different game, update these three constants in `src/core.h`:
 #define EBOOT_GS_THREAD  0x057F89B0
 #define EBOOT_VIDOUT     0x02d695d0
 ```
-
----
-
-## Troubleshooting
-
-| Symptom | Fix |
-|---------|-----|
-| Black screen | Check `EBOOT_VIDOUT` offset for your host game |
-| Crash on start | Check `EBOOT_GS_THREAD` — wrong thread cancel target |
-| WAD transfer stalls | Firewall blocking port 5000, or Lua not yet at `accept()` |
-| No sound | Look for `DoomPS: [34] audio up` in the UDP log — if it says `audio N/A`, `libSceAudioOut` failed to open |
-| Sound plays but no gunshots | Look for `Snd: start pistol` in the log. If absent, check `I_StartSound` in `i_sound_ps.c` |
-| Square doesn't open doors | Both original (`0xa2`) and Chocolate (`0x20`) key codes are sent — make sure you're within 64 units of the door and facing it |
-| Linker errors in CI | Clone layout changed — the Makefile auto-detects both flat (`doomgeneric/*.c`) and nested (`doomgeneric/doomgeneric/*.c`) layouts |
 
 ---
 # Doom-PS: Supported WAD List
