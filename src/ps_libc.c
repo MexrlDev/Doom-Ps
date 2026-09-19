@@ -1,6 +1,15 @@
 /*
  * ps_libc.c — minimal libc replacement for doom-ps.
  *
+ * v16: Streaming fopen for read-mode files: keep the kernel fd open and
+ *      read directly via klseek+kread at fread time.  Eliminates the pool-
+ *      buffer that was causing stale/wrong WAD data on session 2+ (the pool
+ *      is reset to offset 0 between sessions, but old bytes were still there
+ *      and could be read if kread returned short on the second fopen call).
+ *      Added ps_libc_close_all_files() to close leaked WAD fds before the
+ *      BSS wipe in reset_doom_globals().
+ *
+ * v16: (see above)
  * v15: Marked __G, __D, all fn_* pointers, __log_fd, __log_sa,
  *      __log_ready, __error_cb, __pool, __pool_size, __pool_used,
  *      stderr/stdout/stdin, and __null_file as PS_PERSIST so they
@@ -781,27 +790,15 @@ FILE *fopen(const char *path, const char *mode) {
     f->buf = 0;
 
     if (!writable) {
+        /* v16: Streaming mode — keep the fd open.
+         * We just grab the file size here.  All reads go through kread at
+         * fread() time (see below), so WAD data is always read fresh from
+         * the filesystem.  This eliminates the pool-buffer-aliasing bug that
+         * produced garbage music bytes on session 2+. */
         long sz = (long)NC(__G, fn_klseek, (u64)fd, 0, 2, 0,0,0);
-        NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);
-        if (sz < 0) sz = 0;
-        if (sz > 0) {
-            unsigned char *b = (unsigned char *)malloc((size_t)sz);
-            if (b) {
-                long total = 0;
-                while (total < sz) {
-                    s32 n = (s32)NC(__G, fn_kread, (u64)fd,
-                                    (u64)(b + total), (u64)(sz - total), 0,0,0);
-                    if (n <= 0) break;
-                    total += n;
-                }
-                f->buf = b;
-                f->size = total;
-            } else {
-                ps_libc_log("ps_libc: fopen READ malloc FAILED\n");
-            }
-        }
-        NC(__G, fn_kclose, (u64)fd, 0,0,0,0,0);
-        f->fd = -1;
+        NC(__G, fn_klseek, (u64)fd, 0, 0, 0,0,0);   /* rewind */
+        f->size = (sz > 0) ? sz : 0;
+        /* f->fd stays set to fd — fclose() will kclose() it */
     }
     return f;
 }
@@ -815,16 +812,36 @@ int fclose(FILE *f) {
 }
 
 size_t fread(void *ptr, size_t sz, size_t n, FILE *f) {
-    if (!f || !f->buf || sz == 0) return 0;
+    if (!f || sz == 0) return 0;
     size_t want = sz * n;
     long avail = f->size - f->pos;
     if (avail <= 0) return 0;
     if ((long)want > avail) want = (size_t)avail;
+
+    if (f->buf) {
+        /* Buffered path (write-mode files don't reach here; kept for compat) */
+        unsigned char *d = (unsigned char *)ptr;
+        unsigned char *s = f->buf + f->pos;
+        for (size_t i = 0; i < want; i++) d[i] = s[i];
+        f->pos += (long)want;
+        return want / sz;
+    }
+
+    /* Streaming path (v16): seek fd to f->pos then kread directly.
+     * Seeking before each read means multiple FILE handles on the same
+     * underlying file can interleave safely. */
+    if (f->fd < 0 || !fn_klseek || !fn_kread) return 0;
+    NC(__G, fn_klseek, (u64)f->fd, (u64)f->pos, 0, 0,0,0);  /* SEEK_SET */
+    long total = 0;
     unsigned char *d = (unsigned char *)ptr;
-    unsigned char *s = f->buf + f->pos;
-    for (size_t i = 0; i < want; i++) d[i] = s[i];
-    f->pos += (long)want;
-    return want / sz;
+    while ((size_t)total < want) {
+        s32 nr = (s32)NC(__G, fn_kread, (u64)f->fd,
+                         (u64)(d + total), (u64)(want - total), 0,0,0);
+        if (nr <= 0) break;
+        total += nr;
+    }
+    f->pos += total;
+    return (size_t)total / sz;
 }
 
 size_t fwrite(const void *ptr, size_t sz, size_t n, FILE *f) {
@@ -1072,4 +1089,25 @@ void ps_libc_restore(const void *buf) {
 
 void ps_libc_reset_pool(void) {
     __pool_used = 0;
+}
+
+/* v16: Close any kernel file descriptors held in __files[] that Doom left
+ * open when it exited via longjmp (ps_doom_exit_now).  Streaming fopen
+ * keeps the fd alive until an explicit fclose; without this call before the
+ * BSS wipe, the fds accumulate across sessions and sceKernelOpen eventually
+ * fails with EMFILE. */
+void ps_libc_close_all_files(void) {
+    if (!fn_kclose) return;
+    for (int i = 0; i < MAX_FILES; i++) {
+        /* fd == 0 → free slot (our convention).
+         * fd == -1 → old buffered-mode already-closed fd (safe to ignore).
+         * fd >= 1  → real kernel fd that needs closing. */
+        if (__files[i].fd > 0) {
+            NC(__G, fn_kclose, (u64)__files[i].fd, 0,0,0,0,0);
+            __files[i].fd  = 0;
+            __files[i].buf = 0;
+            __files[i].pos = 0;
+            __files[i].size = 0;
+        }
+    }
 }
