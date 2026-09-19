@@ -1,8 +1,5 @@
 # ============================================================
 # doom-ps/Makefile
-#
-# v26: -O3 + render doomgeneric at native 320x200 (was 640x400).
-#      4x fewer pixels to render, no downsampling, big FPS boost.
 # ============================================================
 
 DOOM_ROOT := doomgeneric
