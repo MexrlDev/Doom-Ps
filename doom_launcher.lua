@@ -1,15 +1,7 @@
 --[[
-  doom_launcher.lua — Luac0re payload for doom-ps (v10)
-
-  Fix: accept mmap() return if > 0x10000 (avoids Lua 5.3 signed-int
-       hex-literal wraparound bug on 0x8000000000000000).
-
-  Memory priority:
-    1. mmap(PROT_RWX, 1 MB)     ← primary
-    2. JIT with sizes >= 630 KB ← fallback
-  Dynamic port scan 5001..5020.
+  doom_launcher.lua — Luac0re payload for doom-ps
 --]]
-local PC_IP        = "192.168.1.2" -- PLZ..... put your ip here not the PS4/PS5 ip!
+local PC_IP        = "" -- PLZ..... put your ip here not the PS4/PS5 ip! .. examples.. (192.168.x.x)
 local LOG_PORT     = 9027
 local WAD_PORT     = 5000
 local SC_PORT_BASE = 5001
@@ -50,7 +42,7 @@ local SC_MIN    = 0x9A000
 local rw, rx    = 0, 0
 local SC_SIZE   = SC_TARGET
 
--- ---- mmap PRIMARY ---- (fixed comparison)
+-- ---- mmap PRIMARY ----
 do
     local PROT_RWX      = 0x7
     local MAP_PRIV_ANON = 0x1002
