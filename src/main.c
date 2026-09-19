@@ -1,5 +1,12 @@
 /*
- * doom-ps/src/main.c — v55c
+ * doom-ps/src/main.c — v56
+ *
+ * v56:
+ *   - ps_libc_close_all_files() before BSS wipe: closes leaked WAD fds from
+ *     streaming fopen so the kernel does not run out of file descriptors.
+ *   - WAD inter-file timeout 3000 → 1200 ms.
+ *   - Audio thread: clock_gettime pacing, targeting exactly 4096/48000 s
+ *     per submit so sceAudioOutOutput never under-submits.
  *
  * v55c:
  *   - Call ps_libc_reset_pool() in reset_doom_globals().  __pool_used
@@ -43,6 +50,7 @@ extern int   mkdir(const char *path, unsigned int mode);
 
 extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
 extern void ps_libc_reset_pool(void);
+extern void ps_libc_close_all_files(void);
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -457,8 +465,47 @@ void dg_audio_callback(const short *pcm, int sample_count) {
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
+    struct ps_ctx *c = &g_ctx;
+
+    /* Clock-paced submission.
+     * Target: exactly SAMPLES_PER_BUF / SAMPLE_RATE seconds between submits
+     * = 4096 / 48000 = 85333333 ns per submit.
+     *
+     * sceAudioOutOutput blocks when the hardware queue is full, providing
+     * coarse pacing.  The clock check is a safety net: if the queue has a
+     * free slot and Output returns early we don't spin and over-fill it,
+     * which would cause the queue to drain faster than we mix → underruns.
+     * We sleep 1 ms and re-check; worst-case latency added = 1 ms.
+     */
+    const u64 PERIOD_NS = (u64)SAMPLES_PER_BUF * 1000000000ULL / SAMPLE_RATE;
+    u64 next_ns = 0;
+
     while (g_audio_thread_running) {
-        I_SubmitSound();
+        if (c->clock_gettime) {
+            u64 ts[2] = {0, 0};
+            NC(c->G, c->clock_gettime, 4, (u64)ts, 0, 0, 0, 0);
+            u64 now_ns = ts[0] * 1000000000ULL + ts[1];
+
+            if (next_ns == 0 || now_ns >= next_ns) {
+                I_SubmitSound();
+                if (next_ns == 0) {
+                    next_ns = now_ns + PERIOD_NS;
+                } else {
+                    next_ns += PERIOD_NS;
+                    /* If we've fallen more than one period behind, resync
+                     * rather than trying to catch up (avoids burst submit). */
+                    if (now_ns > next_ns + PERIOD_NS)
+                        next_ns = now_ns + PERIOD_NS;
+                }
+            } else {
+                /* Not time yet — sleep 1 ms then recheck */
+                if (c->usleep_fn)
+                    NC(c->G, c->usleep_fn, 1000, 0, 0, 0, 0, 0);
+            }
+        } else {
+            /* clock_gettime unavailable: rely on sceAudioOutOutput blocking */
+            I_SubmitSound();
+        }
     }
     ps_sound_log("Audio: thread exiting\n");
     return 0;
@@ -619,7 +666,7 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
+        int wait_ms = (g_wad_count == 0) ? 30000 : 1200;
 
         int ready = wait_readable(c, listen_fd, wait_ms);
         if (ready <= 0) {
@@ -866,6 +913,12 @@ static int show_wad_menu(struct ps_ctx *c) {
 static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
+
+    /* v56: Close any kernel file descriptors that streaming fopen left open.
+     * Doom exits via longjmp (ps_doom_exit_now) and never calls fclose on
+     * its WAD handles.  If we don't close them here the fd table leaks one
+     * fd per session and kopen eventually returns -1 (EMFILE). */
+    ps_libc_close_all_files();
 
     volatile char *p = __bss_start;
     while (p < __bss_end) *p++ = 0;
