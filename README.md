@@ -12,6 +12,29 @@ and [doomgeneric](https://github.com/ozkl/doomgeneric) by [ozkl](https://github.
 
 ---
 
+# Project Photos
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MexrlDev/Doom-Ps/refs/heads/main/.photos/IMG_9446.jpeg" width="500">
+</p>
+
+<details>
+<summary>Show more pics</summary>
+
+<br>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MexrlDev/Doom-Ps/refs/heads/main/.photos/IMG_9444.jpeg" width="500">
+</p>
+
+<p align="center">
+  <img src="https://raw.githubusercontent.com/MexrlDev/Doom-Ps/refs/heads/main/.photos/IMG_9445.jpeg" width="500">
+</p>
+
+</details>
+
+---
+
 ## Files
 
 ```
