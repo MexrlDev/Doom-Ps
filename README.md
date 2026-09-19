@@ -1,5 +1,5 @@
 # doom-ps
-* Beta v40
+* Beta v40 - Fully single player 
 * Can you give me [one more day](https://open.spotify.com/track/2n0XjGSB8TO42W8k1G1F3a?si=lJz4SXNZTRCM1W_LsohkyQ&utm_source=copy-link)..
 
 Doom (via [doomgeneric](https://github.com/ozkl/doomgeneric)) running as
