@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 doom_launcher.py — Doom-ps launcher (iPhone / desktop).
-
 """
 
 import argparse, datetime, os, platform, socket, struct, sys, threading, time
 
-DEFAULT_PS5_IP    = "" # Luac0re IP here. the ip shown on screen after luac0re success
+DEFAULT_PS5_IP    = ".4" # Luac0re IP here. the ip shown on screen after luac0re success
 DEFAULT_LAUNCHER  = "doom_launcher.lua" # < lua name. .. bleh :p
 DEFAULT_SHELLCODE = "doom_ps.bin"
 DEFAULT_WAD       = "wad"           # folder, not file
@@ -436,7 +435,7 @@ def main():
             while log_thread.is_alive():
                 time.sleep(0.5)
         except KeyboardInterrupt:
-            print("\n[*] Stopping…")
+            print("\n[*] Stopping...")
         finally:
             log_thread.stop()
     print("Done!")
