@@ -10,10 +10,6 @@ typedef int            s32;
 typedef short          s16;
 typedef signed char    s8;
 
-/* v53: State that must survive the inter-session BSS wipe.
- * See linker.ld — these variables land in .ps_persist, which is
- * placed BEFORE __bss_start, so reset_doom_globals() never touches
- * them. */
 #define PS_PERSIST __attribute__((section(".ps_persist")))
 
 #define GADGET_OFFSET    0x31AA9
@@ -34,13 +30,6 @@ typedef signed char    s8;
 #define OFF_X   0
 #define OFF_Y   ((SCR_H - DOOM_H * SCALE_Y) / 2)
 
-/* ---------------------------------------------------------------
- * v53: Audio buffer doubled from 1024 → 2048 samples.  The audio
- * thread was submitting 900 buffers in 20.48 s (43.95 submits/sec)
- * while the hardware drains 46.87/sec — a 6% underrun.  Doubling
- * the buffer gives 42.67 ms of audio per submit and 2x the slack,
- * which absorbs the scheduler jitter that was causing the cuts.
- * --------------------------------------------------------------- */
 #define SAMPLE_RATE      48000
 #define SAMPLES_PER_BUF  2048
 #define AUDIO_S16_STEREO 1
