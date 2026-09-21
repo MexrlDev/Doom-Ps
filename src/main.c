@@ -1,5 +1,5 @@
 /*
- * doom-ps/src/main.c — v55c
+ * doom-ps/src/main.c — v57
  */
 
 #include "core.h"
@@ -21,6 +21,7 @@ extern int   mkdir(const char *path, unsigned int mode);
 
 extern void ps_libc_init(void *G, void *D, s32 log_fd, const u8 *log_sa);
 extern void ps_libc_reset_pool(void);
+extern void ps_libc_close_all_files(void);
 
 extern u32 *DG_ScreenBuffer;
 extern void doomgeneric_Create(int argc, char **argv);
@@ -425,19 +426,54 @@ static void translate_pad(u32 raw) {
 #undef MAP
 }
 
+#define AUDIO_RING_FRAMES  8192
+
+static short             g_ring[AUDIO_RING_FRAMES * 2];
+static volatile unsigned g_ring_w;
+static volatile unsigned g_ring_r;
+
 void dg_audio_callback(const short *pcm, int sample_count) {
+    unsigned w    = g_ring_w;
+    unsigned fill = w - g_ring_r;
+    if (fill + (unsigned)sample_count > AUDIO_RING_FRAMES) return;
+
+    for (int i = 0; i < sample_count; i++) {
+        unsigned slot = (w + i) & (AUDIO_RING_FRAMES - 1);
+        g_ring[slot * 2]     = pcm[i * 2];
+        g_ring[slot * 2 + 1] = pcm[i * 2 + 1];
+    }
+    __asm__ volatile ("" ::: "memory");
+    g_ring_w = w + sample_count;
+}
+
+static void I_flush_audio_ring(void) {
     struct ps_ctx *c = &g_ctx;
-    if (c->audio_h < 0 || !c->aud_out) return;
-    (void)sample_count;
-    NC(c->G, c->aud_out, (u64)c->audio_h, (u64)pcm, 0,0,0,0);
+
+    if ((g_ring_w - g_ring_r) < (unsigned)SAMPLES_PER_BUF) {
+        if (c->usleep_fn)
+            NC(c->G, c->usleep_fn, 1000, 0, 0, 0, 0, 0);
+        return;
+    }
+
+    static short submit_buf[SAMPLES_PER_BUF * 2];
+    unsigned r = g_ring_r;
+    for (int i = 0; i < SAMPLES_PER_BUF; i++) {
+        unsigned slot = (r + i) & (AUDIO_RING_FRAMES - 1);
+        submit_buf[i * 2]     = g_ring[slot * 2];
+        submit_buf[i * 2 + 1] = g_ring[slot * 2 + 1];
+    }
+    __asm__ volatile ("" ::: "memory");
+    g_ring_r = r + SAMPLES_PER_BUF;
+
+    if (c->audio_h >= 0 && c->aud_out)
+        NC(c->G, c->aud_out, (u64)c->audio_h, (u64)submit_buf, 0, 0, 0, 0);
 }
 
 static void *audio_thread_fn(void *arg) {
     (void)arg;
     ps_sound_log("Audio: thread started\n");
-    while (g_audio_thread_running) {
-        I_SubmitSound();
-    }
+    while (g_audio_thread_running)
+        I_flush_audio_ring();
     ps_sound_log("Audio: thread exiting\n");
     return 0;
 }
@@ -473,6 +509,10 @@ void DG_DrawFrame(void) {
     blit_doom_frame((u32 *)c->fbs[c->active_fb], DG_ScreenBuffer);
     present(c);
     if (c->ext) c->ext->frame_count = c->total_frames;
+
+    if ((g_ring_w - g_ring_r) + (unsigned)SAMPLES_PER_BUF <= (unsigned)AUDIO_RING_FRAMES)
+        I_SubmitSound();
+
     if (c->pad_h >= 0 && c->pad_read) {
         u8 pad_buf[128]; ps_memset(pad_buf, 0, 128);
         s32 n = (s32)NC(c->G, c->pad_read,
@@ -597,7 +637,7 @@ static int recv_wads(s32 listen_fd) {
     for (;;) {
         if (g_wad_count >= MAX_WADS) break;
 
-        int wait_ms = (g_wad_count == 0) ? 30000 : 3000;
+        int wait_ms = (g_wad_count == 0) ? 30000 : 1200;
 
         int ready = wait_readable(c, listen_fd, wait_ms);
         if (ready <= 0) {
@@ -845,14 +885,13 @@ static void reset_doom_globals(void) {
     udp_log("DoomPS: wiping Doom BSS\n");
     log_wad_count("DoomPS: pre-wipe wads=");
 
+    ps_libc_close_all_files();
+
     volatile char *p = __bss_start;
     while (p < __bss_end) *p++ = 0;
 
     log_wad_count("DoomPS: post-wipe wads=");
 
-    /* v55c: reset the libc memory pool so the next session starts
-     * allocating from offset 0.  __pool_used is in .ps_persist so
-     * it survived the wipe above. */
     ps_libc_reset_pool();
     udp_log("DoomPS: pool reset\n");
 
@@ -938,6 +977,8 @@ static void run_doom(struct ps_ctx *c, int wad_idx) {
 
     if (c->aud_close && c->audio_h >= 0)
         NC(c->G, c->aud_close, (u64)c->audio_h, 0,0,0,0,0);
+    g_ring_w = 0;
+    g_ring_r = 0;
     if (c->aud_open)
         c->audio_h = (s32)NC(c->G, c->aud_open, 0xFF, 0, 0,
                              SAMPLES_PER_BUF, SAMPLE_RATE, AUDIO_S16_STEREO);
