@@ -1,5 +1,5 @@
 # doom-ps
-* Beta v40 - Fully single player 
+* Beta v41 - Fully single player 
 * Can you give me [one more day](https://open.spotify.com/track/2n0XjGSB8TO42W8k1G1F3a?si=lJz4SXNZTRCM1W_LsohkyQ&utm_source=copy-link)..
 
 Doom (via [doomgeneric](https://github.com/ozkl/doomgeneric)) running as
@@ -165,8 +165,8 @@ different game, update these three constants in `src/core.h`:
 
 ---
 ## Issues
-1. SFX + Music cutting but stable (if music is lowest muted in menu option > sound volume and kept SFX only it’ll work stable .
-2. switching from WAD to another via Quit Game in doom. switching to another WAD makes music doesn’t work for the new game BUTTT. SFX works so eh. fix it later max..
+~~1. SFX + Music cutting but stable (if music is lowest muted in menu option > sound volume and kept SFX only it’ll work stable .~~
+~~2. switching from WAD to another via Quit Game in doom. switching to another WAD makes music doesn’t work for the new game BUTTT. SFX works so eh. fix it later max..~~ - Used DOOMC0RE to fix them
 
 ---
 ## Credits
@@ -174,7 +174,7 @@ different game, update these three constants in `src/core.h`:
 * **MexrlDev** — Project Development
 
 **Special Thanks To**
-- [egycnq](https://github.com/egycnq) for [EmuC0re](https://github.com/egycnq/EmuC0re)
+- [egycnq](https://github.com/egycnq) for [EmuC0re](https://github.com/egycnq/EmuC0re) $ DooMC0re
 - [Gezine](https://github.com/Gezine) for [Luac0re](https://github.com/Gezine/Luac0re)
 - [ozkl](https://github.com/ozkl) for [doomgeneric](https://github.com/ozkl/doomgeneric)
 - [shahrilnet](https://github.com/shahrilnet) & [n0llptr](https://github.com/n0llptr) for [remote_lua_loader](https://github.com/shahrilnet/remote_lua_loader)
